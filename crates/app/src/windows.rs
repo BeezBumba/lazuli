@@ -19,6 +19,7 @@ pub struct Ctx<'a> {
     pub step: bool,
     pub running: bool,
     pub renderer: &'a mut Renderer,
+    pub step_count: u32,
 }
 
 #[typetag::serde]

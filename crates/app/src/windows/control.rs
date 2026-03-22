@@ -19,6 +19,8 @@ pub struct Window {
     breakpoint_to_remove: Option<u32>,
     #[serde(skip)]
     breakpoint_text: String,
+    #[serde(skip)]
+    step_num: u32,
     #[serde(default)]
     labels: HashMap<u32, String>,
 }
@@ -56,11 +58,19 @@ impl AppWindow for Window {
         ui.set_max_width(150.0);
         ui.horizontal(|ui| {
             ui.checkbox(&mut ctx.running, "Run");
-
+            
+            let step_num = self.step_num;
             let button = egui::Button::new("Step");
+            let dragvalue = egui::DragValue::new(&mut self.step_num)
+                .range(1..=10_000)
+                .speed(1);
+
             if ui.add_enabled(!ctx.running, button).clicked() {
                 ctx.step = true;
+                ctx.step_count = step_num.max(1);
             }
+
+            ui.add(dragvalue);
         });
 
         ui.separator();

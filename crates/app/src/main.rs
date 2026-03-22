@@ -328,6 +328,7 @@ impl eframe::App for App {
             step: false,
             running: was_running,
             renderer: &mut self.renderer,
+            step_count: 1,
         };
 
         egui::CentralPanel::default().show(ctx, |_| {
@@ -367,7 +368,9 @@ impl eframe::App for App {
         }
 
         if context.step {
-            self.runner.step();
+            for _ in 0..context.step_count {
+                self.runner.step();
+            }
         }
 
         let remaining = FRAMETIME.saturating_sub(self.last_update.elapsed());
