@@ -586,6 +586,11 @@ pub struct XerReg {
     pub overflow_fuse: bool,
 }
 
+impl XerReg {
+    pub fn to_u32(&self) -> u32 { self.0 }
+    pub fn set_u32(&mut self, v: u32) { self.0 = v; }
+}
+
 #[bitos(4)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FloatCond {
@@ -820,6 +825,17 @@ impl Bat {
 
         Address(region | offset)
     }
+
+    pub fn lower_u32(&self) -> u32 { self.0 as u32 }
+    pub fn upper_u32(&self) -> u32 { (self.0 >> 32) as u32 }
+
+    pub fn set_lower_u32(&mut self, v: u32) {
+        self.0 = (self.0 & 0xFFFF_FFFF_0000_0000) | (v as u64);
+    }
+
+    pub fn set_upper_u32(&mut self, v: u32) {
+        self.0 = (self.0 & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32);
+    }
 }
 
 /// Memory management registers.
@@ -997,6 +1013,16 @@ pub struct QuantReg {
     /// Scale used by a load instruction
     #[bits(24..30)]
     pub load_scale: i6,
+}
+
+impl QuantReg {
+    pub fn to_u32(&self) -> u32 {
+        self.0
+    }
+
+    pub fn set_u32(&mut self, v: u32) {
+        self.0 = v;
+    }
 }
 
 pub static DEQUANTIZATION_LUT: [f64; 1 << 6] = {

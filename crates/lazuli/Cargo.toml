@@ -19,7 +19,7 @@ util.workspace = true
 disks.workspace = true
 color.workspace = true
 gxtex.workspace = true
-
+ppcjit.workspace = true
 bitos.workspace = true
 bitvec.workspace = true
 bytesize.workspace = true

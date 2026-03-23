@@ -17,9 +17,10 @@ impl System {
         let prev = self.cpu.supervisor.misc.tb;
         let new = prev.wrapping_add(delta);
 
-        tracing::trace!(
-            "updating time base - now {now}, last updated {last_updated}, since then {delta}. prev: {prev}, new: {new}"
-        );
+        println!(
+    "updating time base - now {}, last updated {}, since then {}. prev: {}, new: {}",
+    now, last_updated, delta, prev, new
+);
 
         self.lazy.last_updated_tb = now;
         self.cpu.supervisor.misc.tb = new;
@@ -33,9 +34,10 @@ impl System {
         let prev = self.cpu.supervisor.misc.dec;
         let new = prev.wrapping_sub(delta as u32);
 
-        tracing::trace!(
-            "updating dec - now {now}, last updated {last_updated}, since then {delta}. prev: {prev}, new: {new}"
-        );
+        println!(
+    "updating dec - now {}, last updated {}, since then {}. prev: {}, new: {}",
+    now, last_updated, delta, prev, new
+);
 
         self.lazy.last_updated_dec = now;
         self.cpu.supervisor.misc.dec = new;

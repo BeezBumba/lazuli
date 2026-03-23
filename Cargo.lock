@@ -223,6 +223,8 @@ dependencies = [
  "lazuli",
  "modules",
  "nanorand",
+ "ppcint",
+ "ppcjit",
  "renderdoc",
  "renderer",
  "ron",
@@ -2657,6 +2659,7 @@ dependencies = [
  "indicatif",
  "oneshot",
  "ordered-float",
+ "ppcjit",
  "ring-arena",
  "seq-macro",
  "static_assertions",
@@ -3869,6 +3872,16 @@ checksum = "6279a5e74397a442815266b75cba540630860f62cc306e324079e3056a27225b"
 dependencies = [
  "phf 0.12.1",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ppcint"
+version = "0.1.0"
+dependencies = [
+ "gekko",
+ "lazuli",
+ "tracing",
+ "zerocopy",
 ]
 
 [[package]]
