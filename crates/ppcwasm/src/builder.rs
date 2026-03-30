@@ -319,15 +319,20 @@ impl<'a> BlockBuilder<'a> {
     /// measured from bit 31, i.e., `bi == 0` → CR bit 31 = CR0.LT).
     fn emit_branch_condition(&mut self, bo: u8, bi: u8) {
         // BO encoding (PPC Architecture):
-        //   bit 4 (MSB): ignore_ctr
-        //   bit 3: ctr_cond (0=CTR≠0, 1=CTR==0)
-        //   bit 2: ignore_cr
-        //   bit 1: desired_cr (0=false, 1=true)
+        //   bit 4 (MSB): ignore_cr  (1 = do not test CR condition)
+        //   bit 3: desired_cr       (1 = branch if CR bit is set, 0 = branch if clear)
+        //   bit 2: ignore_ctr       (1 = do not decrement/test CTR)
+        //   bit 1: ctr_cond         (1 = branch if CTR==0, 0 = branch if CTR≠0)
         //   bit 0: branch prediction hint (ignored here)
-        let ignore_ctr = (bo >> 4) & 1 != 0;
-        let ctr_zero = (bo >> 3) & 1 != 0;
-        let ignore_cr = (bo >> 2) & 1 != 0;
-        let desired_cr = (bo >> 1) & 1 != 0;
+        //
+        // Common examples:
+        //   blt  (bc 12, bi) → BO=0b01100: ignore_ctr=1, desired_cr=1, ignore_cr=0
+        //   bge  (bc  4, bi) → BO=0b00100: ignore_ctr=1, desired_cr=0, ignore_cr=0
+        //   bdnz (bc 16, bi) → BO=0b10000: ignore_ctr=0, ctr_cond=0,   ignore_cr=1
+        let ignore_cr  = (bo >> 4) & 1 != 0;
+        let desired_cr = (bo >> 3) & 1 != 0;
+        let ignore_ctr = (bo >> 2) & 1 != 0;
+        let ctr_zero   = (bo >> 1) & 1 != 0;
 
         // ctr_ok: CTR condition satisfied
         // cr_ok:  CR condition satisfied
@@ -360,9 +365,13 @@ impl<'a> BlockBuilder<'a> {
         }
 
         if !ignore_cr {
-            // cr_ok = ((CR >> bi) & 1) == desired_cr
+            // The CR register stores CR0.LT at bit 31 (MSB), CR0.GT at bit 30,
+            // CR0.EQ at bit 29, etc.  The BI field encodes the CR bit index in
+            // PowerPC big-endian bit numbering, so BI=0 → CR bit 31, BI=1 → CR
+            // bit 30, ..., BI=n → CR bit (31−n).
+            // cr_ok = ((CR >> (31 - bi)) & 1) == desired_cr
             self.push_cr();
-            self.body.push(Instruction::I32Const(bi as i32));
+            self.body.push(Instruction::I32Const(31 - (bi as i32)));
             self.body.push(Instruction::I32ShrU);
             self.body.push(Instruction::I32Const(1));
             self.body.push(Instruction::I32And);
