@@ -116,6 +116,8 @@ function annotateWasm(bytes) {
 // taken before execution.  Writes from the block are buffered in that
 // snapshot and flushed back to the Rust emulator afterwards via sync_ram().
 //
+const WASM_PAGE_SIZE = 65536;
+
 async function executeOneBlock(emu, execLog) {
   const pc = emu.get_pc();
   const pcHex = "0x" + pc.toString(16).toUpperCase().padStart(8, "0");
@@ -131,7 +133,7 @@ async function executeOneBlock(emu, execLog) {
 
   // Step 2 – allocate a WASM memory large enough for the CPU struct
   const cpuSize   = emu.cpu_struct_size();
-  const pagesNeeded = Math.ceil(cpuSize / 65536);
+  const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE_SIZE);
   const regsMemory = new WebAssembly.Memory({ initial: pagesNeeded });
   const regsView   = new Uint8Array(regsMemory.buffer);
 
