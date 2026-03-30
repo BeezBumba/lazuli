@@ -171,8 +171,11 @@ function parseAndLoadIso(arrayBuffer, emu) {
     );
   }
 
-  // Game ID: bytes 0–5 (e.g. "GMSE01" for Super Mario Sunshine NTSC)
-  const gameId = String.fromCharCode(...bytes.slice(0, 6).filter(b => b !== 0));
+  // Game ID: bytes 0–5 (e.g. "GMSE01" for Super Mario Sunshine NTSC).
+  // Only keep printable ASCII (0x20–0x7E) to avoid garbage in the display.
+  const gameId = String.fromCharCode(
+    ...bytes.slice(0, 6).filter(b => b >= 0x20 && b <= 0x7E)
+  );
 
   // Game name: null-terminated string starting at 0x020
   let gameName = "";
@@ -450,25 +453,31 @@ const SCREEN_H = 480;
  * @param {WasmEmulator} emu
  */
 function renderXfb(ram, ctx, emu) {
-  const xfb = XFB_PHYS;
-  const totalYuv = SCREEN_W * SCREEN_H * 2; // YUV422: 2 bytes per pixel
+  const xfb         = XFB_PHYS;
+  // YUV422: 2 bytes per pixel
+  const xfbByteSize = SCREEN_W * SCREEN_H * 2;
 
   // Check whether the XFB region is within mapped RAM
-  if (xfb + totalYuv > ram.length) {
+  if (xfb + xfbByteSize > ram.length) {
     drawPlaceholder(ctx, null, emu);
     return;
   }
 
-  // Check for any non-trivial data (games write non-zero YUV when rendering)
-  let hasContent = false;
-  for (let i = xfb; i < xfb + 64; i += 4) {
-    if (ram[i] !== 0 || ram[i + 1] !== 0 || ram[i + 2] !== 0 || ram[i + 3] !== 0) {
-      hasContent = true;
-      break;
+  // Quick heuristic: sample the first 64 bytes (16 YUV422 pixel pairs) to
+  // decide whether the game has written any frame data yet.  64 bytes is
+  // enough to distinguish a real frame from an all-zero buffer without
+  // scanning the full 600 KB XFB.  Once content is detected we skip this
+  // check via `xfbHasContent` to avoid the scan overhead on every frame.
+  if (!xfbHasContent) {
+    for (let i = xfb; i < xfb + 64; i += 4) {
+      if (ram[i] !== 0 || ram[i + 1] !== 0 || ram[i + 2] !== 0 || ram[i + 3] !== 0) {
+        xfbHasContent = true;
+        break;
+      }
     }
   }
 
-  if (!hasContent) {
+  if (!xfbHasContent) {
     drawPlaceholder(ctx, null, emu);
     return;
   }
@@ -488,7 +497,10 @@ function renderXfb(ram, ctx, emu) {
     const cbOff = cb - 128;
     const crOff = cr - 128;
 
-    // BT.601: clamp to [0, 255]
+    // BT.601 YUV→RGB using fixed-point coefficients scaled by 1024 (>> 10).
+    // R = Y + 1.402 * Cr        → (Y + (1402 * crOff) >> 10)
+    // G = Y − 0.344 * Cb − 0.714 * Cr
+    // B = Y + 1.772 * Cb        → (Y + (1772 * cbOff) >> 10)
     const clamp = (v) => v < 0 ? 0 : v > 255 ? 255 : v;
 
     const r0 = clamp(y0 + ((1402 * crOff) >> 10)) | 0;
@@ -609,7 +621,11 @@ function suspendAudio() {
 
 // ── Game loop ─────────────────────────────────────────────────────────────────
 
-/** Number of JIT blocks to execute per animation frame (~60 Hz). */
+// Number of JIT blocks to execute per animation frame (~60 Hz).
+// The GameCube CPU runs at ~486 MHz with ~1-2 IPC; typical games have
+// basic blocks of 5–20 instructions.  500 blocks/frame ≈ 7,500–15,000
+// instructions per frame — a reasonable starting budget that keeps the
+// main thread responsive while making visible forward progress.
 const BLOCKS_PER_FRAME = 500;
 
 let running        = false;
@@ -617,6 +633,8 @@ let animFrameId    = null;
 let gameTitle      = null;
 let frameCount     = 0;
 let lastFpsTime    = 0;
+/** Set to true the first time we detect non-zero XFB data; avoids re-scanning every frame. */
+let xfbHasContent  = false;
 
 /**
  * Main emulation loop — called by requestAnimationFrame at ~60 Hz.
@@ -717,6 +735,9 @@ async function main() {
   const canvas = $("screen");
   const ctx    = canvas.getContext("2d");
 
+  // Last ISO entry point — used by the Reset button to restart at the correct PC.
+  let lastEntryPoint = 0x80000000;
+
   // Draw splash screen while WASM loads
   drawPlaceholder(ctx, null, null);
 
@@ -774,13 +795,17 @@ async function main() {
   $("btn-reset").addEventListener("click", () => {
     stopLoop();
     clearModuleCache();
-    ramView = null; // force refresh of zero-copy view
-    // Re-zero RAM and reload last ISO if available — for now just reset PC
-    emu.set_pc(0x80000000);
+    ramView = null;        // force refresh of zero-copy view
+    xfbHasContent = false; // re-arm the XFB content check
+    // Return to the entry point of the last loaded game (or 0x80000000 if none)
+    emu.set_pc(lastEntryPoint);
     drawPlaceholder(ctx, gameTitle, null);
     renderRegisters(emu);
     updateStats(emu);
-    setStatus("↺ Emulator reset — reload ISO to restart", "status-info");
+    setStatus(
+      `↺ Reset to entry 0x${lastEntryPoint.toString(16).toUpperCase()} — press ▶ Start`,
+      "status-info"
+    );
   });
 
   // ── Audio toggle ───────────────────────────────────────────────────────────
@@ -818,10 +843,12 @@ async function main() {
       try {
         stopLoop();
         clearModuleCache();
-        ramView = null;
+        ramView       = null;
+        xfbHasContent = false;
 
         const meta = parseAndLoadIso(evt.target.result, emu);
-        gameTitle = meta.gameName || meta.gameId || "Unknown Game";
+        gameTitle     = meta.gameName || meta.gameId || "Unknown Game";
+        lastEntryPoint = meta.entry;
 
         $("header-game").textContent = `— ${gameTitle}`;
         $("iso-meta").textContent =
@@ -917,9 +944,9 @@ async function main() {
   // ── Demo loader ────────────────────────────────────────────────────────────
   $("btn-load-demo").addEventListener("click", () => {
     const keys = Object.keys(DEMO_PROGRAMS);
-    const prog = DEMO_PROGRAMS[keys[Math.floor(Math.random() * keys.length)]];
+    const key  = keys[Math.floor(Math.random() * keys.length)];
+    const prog = DEMO_PROGRAMS[key];
     $("asm-input").value = prog.words.join("\n");
-    const key = keys.find(k => DEMO_PROGRAMS[k] === prog);
     setStatus(`Loaded demo: "${key}" — ${prog.description}`, "status-info");
   });
 

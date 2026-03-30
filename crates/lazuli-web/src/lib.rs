@@ -189,7 +189,10 @@ impl WasmEmulator {
             return;
         }
         self.ram[start..end].copy_from_slice(data);
-        // Invalidate compiled blocks in the written range
+        // Invalidate compiled blocks in the written range.
+        // PPC instructions are always 4 bytes wide; we align start/end to the
+        // nearest 4-byte boundary with `& !3` (clear the low two bits) so
+        // every overlapping instruction address is evicted from the cache.
         let start_page = (start & !3) as u32;
         let end_page = (end as u32 + 3) & !3;
         for pc in (start_page..end_page).step_by(4) {
@@ -494,10 +497,13 @@ impl WasmEmulator {
     /// Translate a guest virtual address to a physical RAM offset.
     ///
     /// Strips the GameCube KSEG0 (`0x80000000`) and KSEG1 (`0xA0000000`)
-    /// segment bits by masking with `0x01FF_FFFF` (25-bit physical space).
-    /// Physical addresses already below 32 MiB pass through unchanged, keeping
-    /// backward compatibility with demo programs that use raw offsets starting
-    /// at 0.
+    /// segment bits.  The mask `0x01FF_FFFF` (25 bits = 32 MiB) is
+    /// intentionally one bit wider than the 24 MiB of main RAM so that the
+    /// upper MiB of the address space — used by the GameCube for cache-locked
+    /// L2 data and some hardware registers — also maps cleanly to physical
+    /// offsets without wrapping.  Addresses already below 0x02000000 pass
+    /// through unchanged, keeping backward compatibility with demo programs
+    /// that use raw RAM offsets starting at 0.
     fn phys_addr(vaddr: u32) -> usize {
         (vaddr & 0x01FF_FFFF) as usize
     }
