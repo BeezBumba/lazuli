@@ -22,5 +22,14 @@ features = [
     "Performance",
 ]
 
+# Disable wasm-opt during wasm-pack builds so that the package can be built
+# without a network connection.  Re-enable for distribution builds by removing
+# this section or setting `wasm-opt = ["-O3"]`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
+
 [lints]
 workspace = true

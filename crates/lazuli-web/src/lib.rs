@@ -37,6 +37,7 @@
 //! emulator's RAM.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use gekko::disasm::{Extensions, Ins};
 use js_sys::WebAssembly;
@@ -202,6 +203,14 @@ impl WasmEmulator {
         self.blocks_executed as u32
     }
 
+    /// Notify the emulator that one compiled block has just been executed.
+    ///
+    /// Call this from JavaScript after a successful `instance.exports.execute()`
+    /// call to keep the execution counter in sync with the host.
+    pub fn record_block_executed(&mut self) {
+        self.blocks_executed += 1;
+    }
+
     /// Number of blocks currently in the module cache.
     pub fn cache_size(&self) -> u32 {
         self.cache.len() as u32
@@ -310,6 +319,106 @@ impl WasmEmulator {
                 arr.into()
             },
         );
+        obj.into()
+    }
+
+    // ── CPU struct serialisation ──────────────────────────────────────────────
+
+    /// Size in bytes of the [`gekko::Cpu`] struct.
+    ///
+    /// JavaScript should allocate at least this many bytes in the WASM memory
+    /// that it passes as the `env.memory` import when instantiating a compiled
+    /// block.  The WASM memory must be at least one page (65536 bytes), which
+    /// is always enough to hold the CPU struct.
+    pub fn cpu_struct_size(&self) -> u32 {
+        size_of::<gekko::Cpu>() as u32
+    }
+
+    /// Serialise the current CPU register state into a [`js_sys::Uint8Array`].
+    ///
+    /// The returned bytes match the `#[repr(C)]` in-memory layout of
+    /// [`gekko::Cpu`].  Write them to offset 0 of the `env.memory` WASM
+    /// memory before calling `execute(0)` on a compiled block.
+    pub fn get_cpu_bytes(&self) -> js_sys::Uint8Array {
+        // SAFETY: `gekko::Cpu` is `#[repr(C)]` and contains only plain integer /
+        // float fields.  We borrow it as a byte slice for the duration of this
+        // call, which is safe.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&self.cpu as *const gekko::Cpu).cast::<u8>(),
+                size_of::<gekko::Cpu>(),
+            )
+        };
+        js_sys::Uint8Array::from(bytes)
+    }
+
+    /// Restore the CPU register state from raw bytes.
+    ///
+    /// `data` must have been produced by a previous call to [`get_cpu_bytes`]
+    /// and must therefore have length exactly [`cpu_struct_size`] bytes.  Call
+    /// this after `execute()` returns to sync the register changes made by the
+    /// compiled block back into the Rust emulator.
+    pub fn set_cpu_bytes(&mut self, data: &[u8]) {
+        let expected = size_of::<gekko::Cpu>();
+        if data.len() != expected {
+            console_log!(
+                "[lazuli-web] set_cpu_bytes: expected {} bytes, got {}",
+                expected,
+                data.len()
+            );
+            return;
+        }
+        // SAFETY: `data` has the correct size and alignment is guaranteed by
+        // the `#[repr(C)]` layout.  The source slice is valid for the duration
+        // of the copy.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (&mut self.cpu as *mut gekko::Cpu).cast::<u8>(),
+                expected,
+            );
+        }
+    }
+
+    /// Return a snapshot of the emulator's guest RAM as a [`js_sys::Uint8Array`].
+    ///
+    /// JavaScript hook closures (`read_u8`, `read_u32`, etc.) passed to
+    /// `WebAssembly.instantiate()` can read from this buffer to implement
+    /// guest memory loads.  For writes, call [`sync_ram`] after execution.
+    pub fn get_ram_copy(&self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(self.ram.as_slice())
+    }
+
+    /// Copy `data` back over the emulator's guest RAM.
+    ///
+    /// Call this after block execution if the block wrote to guest memory and
+    /// you want those writes to be reflected in the Rust emulator state.
+    pub fn sync_ram(&mut self, data: &[u8]) {
+        let len = data.len().min(self.ram.len());
+        self.ram[..len].copy_from_slice(&data[..len]);
+    }
+
+    /// Return the byte offsets of key CPU registers within the [`gekko::Cpu`]
+    /// struct as a JavaScript object.
+    ///
+    /// JavaScript can use these offsets to directly read / write individual
+    /// registers in the WASM memory buffer that holds the serialised CPU state.
+    pub fn get_reg_offsets(&self) -> JsValue {
+        let offsets = self.jit.offsets();
+        let obj = js_sys::Object::new();
+        let set = |key: &str, val: u64| {
+            let _ = js_sys::Reflect::set(&obj, &key.into(), &JsValue::from(val as u32));
+        };
+        set("pc", offsets.pc);
+        set("lr", offsets.lr);
+        set("ctr", offsets.ctr);
+        set("cr", offsets.cr);
+        set("xer", offsets.xer);
+        let gpr_arr = js_sys::Array::new();
+        for &off in &offsets.gpr {
+            gpr_arr.push(&JsValue::from(off as u32));
+        }
+        let _ = js_sys::Reflect::set(&obj, &"gpr".into(), &gpr_arr.into());
         obj.into()
     }
 }
