@@ -44,6 +44,27 @@ use js_sys::WebAssembly;
 use ppcwasm::WasmJit;
 use wasm_bindgen::prelude::*;
 
+// ─── WASM memory export ───────────────────────────────────────────────────────
+
+/// Returns the WebAssembly linear memory of this module.
+///
+/// JavaScript can use the returned [`WebAssembly::Memory`] together with
+/// [`WasmEmulator::ram_ptr`] and [`WasmEmulator::ram_size`] to create a
+/// **zero-copy live view** over the emulator's guest RAM:
+///
+/// ```js
+/// const mem   = wasm_memory();
+/// const ptr   = emu.ram_ptr();
+/// const size  = emu.ram_size();
+/// const ram   = new Uint8Array(mem.buffer, ptr, size);
+/// // `ram` is now a live, zero-copy view — any write from a compiled block
+/// // is instantly visible without calling get_ram_copy() / sync_ram().
+/// ```
+#[wasm_bindgen]
+pub fn wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
 // Re-export the block type for JavaScript inspection.
 pub use ppcwasm::WasmBlock;
 
@@ -121,6 +142,8 @@ pub struct WasmEmulator {
     blocks_compiled: u64,
     /// Number of blocks executed since emulator creation.
     blocks_executed: u64,
+    /// GameCube controller button bitmask (set by JavaScript keyboard handler).
+    pad_buttons: u32,
 }
 
 #[wasm_bindgen]
@@ -128,6 +151,7 @@ impl WasmEmulator {
     /// Create a new emulator with `ram_size` bytes of guest RAM.
     ///
     /// `ram_size` must be a multiple of 65536 (one WASM memory page).
+    /// For a full GameCube emulation pass `24 * 1024 * 1024` (24 MiB).
     #[wasm_bindgen(constructor)]
     pub fn new(ram_size: u32) -> WasmEmulator {
         console_error_panic_hook_set();
@@ -138,6 +162,7 @@ impl WasmEmulator {
             cache: WasmBlockCache::new(),
             blocks_compiled: 0,
             blocks_executed: 0,
+            pad_buttons: 0,
         }
     }
 
@@ -145,10 +170,14 @@ impl WasmEmulator {
 
     /// Copy `data` into guest RAM starting at `guest_addr`.
     ///
+    /// `guest_addr` may be a GameCube virtual address (`0x8xxxxxxx`) or a raw
+    /// physical offset; both are handled transparently via the same
+    /// `0x01FF_FFFF` mask used by [`Self::phys_addr`].
+    ///
     /// Clears the block cache for any PC that overlaps the written region, so
     /// that stale compiled blocks are not executed after a ROM reload.
     pub fn load_bytes(&mut self, guest_addr: u32, data: &[u8]) {
-        let start = guest_addr as usize;
+        let start = Self::phys_addr(guest_addr);
         let end = start + data.len();
         if end > self.ram.len() {
             console_log!(
@@ -160,13 +189,16 @@ impl WasmEmulator {
             return;
         }
         self.ram[start..end].copy_from_slice(data);
-        // Invalidate compiled blocks in the written range
-        let start_page = (guest_addr & !3) as u32;
-        let end_page = (guest_addr + data.len() as u32 + 3) & !3;
+        // Invalidate compiled blocks in the written range.
+        // PPC instructions are always 4 bytes wide; we align start/end to the
+        // nearest 4-byte boundary with `& !3` (clear the low two bits) so
+        // every overlapping instruction address is evicted from the cache.
+        let start_page = (start & !3) as u32;
+        let end_page = (end as u32 + 3) & !3;
         for pc in (start_page..end_page).step_by(4) {
             self.cache.invalidate(pc);
         }
-        console_log!("[lazuli-web] loaded {} bytes at guest 0x{:08X}", data.len(), guest_addr);
+        console_log!("[lazuli-web] loaded {} bytes at physical 0x{:08X}", data.len(), start);
     }
 
     // ── Register access (for JS debugging) ───────────────────────────────────
@@ -214,6 +246,42 @@ impl WasmEmulator {
     /// Number of blocks currently in the module cache.
     pub fn cache_size(&self) -> u32 {
         self.cache.len() as u32
+    }
+
+    // ── Zero-copy RAM access ──────────────────────────────────────────────────
+
+    /// Returns a raw pointer (WASM linear memory offset) to the start of the
+    /// guest RAM buffer.
+    ///
+    /// Combine with [`wasm_memory`] and [`ram_size`] to create a live,
+    /// zero-copy JavaScript view that avoids per-block `get_ram_copy()` calls:
+    ///
+    /// ```js
+    /// const ram = new Uint8Array(wasm_memory().buffer, emu.ram_ptr(), emu.ram_size());
+    /// ```
+    pub fn ram_ptr(&self) -> u32 {
+        self.ram.as_ptr() as u32
+    }
+
+    /// Returns the size of the guest RAM buffer in bytes.
+    pub fn ram_size(&self) -> u32 {
+        self.ram.len() as u32
+    }
+
+    // ── Controller input ──────────────────────────────────────────────────────
+
+    /// Set the GameCube controller button bitmask.
+    ///
+    /// Called by the JavaScript keyboard handler on every `keydown` / `keyup`
+    /// event.  The bitmask layout matches the `GC_BTN` constants defined in
+    /// `bootstrap.js`.
+    pub fn set_pad_buttons(&mut self, buttons: u32) {
+        self.pad_buttons = buttons;
+    }
+
+    /// Get the current GameCube controller button bitmask.
+    pub fn get_pad_buttons(&self) -> u32 {
+        self.pad_buttons
     }
 
     // ── Block compilation ─────────────────────────────────────────────────────
@@ -426,14 +494,32 @@ impl WasmEmulator {
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
 impl WasmEmulator {
+    /// Translate a guest virtual address to a physical RAM offset.
+    ///
+    /// Strips the GameCube KSEG0 (`0x80000000`) and KSEG1 (`0xA0000000`)
+    /// segment bits.  The mask `0x01FF_FFFF` (25 bits = 32 MiB) is
+    /// intentionally one bit wider than the 24 MiB of main RAM so that the
+    /// upper MiB of the address space — used by the GameCube for cache-locked
+    /// L2 data and some hardware registers — also maps cleanly to physical
+    /// offsets without wrapping.  Addresses already below 0x02000000 pass
+    /// through unchanged, keeping backward compatibility with demo programs
+    /// that use raw RAM offsets starting at 0.
+    fn phys_addr(vaddr: u32) -> usize {
+        (vaddr & 0x01FF_FFFF) as usize
+    }
+
     /// Fetch PowerPC instructions from guest RAM at `guest_pc`, stopping at
     /// the first terminal instruction or after at most 32 instructions.
+    ///
+    /// `guest_pc` may be a GameCube virtual address (`0x8xxxxxxx`) or a raw
+    /// physical RAM offset; both are handled via [`Self::phys_addr`].
     fn fetch_instructions(&self, guest_pc: u32) -> Vec<(u32, Ins)> {
         let exts = Extensions::gekko_broadway();
         let mut out = Vec::new();
 
         for i in 0..32usize {
-            let addr = (guest_pc as usize).wrapping_add(i * 4);
+            let pc = guest_pc.wrapping_add((i * 4) as u32);
+            let addr = Self::phys_addr(pc);
             if addr + 4 > self.ram.len() {
                 break;
             }
@@ -444,7 +530,6 @@ impl WasmEmulator {
                 self.ram[addr + 3],
             ]);
             let ins = Ins::new(word, exts);
-            let pc = guest_pc.wrapping_add((i * 4) as u32);
             let is_terminal = matches!(
                 ins.op,
                 gekko::disasm::Opcode::B
