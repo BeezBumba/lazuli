@@ -1441,8 +1441,49 @@ impl<'a> BlockBuilder<'a> {
                         self.push_gpr(rs);
                         self.store_ctr();
                     }
+                    // SPR 284 (TBWL) — write low 32 bits of the time base.
+                    // The rotate_right(5) encoding of 284 produces 28.
+                    28 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.tb_lo)));
+                    }
+                    // SPR 285 (TBWU) — write high 32 bits of the time base.
+                    // The rotate_right(5) encoding of 285 produces 29.
+                    29 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.tb_hi)));
+                    }
                     _ => {} // unimplemented SPR: silently ignore
                 }
+            }
+
+            // mftb  rD, TBR — read the time-base registers.
+            // TBR 268 = TBL (low 32 bits), TBR 269 = TBU (high 32 bits).
+            // Games use this for all timing loops (e.g. OSWaitVBlank); returning
+            // a static zero causes the game to spin forever.
+            Opcode::Mftb => {
+                let rd = ins.gpr_d() as u8;
+                let tbr = ins.field_tbr();
+                self.push_base();
+                match tbr {
+                    268 => {
+                        // TBL — low 32 bits
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.tb_lo)));
+                    }
+                    269 => {
+                        // TBU — high 32 bits
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.tb_hi)));
+                    }
+                    _ => {
+                        // Unknown TBR: load 0
+                        self.body.push(Instruction::I32Const(0));
+                    }
+                }
+                self.store_gpr(rd);
             }
 
             // mfcr  rD

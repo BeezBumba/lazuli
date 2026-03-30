@@ -36,6 +36,10 @@ pub struct RegOffsets {
     pub ctr: u64,
     /// Byte offset of `Cpu::user.xer`.
     pub xer: u64,
+    /// Byte offset of the low 32 bits of `Cpu::supervisor.misc.tb` (TBL, TBR 268).
+    pub tb_lo: u64,
+    /// Byte offset of the high 32 bits of `Cpu::supervisor.misc.tb` (TBU, TBR 269).
+    pub tb_hi: u64,
 }
 
 impl RegOffsets {
@@ -66,6 +70,8 @@ impl RegOffsets {
             lr: offset_of!(Cpu, user.lr) as u64,
             ctr: offset_of!(Cpu, user.ctr) as u64,
             xer: offset_of!(Cpu, user.xer) as u64,
+            tb_lo: offset_of!(Cpu, supervisor.misc.tb) as u64,
+            tb_hi: offset_of!(Cpu, supervisor.misc.tb) as u64 + 4,
         }
     }
 }
