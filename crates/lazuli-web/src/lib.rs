@@ -528,11 +528,18 @@ impl WasmEmulator {
         set("ctr", offsets.ctr);
         set("cr", offsets.cr);
         set("xer", offsets.xer);
+        set("srr0", offsets.srr0);
+        set("srr1", offsets.srr1);
         let gpr_arr = js_sys::Array::new();
         for &off in &offsets.gpr {
             gpr_arr.push(&JsValue::from(off as u32));
         }
         let _ = js_sys::Reflect::set(&obj, &"gpr".into(), &gpr_arr.into());
+        let sprg_arr = js_sys::Array::new();
+        for &off in &offsets.sprg {
+            sprg_arr.push(&JsValue::from(off as u32));
+        }
+        let _ = js_sys::Reflect::set(&obj, &"sprg".into(), &sprg_arr.into());
         obj.into()
     }
 }
@@ -582,6 +589,7 @@ impl WasmEmulator {
                     | gekko::disasm::Opcode::Bc
                     | gekko::disasm::Opcode::Bclr
                     | gekko::disasm::Opcode::Bcctr
+                    | gekko::disasm::Opcode::Rfi
             );
             out.push((pc, ins));
             if is_terminal {

@@ -165,4 +165,64 @@ mod tests {
         // Low byte
         assert_eq!(super::builder::ppc_mask(24, 31), 0x0000_00FFu32);
     }
+
+    /// Verify that a block containing `stwu` followed by a non-terminal
+    /// instruction produces valid WASM.  Before the LocalTee→LocalSet fix,
+    /// `stwu` left an extra i32 on the operand stack, causing the WASM
+    /// validator to reject the module when the block fell through.
+    #[test]
+    fn stwu_followed_by_addi_is_valid_wasm() {
+        let jit = WasmJit::new();
+        // stwu r1, -8(r1)  = 0x9421_FFF8
+        let stwu = ins(0x9421_FFF8);
+        // addi r3, r0, 1   = 0x3860_0001 (non-terminal, ensures fallthrough)
+        let addi = ins(0x3860_0001);
+
+        let block = jit
+            .build([(0x8000_0000u32, stwu), (0x8000_0004u32, addi)].into_iter())
+            .unwrap();
+
+        assert_eq!(&block.bytes[..4], b"\0asm");
+        assert_eq!(block.instruction_count, 2);
+        // No unimplemented ops
+        assert!(block.unimplemented_ops.is_empty());
+    }
+
+    /// Verify that a block containing `lwzu` followed by a non-terminal
+    /// instruction produces valid WASM (same LocalTee→LocalSet fix as stwu).
+    #[test]
+    fn lwzu_followed_by_addi_is_valid_wasm() {
+        let jit = WasmJit::new();
+        // lwzu r3, 4(r4)  = 0x8464_0004
+        let lwzu = ins(0x8464_0004);
+        // addi r5, r0, 1  = 0x38A0_0001
+        let addi = ins(0x38A0_0001);
+
+        let block = jit
+            .build([(0x8000_0000u32, lwzu), (0x8000_0004u32, addi)].into_iter())
+            .unwrap();
+
+        assert_eq!(&block.bytes[..4], b"\0asm");
+        assert_eq!(block.instruction_count, 2);
+        assert!(block.unimplemented_ops.is_empty());
+    }
+
+    /// Verify that `rfi` terminates a block (like `blr`) and produces valid WASM.
+    #[test]
+    fn rfi_terminates_block() {
+        let jit = WasmJit::new();
+        // rfi = 0x4C00_0064
+        let rfi = ins(0x4C00_0064);
+        // addi r3, r0, 1  — should NOT be included
+        let addi = ins(0x3860_0001);
+
+        let block = jit
+            .build([(0x8000_0000u32, rfi), (0x8000_0004u32, addi)].into_iter())
+            .unwrap();
+
+        // Only rfi should be in the block
+        assert_eq!(block.instruction_count, 1);
+        assert_eq!(&block.bytes[..4], b"\0asm");
+        assert!(block.unimplemented_ops.is_empty());
+    }
 }

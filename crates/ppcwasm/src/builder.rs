@@ -1056,11 +1056,11 @@ impl<'a> BlockBuilder<'a> {
                 let rd = ins.gpr_d() as u8;
                 let ra = ins.gpr_a() as u8;
                 let d = ins.field_offset() as i32;
-                // ea = rA + d
+                // ea = rA + d; store ea in scratch without leaving it on the stack
                 self.push_gpr(ra);
                 self.body.push(Instruction::I32Const(d));
                 self.body.push(Instruction::I32Add);
-                self.body.push(Instruction::LocalTee(LOCAL_SCRATCH));
+                self.body.push(Instruction::LocalSet(LOCAL_SCRATCH));
                 // rD = mem[ea]
                 self.push_base();
                 self.body.push(Instruction::LocalGet(LOCAL_SCRATCH));
@@ -1160,11 +1160,11 @@ impl<'a> BlockBuilder<'a> {
                 let rs = ins.gpr_s() as u8;
                 let ra = ins.gpr_a() as u8;
                 let d = ins.field_offset() as i32;
-                // ea = rA + d
+                // ea = rA + d; store ea in scratch without leaving it on the stack
                 self.push_gpr(ra);
                 self.body.push(Instruction::I32Const(d));
                 self.body.push(Instruction::I32Add);
-                self.body.push(Instruction::LocalTee(LOCAL_SCRATCH));
+                self.body.push(Instruction::LocalSet(LOCAL_SCRATCH));
                 // mem[ea] = rS
                 self.body.push(Instruction::LocalGet(LOCAL_SCRATCH));
                 self.push_gpr(rs);
@@ -1432,6 +1432,33 @@ impl<'a> BlockBuilder<'a> {
                         // CTR
                         self.push_ctr();
                     }
+                    26 => {
+                        // SRR0 — save/restore register 0 (exception PC)
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.srr0)));
+                    }
+                    27 => {
+                        // SRR1 — save/restore register 1 (exception MSR)
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.srr1)));
+                    }
+                    // SPRG0–3 (SPR 272–275): low-5 encoded as 16–19
+                    16 => {
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.sprg[0])));
+                    }
+                    17 => {
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.sprg[1])));
+                    }
+                    18 => {
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.sprg[2])));
+                    }
+                    19 => {
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.sprg[3])));
+                    }
                     _ => {
                         // Unimplemented SPR: load 0
                         self.body.push(Instruction::I32Const(0));
@@ -1462,6 +1489,39 @@ impl<'a> BlockBuilder<'a> {
                         self.push_base();
                         self.push_gpr(rs);
                         self.store_ctr();
+                    }
+                    26 => {
+                        // SRR0 — save/restore register 0 (exception PC)
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.srr0)));
+                    }
+                    27 => {
+                        // SRR1 — save/restore register 1 (exception MSR)
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.srr1)));
+                    }
+                    // SPRG0–3 (SPR 272–275): low-5 encoded as 16–19
+                    16 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.sprg[0])));
+                    }
+                    17 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.sprg[1])));
+                    }
+                    18 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.sprg[2])));
+                    }
+                    19 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.sprg[3])));
                     }
                     // SPR 284 (TBWL) — write low 32 bits of the time base.
                     // The rotate_right(5) encoding of 284 produces 28.
@@ -1562,6 +1622,30 @@ impl<'a> BlockBuilder<'a> {
 
             // dcbz / icbi / dcbst  — cache operations, no-op in WASM
             Opcode::Dcbz | Opcode::Icbi | Opcode::Dcbst => {}
+
+            // rfi  — Return from interrupt.
+            //
+            // Restores PC from SRR0 and MSR from SRR1 (MSR update is emitted
+            // but has no further effect in the JIT; the key observable effect
+            // is that execution resumes at SRR0).  Treated as a terminal so
+            // that the block scanner does not continue past it.
+            Opcode::Rfi => {
+                // MSR = SRR1 (update MSR so context switch reflects the new mode)
+                self.push_base();
+                self.push_base();
+                self.body.push(Instruction::I32Load(self.m32(self.offsets.srr1)));
+                self.store_msr();
+                // PC = SRR0
+                self.push_base();
+                self.push_base();
+                self.body.push(Instruction::I32Load(self.m32(self.offsets.srr0)));
+                self.store_pc();
+                // Return 0: block wrote PC itself
+                self.body.push(Instruction::I32Const(0));
+                self.body.push(Instruction::Return);
+                self.has_terminal = true;
+                return true;
+            }
 
             // Unrecognised/unimplemented instruction: call raise_exception(0)
             _ => {
