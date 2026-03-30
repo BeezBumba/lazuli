@@ -58,6 +58,48 @@ This should generate `ipl-hle.dol` inside a `local/` directory in the workspace.
 Then, build the main lazuli app by executing `cargo build` (with any optional flags you might want,
 such as `--release`). This should produce an `app` executable inside `target/chosen_profile`.
 
+## Web frontend (dynarec WASM demo)
+
+Lazuli also includes a browser-based PowerPC → WebAssembly dynarec demo (`crates/lazuli-web`).
+You can test it locally without any native build:
+
+1. Install [`wasm-pack`](https://rustwasm.github.io/wasm-pack/):
+   ```sh
+   curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+   # or via cargo:
+   cargo install wasm-pack
+   ```
+
+2. Build and serve with `just`:
+   ```sh
+   just web-serve
+   ```
+   Then open **http://localhost:8080** in your browser.
+
+   Or do the steps manually:
+   ```sh
+   cd crates/lazuli-web
+   wasm-pack build --target web --out-dir www/pkg
+   cd www
+   python3 -m http.server 8080
+   ```
+
+### What you can do in the browser
+
+- **Paste PowerPC hex words** (one 32-bit big-endian instruction word per line) and click
+  **Compile → WASM** to see the JIT-compiled WebAssembly bytecode for that basic block.
+- **Load a binary file** (raw `.bin`, stripped `.dol`, `.iso`, or any binary blob) via the
+  *ROM / Binary File Loader* card.  The file is loaded into the emulator's guest RAM at the
+  address you choose.
+- **Step execution**: click **Step (1 block)** to JIT-compile and execute the current basic
+  block via `WebAssembly.instantiate()`, then watch the CPU register file update in real time.
+- **Run 10 blocks**: execute up to 10 consecutive blocks in one click.
+
+> **Note:** The web frontend is a dynarec *demo*, not a full emulator.  It demonstrates the
+> PowerPC → WASM JIT pipeline (the same approach used by the Play! PS2 emulator) but does not
+> implement hardware peripherals, audio, graphics, or the GameCube disc filesystem.  Full
+> game playback requires the native `app` binary.
+
 # Usage
 
 ## Obtaining Lazuli

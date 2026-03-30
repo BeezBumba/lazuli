@@ -3,3 +3,4 @@
 profile.json.gz
 log.log
 *.wav
+/crates/lazuli-web/www/pkg

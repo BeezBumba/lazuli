@@ -38,7 +38,11 @@ pub mod imports {
 /// | `$regs_ptr` | Byte offset into WASM linear memory where the [`gekko::Cpu`] struct begins. |
 /// | return value | The next PC address the emulator should jump to.  `0` indicates that the block already updated `Cpu::pc` in place (computed branches to LR / CTR). |
 ///
-/// The module imports seven functions from the `"hooks"` namespace:
+/// The module imports a linear memory and seven functions:
+///
+/// | namespace | name              | kind               |
+/// |-----------|-------------------|--------------------|
+/// | `"env"`   | `"memory"`        | memory (min 1 page)|
 ///
 /// | index | name              | signature          |
 /// |-------|-------------------|--------------------|

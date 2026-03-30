@@ -46,7 +46,7 @@ use gekko::disasm::{Ins, Opcode};
 use gekko::InsExt;
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    ImportSection, Instruction, MemArg, Module, TypeSection, ValType,
+    ImportSection, Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::block::{WasmBlock, imports};
@@ -1517,6 +1517,22 @@ impl<'a> BlockBuilder<'a> {
 
         // ── Import section ────────────────────────────────────────────────────
         let mut imports_section = ImportSection::new();
+        // Import a shared linear memory from the host.  The `execute` function
+        // accesses CPU register state via `i32.load` / `i32.store` indexed by
+        // `regs_ptr` (local 0), so the host must supply a memory that contains
+        // the serialised [`gekko::Cpu`] struct.  JavaScript passes this as the
+        // `env.memory` import when calling `WebAssembly.instantiate()`.
+        imports_section.import(
+            "env",
+            "memory",
+            EntityType::Memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            }),
+        );
         let hooks = "hooks";
         imports_section.import(hooks, "read_u8", EntityType::Function(TY_I32_RET_I32));
         imports_section.import(hooks, "read_u16", EntityType::Function(TY_I32_RET_I32));

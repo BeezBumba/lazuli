@@ -65,7 +65,7 @@
     /* Controls */
     .controls { display: flex; flex-direction: column; gap: 10px; }
     label { font-size: 0.85rem; color: var(--muted); }
-    input[type=number], textarea, select {
+    input[type=number], input[type=text], textarea, select {
       width: 100%;
       background: var(--bg);
       border: 1px solid var(--border);
@@ -74,6 +74,16 @@
       padding: 6px 8px;
       font-size: 0.85rem;
       font-family: "Consolas", "Courier New", monospace;
+    }
+    input[type=file] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 6px 8px;
+      font-size: 0.85rem;
+      cursor: pointer;
     }
     textarea { resize: vertical; min-height: 80px; }
     button {
@@ -87,6 +97,7 @@
     .btn-primary { background: var(--accent); color: #000; }
     .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-secondary { background: var(--border); color: var(--text); }
+    .btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
     .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
 
     /* Status bar */
@@ -161,6 +172,20 @@
     .stage-title { color: var(--muted); font-size: 0.7rem; }
     .stage-body  { color: var(--accent); font-weight: 600; margin-top: 2px; }
     .arrow { color: var(--muted); font-size: 1rem; }
+
+    /* Execution log */
+    #exec-log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+      font-family: "Consolas", monospace;
+      font-size: 0.75rem;
+      white-space: pre-wrap;
+      max-height: 180px;
+      overflow-y: auto;
+      color: var(--text);
+    }
   </style>
 </head>
 <body>
@@ -174,6 +199,27 @@
 
   <!-- ── Left column ── -->
   <div style="display:flex;flex-direction:column;gap:16px;">
+
+    <!-- ROM / binary file loader -->
+    <div class="card">
+      <div class="card-header">ROM / Binary File Loader</div>
+      <div class="card-body controls">
+        <label>
+          Select a raw binary file to load into guest RAM (e.g. a compiled
+          DOL / ELF stripped to raw bytes, or any <code>.bin</code> test blob):
+        </label>
+        <input type="file" id="rom-file" accept=".bin,.dol,.iso,.gcm,.elf,.raw" />
+        <label>Load at guest address (hex):</label>
+        <input type="text" id="rom-addr" value="80000000" style="font-family:monospace;" />
+        <label>Set PC to (hex, leave blank to use load address):</label>
+        <input type="text" id="rom-pc" value="" placeholder="80000000" style="font-family:monospace;" />
+        <div class="btn-row">
+          <button class="btn-primary" id="btn-load-rom" disabled>
+            Load file into RAM
+          </button>
+        </div>
+      </div>
+    </div>
 
     <!-- Assembly input -->
     <div class="card">
@@ -194,6 +240,27 @@
             Load demo program
           </button>
         </div>
+      </div>
+    </div>
+
+    <!-- Execution controls -->
+    <div class="card">
+      <div class="card-header">Execution Controls</div>
+      <div class="card-body controls">
+        <label>
+          Execute compiled blocks via the dynarec pipeline.
+          Each "step" compiles the block at the current PC and runs it.
+        </label>
+        <div class="btn-row">
+          <button class="btn-primary" id="btn-step" disabled>
+            Step (1 block)
+          </button>
+          <button class="btn-secondary" id="btn-run10" disabled>
+            Run 10 blocks
+          </button>
+        </div>
+        <label>Execution log:</label>
+        <div id="exec-log">(no execution yet)</div>
       </div>
     </div>
 
@@ -260,6 +327,10 @@
         <div class="stat-row">
           <span>Blocks compiled</span>
           <span class="stat-val" id="stat-compiled">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Blocks executed</span>
+          <span class="stat-val" id="stat-executed">0</span>
         </div>
         <div class="stat-row">
           <span>Cache entries</span>

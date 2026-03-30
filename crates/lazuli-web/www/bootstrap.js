@@ -4,13 +4,28 @@
  * This script:
  *  1. Loads the Lazuli WASM module produced by `wasm-pack build`.
  *  2. Creates a `WasmEmulator` instance.
- *  3. Wires up the UI so the user can enter PowerPC hex words and see the
- *     compiled WebAssembly bytecode — demonstrating the dynarec-to-WASM
- *     pipeline at work in the browser.
+ *  3. Wires up the UI so the user can:
+ *     - Paste PowerPC hex words and see the compiled WASM bytecode.
+ *     - Load a raw binary file into guest RAM.
+ *     - Step through execution one compiled block at a time.
+ *
+ * ## How to build and serve
+ *
+ *   # Install wasm-pack (once):
+ *   curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+ *
+ *   # Build the WASM package (from workspace root):
+ *   cd crates/lazuli-web && wasm-pack build --target web --out-dir www/pkg
+ *
+ *   # Serve on localhost:8080:
+ *   cd crates/lazuli-web/www && python3 -m http.server 8080
+ *
+ * Then open http://localhost:8080 in your browser.
+ * Alternatively run `just web-serve` from the workspace root.
  */
 
 // ── Load the wasm-bindgen generated module ─────────────────────────────────
-import init, { WasmEmulator } from "./lazuli_web.js";
+import init, { WasmEmulator } from "./pkg/lazuli_web.js";
 
 // ── DOM helpers ────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -23,6 +38,7 @@ function setStatus(msg, cls = "status-info") {
 
 function updateStats(emu) {
   $("stat-compiled").textContent = emu.blocks_compiled();
+  $("stat-executed").textContent = emu.blocks_executed();
   $("stat-cache").textContent    = emu.cache_size();
 }
 
@@ -85,6 +101,118 @@ function annotateWasm(bytes) {
   return lines.join("\n");
 }
 
+// ── Block execution via dynarec pipeline ──────────────────────────────────
+//
+// To execute a compiled block we need to:
+//  1. Compile the block at the current PC → raw WASM bytes.
+//  2. Copy the emulator's serialised CPU struct into a fresh WebAssembly.Memory.
+//  3. Instantiate the block with:
+//       • env.memory  — the memory holding the CPU registers.
+//       • hooks.*     — closures that read/write the emulator's guest RAM.
+//  4. Call instance.exports.execute(regs_ptr=0) → returns the next PC.
+//  5. Copy the (potentially modified) CPU bytes back into the Rust emulator.
+//
+// The hook closures hold a Uint8Array over a *snapshot* of the guest RAM
+// taken before execution.  Writes from the block are buffered in that
+// snapshot and flushed back to the Rust emulator afterwards via sync_ram().
+//
+async function executeOneBlock(emu, execLog) {
+  const pc = emu.get_pc();
+  const pcHex = "0x" + pc.toString(16).toUpperCase().padStart(8, "0");
+
+  // Step 1 – compile
+  let wasmBytes;
+  try {
+    wasmBytes = emu.compile_block(pc);
+  } catch (e) {
+    execLog.push(`[PC ${pcHex}] compile error: ${e}`);
+    return false;
+  }
+
+  // Step 2 – allocate a WASM memory large enough for the CPU struct
+  const cpuSize   = emu.cpu_struct_size();
+  const pagesNeeded = Math.ceil(cpuSize / 65536);
+  const regsMemory = new WebAssembly.Memory({ initial: pagesNeeded });
+  const regsView   = new Uint8Array(regsMemory.buffer);
+
+  // Write the current CPU register state into the memory
+  const cpuBytes = emu.get_cpu_bytes();
+  regsView.set(cpuBytes, 0);
+
+  // Step 3 – snapshot guest RAM and build hook closures
+  const ramSnap = emu.get_ram_copy(); // Uint8Array copy
+
+  const hooks = {
+    read_u8:  (addr) => {
+      addr = addr >>> 0; // treat as unsigned
+      return addr < ramSnap.length ? ramSnap[addr] : 0;
+    },
+    read_u16: (addr) => {
+      addr = addr >>> 0;
+      if (addr + 1 >= ramSnap.length) return 0;
+      return (ramSnap[addr] << 8) | ramSnap[addr + 1];
+    },
+    read_u32: (addr) => {
+      addr = addr >>> 0;
+      if (addr + 3 >= ramSnap.length) return 0;
+      return ((ramSnap[addr] << 24) | (ramSnap[addr + 1] << 16) |
+              (ramSnap[addr + 2] << 8)  |  ramSnap[addr + 3]) >>> 0;
+    },
+    write_u8: (addr, val) => {
+      addr = addr >>> 0;
+      if (addr < ramSnap.length) ramSnap[addr] = val & 0xff;
+    },
+    write_u16: (addr, val) => {
+      addr = addr >>> 0;
+      if (addr + 1 < ramSnap.length) {
+        ramSnap[addr]     = (val >> 8) & 0xff;
+        ramSnap[addr + 1] = val & 0xff;
+      }
+    },
+    write_u32: (addr, val) => {
+      addr = addr >>> 0; val = val >>> 0;
+      if (addr + 3 < ramSnap.length) {
+        ramSnap[addr]     = (val >>> 24) & 0xff;
+        ramSnap[addr + 1] = (val >>> 16) & 0xff;
+        ramSnap[addr + 2] = (val >>>  8) & 0xff;
+        ramSnap[addr + 3] =  val         & 0xff;
+      }
+    },
+    raise_exception: (kind) => {
+      execLog.push(`[PC ${pcHex}] exception raised: kind=${kind}`);
+    },
+  };
+
+  // Step 4 – instantiate and execute
+  let nextPc;
+  try {
+    const { instance } = await WebAssembly.instantiate(wasmBytes, {
+      env: { memory: regsMemory },
+      hooks,
+    });
+    nextPc = instance.exports.execute(0); // regs_ptr = 0
+  } catch (e) {
+    execLog.push(`[PC ${pcHex}] instantiation/execution error: ${e}`);
+    return false;
+  }
+
+  // Step 5 – sync CPU state and RAM back to the Rust emulator
+  const updatedCpuBytes = new Uint8Array(regsMemory.buffer, 0, cpuSize);
+  emu.set_cpu_bytes(updatedCpuBytes);
+  emu.sync_ram(ramSnap);
+  emu.record_block_executed();
+
+  // Determine the next PC: 0 means the block updated Cpu::pc itself
+  const newPc = (nextPc >>> 0) !== 0 ? (nextPc >>> 0) : emu.get_pc();
+  emu.set_pc(newPc);
+
+  const newPcHex = "0x" + newPc.toString(16).toUpperCase().padStart(8, "0");
+  execLog.push(
+    `[PC ${pcHex}] executed ${wasmBytes.length} byte block → next PC ${newPcHex}`
+  );
+  return true;
+}
+
 // ── Demo programs ──────────────────────────────────────────────────────────
 const DEMO_PROGRAMS = {
   "addi+blr": {
@@ -101,6 +229,20 @@ const DEMO_PROGRAMS = {
   },
 };
 
+// ── Execution log helpers ──────────────────────────────────────────────────
+const MAX_LOG_LINES = 200;
+let execLogLines = [];
+
+function appendExecLog(line) {
+  execLogLines.push(line);
+  if (execLogLines.length > MAX_LOG_LINES) {
+    execLogLines = execLogLines.slice(-MAX_LOG_LINES);
+  }
+  const el = $("exec-log");
+  el.textContent = execLogLines.join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────
 async function main() {
   setStatus("Loading Lazuli WASM module…", "status-info");
@@ -108,11 +250,14 @@ async function main() {
   let emu;
   try {
     await init();
-    // 1 MiB of guest RAM for demos
-    emu = new WasmEmulator(1024 * 1024);
+    // 4 MiB of guest RAM (enough for most demo programs and small ROM blobs)
+    emu = new WasmEmulator(4 * 1024 * 1024);
     emu.set_pc(0x80000000);
     setStatus("✓ WASM module loaded — ready", "status-ok");
-    $("btn-compile").disabled = false;
+    $("btn-compile").disabled  = false;
+    $("btn-load-rom").disabled = false;
+    $("btn-step").disabled     = false;
+    $("btn-run10").disabled    = false;
   } catch (e) {
     setStatus(`✗ Failed to load WASM module: ${e}`, "status-err");
     console.error(e);
@@ -121,6 +266,44 @@ async function main() {
 
   renderRegisters(emu);
   updateStats(emu);
+
+  // ── ROM file loader ────────────────────────────────────────────────────
+  $("btn-load-rom").addEventListener("click", () => {
+    const file = $("rom-file").files[0];
+    if (!file) {
+      setStatus("✗ No file selected", "status-err");
+      return;
+    }
+
+    const addrHex  = $("rom-addr").value.trim();
+    const guestAddr = parseInt(addrHex, 16) || 0x80000000;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const data = new Uint8Array(evt.target.result);
+
+      // The emulator's RAM starts at address 0 and is 4 MiB.
+      // We map the guest address modulo RAM size for the demo.
+      const ramOffset = guestAddr % (4 * 1024 * 1024);
+      emu.load_bytes(ramOffset, data);
+
+      // Set the PC to the load address (or override)
+      const pcHex = $("rom-pc").value.trim();
+      const newPc = pcHex ? parseInt(pcHex, 16) : guestAddr;
+      emu.set_pc(newPc % (4 * 1024 * 1024));
+
+      renderRegisters(emu);
+      updateStats(emu);
+      setStatus(
+        `✓ Loaded ${data.length} bytes from "${file.name}" at RAM offset 0x` +
+        ramOffset.toString(16).toUpperCase() +
+        ` — PC set to 0x` + (newPc % (4 * 1024 * 1024)).toString(16).toUpperCase(),
+        "status-ok"
+      );
+    };
+    reader.onerror = () => setStatus("✗ Failed to read file", "status-err");
+    reader.readAsArrayBuffer(file);
+  });
 
   // ── Compile button ─────────────────────────────────────────────────────
   $("btn-compile").addEventListener("click", async () => {
@@ -157,7 +340,7 @@ async function main() {
       const wasmBytes = emu.compile_block(0);
 
       // ── Verify with WebAssembly.compile() ──
-      const module = await WebAssembly.compile(wasmBytes);
+      await WebAssembly.compile(wasmBytes);
       const moduleBytes = Array.from(wasmBytes);
 
       // Display the bytecode
@@ -188,6 +371,44 @@ async function main() {
     $("asm-input").value = prog.words.join("\n");
     setStatus(`Loaded demo: "${key}" — ${prog.description}`, "status-info");
   });
+
+  // ── Step button (execute one block) ───────────────────────────────────
+  $("btn-step").addEventListener("click", async () => {
+    const log = [];
+    const ok  = await executeOneBlock(emu, log);
+    for (const line of log) appendExecLog(line);
+    renderRegisters(emu);
+    updateStats(emu);
+    if (ok) {
+      setStatus(
+        `✓ Stepped — PC now 0x${emu.get_pc().toString(16).toUpperCase().padStart(8, "0")}`,
+        "status-ok"
+      );
+    } else {
+      setStatus("✗ Step failed — see execution log", "status-err");
+    }
+  });
+
+  // ── Run 10 blocks button ───────────────────────────────────────────────
+  $("btn-run10").addEventListener("click", async () => {
+    let count = 0;
+    for (let i = 0; i < 10; i++) {
+      const log = [];
+      const ok  = await executeOneBlock(emu, log);
+      for (const line of log) appendExecLog(line);
+      if (!ok) break;
+      count++;
+    }
+    renderRegisters(emu);
+    updateStats(emu);
+    setStatus(
+      count > 0
+        ? `✓ Ran ${count} block(s) — PC now 0x${emu.get_pc().toString(16).toUpperCase().padStart(8, "0")}`
+        : "✗ Run failed at first block — see execution log",
+      count > 0 ? "status-ok" : "status-err"
+    );
+  });
 }
 
 main();
+
