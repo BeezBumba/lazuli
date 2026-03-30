@@ -1,0 +1,13 @@
+[package]
+name = "ppcwasm"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "PowerPC → WebAssembly JIT compiler for the Lazuli GameCube emulator"
+
+[dependencies]
+gekko = { workspace = true }
+wasm-encoder = "0.244"
+
+[lints]
+workspace = true

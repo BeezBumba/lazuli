@@ -2671,6 +2671,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazuli-web"
+version = "0.1.0"
+dependencies = [
+ "gekko",
+ "js-sys",
+ "ppcwasm",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3907,6 +3918,14 @@ dependencies = [
  "twox-hash",
  "zerocopy",
  "zstd",
+]
+
+[[package]]
+name = "ppcwasm"
+version = "0.1.0"
+dependencies = [
+ "gekko",
+ "wasm-encoder",
 ]
 
 [[package]]
