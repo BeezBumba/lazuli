@@ -83,6 +83,8 @@ pub(crate) struct BlockBuilder<'a> {
     cycles: u32,
     /// Whether the last instruction was a terminal (branch/return).
     has_terminal: bool,
+    /// Opcode names for instructions that hit the unimplemented fallthrough.
+    unimplemented_ops: Vec<String>,
 }
 
 impl<'a> BlockBuilder<'a> {
@@ -93,6 +95,7 @@ impl<'a> BlockBuilder<'a> {
             ins_count: 0,
             cycles: 0,
             has_terminal: false,
+            unimplemented_ops: Vec::new(),
         }
     }
 
@@ -1536,6 +1539,7 @@ impl<'a> BlockBuilder<'a> {
 
             // Unrecognised/unimplemented instruction: call raise_exception(0)
             _ => {
+                self.unimplemented_ops.push(format!("{:?}", ins.op));
                 self.body.push(Instruction::I32Const(0));
                 self.body.push(Instruction::Call(imports::RAISE_EXCEPTION));
             }
@@ -1628,6 +1632,7 @@ impl<'a> BlockBuilder<'a> {
             bytes: module.finish(),
             instruction_count: self.ins_count,
             cycles: self.cycles,
+            unimplemented_ops: self.unimplemented_ops,
         }
     }
 }
