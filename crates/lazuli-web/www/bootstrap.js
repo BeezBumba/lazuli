@@ -284,39 +284,51 @@ function getRamView(emu) {
  * The closures operate directly on the zero-copy `ramView`, so reads and
  * writes are immediately visible in the Rust emulator without any syncing.
  *
+ * Addresses are masked with PHYS_MASK before indexing into `ram`.  This
+ * mirrors the `phys_addr` helper in the Rust emulator: GameCube virtual
+ * addresses like 0x80xxxxxx and hardware-register addresses like 0xCCxxxxxx
+ * both strip their high bits, leaving a 25-bit physical offset that fits
+ * within the 24 MiB guest RAM.  Without this mask every 0x80xxxxxx read
+ * returns 0 and every write is silently dropped because the index exceeds
+ * the ram buffer length.
+ *
  * @param {Uint8Array} ram  Zero-copy view of guest RAM
  * @param {string[]}   log  Array to append exception/error messages to
  */
+
+/** 25-bit physical address mask — matches Rust's `phys_addr` helper. */
+const PHYS_MASK = 0x01FFFFFF;
+
 function buildHooks(ram, log) {
   return {
     read_u8(addr) {
-      addr = addr >>> 0;
+      addr = (addr >>> 0) & PHYS_MASK;
       return addr < ram.length ? ram[addr] : 0;
     },
     read_u16(addr) {
-      addr = addr >>> 0;
+      addr = (addr >>> 0) & PHYS_MASK;
       if (addr + 1 >= ram.length) return 0;
       return (ram[addr] << 8) | ram[addr + 1];
     },
     read_u32(addr) {
-      addr = addr >>> 0;
+      addr = (addr >>> 0) & PHYS_MASK;
       if (addr + 3 >= ram.length) return 0;
       return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
                (ram[addr + 2] << 8) | ram[addr + 3]) >>> 0);
     },
     write_u8(addr, val) {
-      addr = addr >>> 0;
+      addr = (addr >>> 0) & PHYS_MASK;
       if (addr < ram.length) ram[addr] = val & 0xff;
     },
     write_u16(addr, val) {
-      addr = addr >>> 0;
+      addr = (addr >>> 0) & PHYS_MASK;
       if (addr + 1 < ram.length) {
         ram[addr]     = (val >> 8) & 0xff;
         ram[addr + 1] = val & 0xff;
       }
     },
     write_u32(addr, val) {
-      addr = addr >>> 0;
+      addr = (addr >>> 0) & PHYS_MASK;
       val  = val  >>> 0;
       if (addr + 3 < ram.length) {
         ram[addr]     = (val >>> 24) & 0xff;
@@ -433,10 +445,55 @@ function executeOneBlockSync(emu, ram, log) {
 
 // ── Canvas rendering ──────────────────────────────────────────────────────────
 
-/** Typical GameCube XFB physical base address. */
-const XFB_PHYS = 0x00C00000;
 const SCREEN_W = 640;
 const SCREEN_H = 480;
+/** YUV422 frame-buffer size in bytes. */
+const XFB_BYTE_SIZE = SCREEN_W * SCREEN_H * 2;
+
+/**
+ * Candidate physical base addresses to probe when searching for the XFB.
+ *
+ * Games can allocate the external frame-buffer anywhere in the 24 MiB main
+ * RAM.  We check these addresses in order and use the first one that contains
+ * non-zero pixel data.  Candidates are:
+ *  • 0x00C00000 — a common static XFB address used by many games / SDKs.
+ *  • End-of-RAM minus one XFB  — for games that place a single XFB at the
+ *    top of heap (e.g. Super Mario Sunshine @ 0x016D2C00).
+ *  • End-of-RAM minus two XFBs — for double-buffered games.
+ *
+ * The candidates are computed lazily using the actual `ram.length` passed to
+ * `detectXfbAddress` so they adjust automatically to different RAM sizes.
+ */
+const XFB_PHYS_DEFAULT = 0x00C00000;
+
+/**
+ * Probe `ram` for a non-zero XFB at each candidate address and return the
+ * first address that contains frame data, or -1 if none is found yet.
+ *
+ * Only the first 64 bytes at each candidate are checked to keep the scan
+ * fast; this is enough to distinguish a rendered frame from an all-zero
+ * buffer.
+ *
+ * @param {Uint8Array} ram
+ * @returns {number}  Physical base address, or -1 if no content found
+ */
+function detectXfbAddress(ram) {
+  const candidates = [
+    XFB_PHYS_DEFAULT,
+    (ram.length - XFB_BYTE_SIZE) & ~0x1F,        // 1× buffer from end
+    (ram.length - 2 * XFB_BYTE_SIZE) & ~0x1F,    // 2× buffers from end
+  ];
+
+  for (const addr of candidates) {
+    if (addr < 0 || addr + XFB_BYTE_SIZE > ram.length) continue;
+    for (let i = addr; i < addr + 64; i += 4) {
+      if (ram[i] !== 0 || ram[i + 1] !== 0 || ram[i + 2] !== 0 || ram[i + 3] !== 0) {
+        return addr;
+      }
+    }
+  }
+  return -1;
+}
 
 /**
  * Try to render the GameCube YUV422 external frame buffer (XFB) to the canvas.
@@ -445,40 +502,31 @@ const SCREEN_H = 480;
  * pixels).  This function converts each pair to two RGBA pixels using
  * standard BT.601 coefficients.
  *
- * If the XFB region contains only zero bytes (game not yet rendering), fall
- * back to a "running" status overlay so the canvas is not just black.
+ * If no XFB content is found yet, `drawPlaceholder` is called with `title`
+ * so the canvas shows the game name and a "waiting for first XFB write" hint
+ * rather than the generic "load a game" splash.
  *
  * @param {Uint8Array} ram  Zero-copy RAM view
  * @param {CanvasRenderingContext2D} ctx
  * @param {WasmEmulator} emu
+ * @param {string|null}  title  Current game title (or null if no game loaded)
  */
-function renderXfb(ram, ctx, emu) {
-  const xfb         = XFB_PHYS;
-  // YUV422: 2 bytes per pixel
-  const xfbByteSize = SCREEN_W * SCREEN_H * 2;
-
-  // Check whether the XFB region is within mapped RAM
-  if (xfb + xfbByteSize > ram.length) {
-    drawPlaceholder(ctx, null, emu);
-    return;
-  }
-
-  // Quick heuristic: sample the first 64 bytes (16 YUV422 pixel pairs) to
-  // decide whether the game has written any frame data yet.  64 bytes is
-  // enough to distinguish a real frame from an all-zero buffer without
-  // scanning the full 600 KB XFB.  Once content is detected we skip this
-  // check via `xfbHasContent` to avoid the scan overhead on every frame.
+function renderXfb(ram, ctx, emu, title) {
+  // Once content has been located we skip the scan; reset xfbHasContent to
+  // re-enable it (e.g. after loading a new ISO or pressing Reset).
   if (!xfbHasContent) {
-    for (let i = xfb; i < xfb + 64; i += 4) {
-      if (ram[i] !== 0 || ram[i + 1] !== 0 || ram[i + 2] !== 0 || ram[i + 3] !== 0) {
-        xfbHasContent = true;
-        break;
-      }
+    const found = detectXfbAddress(ram);
+    if (found < 0) {
+      drawPlaceholder(ctx, title, emu);
+      return;
     }
+    xfbAddr       = found;
+    xfbHasContent = true;
   }
 
-  if (!xfbHasContent) {
-    drawPlaceholder(ctx, null, emu);
+  const xfb = xfbAddr;
+  if (xfb + XFB_BYTE_SIZE > ram.length) {
+    drawPlaceholder(ctx, title, emu);
     return;
   }
 
@@ -633,8 +681,10 @@ let animFrameId    = null;
 let gameTitle      = null;
 let frameCount     = 0;
 let lastFpsTime    = 0;
-/** Set to true the first time we detect non-zero XFB data; avoids re-scanning every frame. */
+/** Set to true once non-zero XFB data is found; cleared on ISO load / Reset. */
 let xfbHasContent  = false;
+/** Physical base address of the discovered XFB (updated by detectXfbAddress). */
+let xfbAddr        = XFB_PHYS_DEFAULT;
 
 /**
  * Main emulation loop — called by requestAnimationFrame at ~60 Hz.
@@ -654,7 +704,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   }
 
   // Render XFB to canvas
-  renderXfb(ram, ctx, emu);
+  renderXfb(ram, ctx, emu, gameTitle);
 
   // FPS counter (update every second)
   frameCount++;
@@ -795,8 +845,9 @@ async function main() {
   $("btn-reset").addEventListener("click", () => {
     stopLoop();
     clearModuleCache();
-    ramView = null;        // force refresh of zero-copy view
-    xfbHasContent = false; // re-arm the XFB content check
+    ramView       = null;        // force refresh of zero-copy view
+    xfbHasContent = false;       // re-arm the XFB content check
+    xfbAddr       = XFB_PHYS_DEFAULT;
     // Return to the entry point of the last loaded game (or 0x80000000 if none)
     emu.set_pc(lastEntryPoint);
     drawPlaceholder(ctx, gameTitle, null);
@@ -845,6 +896,7 @@ async function main() {
         clearModuleCache();
         ramView       = null;
         xfbHasContent = false;
+        xfbAddr       = XFB_PHYS_DEFAULT;
 
         const meta = parseAndLoadIso(evt.target.result, emu);
         gameTitle     = meta.gameName || meta.gameId || "Unknown Game";
