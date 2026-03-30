@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lazuli — GameCube WASM Emulator</title>
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --panel:   #161b22;
+      --border:  #30363d;
+      --accent:  #58a6ff;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --text:    #c9d1d9;
+      --muted:   #8b949e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 1.2rem; color: var(--accent); }
+    header span { color: var(--muted); font-size: 0.85rem; }
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      padding: 16px;
+    }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .card-body { padding: 14px; }
+
+    /* Controls */
+    .controls { display: flex; flex-direction: column; gap: 10px; }
+    label { font-size: 0.85rem; color: var(--muted); }
+    input[type=number], textarea, select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 6px 8px;
+      font-size: 0.85rem;
+      font-family: "Consolas", "Courier New", monospace;
+    }
+    textarea { resize: vertical; min-height: 80px; }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      padding: 8px 16px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    .btn-primary { background: var(--accent); color: #000; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-secondary { background: var(--border); color: var(--text); }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* Status bar */
+    #status-bar {
+      padding: 6px 14px;
+      font-size: 0.78rem;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .status-ok   { color: var(--green); }
+    .status-err  { color: var(--red); }
+    .status-info { color: var(--yellow); }
+
+    /* Register grid */
+    .reg-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 4px;
+      font-family: "Consolas", monospace;
+      font-size: 0.78rem;
+    }
+    .reg-cell {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 4px 6px;
+    }
+    .reg-name { color: var(--muted); }
+    .reg-val  { color: var(--accent); }
+
+    /* WAT / hex output */
+    #block-output {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+      font-family: "Consolas", monospace;
+      font-size: 0.78rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    /* Stats */
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.83rem;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .stat-row:last-child { border-bottom: none; }
+    .stat-val { color: var(--accent); font-family: monospace; }
+
+    /* Pipeline diagram */
+    .pipeline {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .stage {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 6px 10px;
+      text-align: center;
+    }
+    .stage-title { color: var(--muted); font-size: 0.7rem; }
+    .stage-body  { color: var(--accent); font-weight: 600; margin-top: 2px; }
+    .arrow { color: var(--muted); font-size: 1rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🎮 Lazuli</h1>
+  <span>GameCube · PowerPC → WebAssembly Dynarec</span>
+</header>
+
+<main>
+
+  <!-- ── Left column ── -->
+  <div style="display:flex;flex-direction:column;gap:16px;">
+
+    <!-- Assembly input -->
+    <div class="card">
+      <div class="card-header">PowerPC Instruction Input (hex words)</div>
+      <div class="card-body controls">
+        <label>Paste 32-bit big-endian instruction words (one per line, hex):</label>
+        <textarea id="asm-input" rows="6" spellcheck="false">38600002
+3C600001
+60630000
+4E800020</textarea>
+        <label>Base PC (hex):</label>
+        <input type="text" id="base-pc" value="80000000" style="font-family:monospace;" />
+        <div class="btn-row">
+          <button class="btn-primary" id="btn-compile" disabled>
+            Compile → WASM
+          </button>
+          <button class="btn-secondary" id="btn-load-demo">
+            Load demo program
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dynarec pipeline diagram -->
+    <div class="card">
+      <div class="card-header">Dynarec-to-WASM Pipeline</div>
+      <div class="card-body">
+        <p style="font-size:0.82rem;color:var(--muted);margin-bottom:8px;">
+          This is the same "compiled dynarec to WebAssembly" approach used by the
+          <strong style="color:var(--text)">Play!</strong> PS2 emulator.
+          Guest PowerPC instructions are translated once by the
+          <code style="color:var(--accent)">ppcwasm</code> Rust JIT, and the
+          resulting WASM bytecode is compiled by the browser's native engine.
+        </p>
+        <div class="pipeline">
+          <div class="stage">
+            <div class="stage-title">Guest ISA</div>
+            <div class="stage-body">PowerPC</div>
+          </div>
+          <span class="arrow">→</span>
+          <div class="stage">
+            <div class="stage-title">Rust JIT (ppcwasm)</div>
+            <div class="stage-body">WASM bytecode</div>
+          </div>
+          <span class="arrow">→</span>
+          <div class="stage">
+            <div class="stage-title">Browser compiler</div>
+            <div class="stage-body">WebAssembly.compile()</div>
+          </div>
+          <span class="arrow">→</span>
+          <div class="stage">
+            <div class="stage-title">Execution</div>
+            <div class="stage-body">native speed</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status -->
+    <div class="card">
+      <div class="card-header">Status</div>
+      <div class="card-body">
+        <div id="status-bar" class="status-info">Loading WASM module…</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Right column ── -->
+  <div style="display:flex;flex-direction:column;gap:16px;">
+
+    <!-- Compiled block output -->
+    <div class="card">
+      <div class="card-header">Compiled WASM Block</div>
+      <div class="card-body">
+        <div id="block-output">(compile a block to see its WASM bytecode here)</div>
+      </div>
+    </div>
+
+    <!-- JIT statistics -->
+    <div class="card">
+      <div class="card-header">JIT Statistics</div>
+      <div class="card-body">
+        <div class="stat-row">
+          <span>Blocks compiled</span>
+          <span class="stat-val" id="stat-compiled">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Cache entries</span>
+          <span class="stat-val" id="stat-cache">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Last block — PPC instructions</span>
+          <span class="stat-val" id="stat-ins">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Last block — WASM bytes</span>
+          <span class="stat-val" id="stat-bytes">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- CPU register file -->
+    <div class="card">
+      <div class="card-header">CPU Register File</div>
+      <div class="card-body">
+        <div class="reg-grid" id="reg-grid">
+          <!-- filled by JS -->
+        </div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<script type="module" src="bootstrap.js"></script>
+</body>
+</html>

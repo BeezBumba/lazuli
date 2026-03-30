@@ -11,6 +11,7 @@ members = [
     "crates/lazuli",
     "crates/ppcjit",
     "crates/ppcint",
+    "crates/ppcwasm",
     "crates/dspint",
     "crates/vtxjit",
     "crates/cores",
@@ -22,6 +23,7 @@ members = [
     "crates/ipl-hle",
     "crates/app",
     "crates/ppcint",
+    "crates/lazuli-web",
 ]
 default-members = [
     # libraries
@@ -35,6 +37,7 @@ default-members = [
     "crates/lazuli",
     "crates/ppcjit",
     "crates/ppcint",
+    "crates/ppcwasm",
     "crates/dspint",
     "crates/vtxjit",
     "crates/cores",
@@ -141,6 +144,7 @@ dspint = { path = "./crates/dspint" }
 vtxjit = { path = "./crates/vtxjit" }
 cores = { path = "./crates/cores" }
 renderer = { path = "./crates/renderer" }
+ppcwasm = { path = "./crates/ppcwasm" }
 modules = { path = "./crates/modules" }
 
 # actual dependencies
