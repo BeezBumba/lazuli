@@ -42,6 +42,12 @@ pub struct RegOffsets {
     pub tb_hi: u64,
     /// Byte offset of `Cpu::supervisor.config.msr`.
     pub msr: u64,
+    /// Byte offset of `Cpu::supervisor.exception.srr[0]` (SRR0, SPR 26).
+    pub srr0: u64,
+    /// Byte offset of `Cpu::supervisor.exception.srr[1]` (SRR1, SPR 27).
+    pub srr1: u64,
+    /// Byte offsets of `Cpu::supervisor.exception.sprg[0..4]` (SPRG0–3, SPR 272–275).
+    pub sprg: [u64; 4],
 }
 
 impl RegOffsets {
@@ -63,6 +69,9 @@ impl RegOffsets {
             fpr_ps1[i] = fpr_base + (i as u64) * float_pair_size + 8;
         }
 
+        let srr_base  = offset_of!(Cpu, supervisor.exception.srr) as u64;
+        let sprg_base = offset_of!(Cpu, supervisor.exception.sprg) as u64;
+
         RegOffsets {
             pc,
             gpr,
@@ -75,6 +84,9 @@ impl RegOffsets {
             tb_lo: offset_of!(Cpu, supervisor.misc.tb) as u64,
             tb_hi: offset_of!(Cpu, supervisor.misc.tb) as u64 + 4,
             msr: offset_of!(Cpu, supervisor.config.msr) as u64,
+            srr0: srr_base,
+            srr1: srr_base + 4,
+            sprg: [sprg_base, sprg_base + 4, sprg_base + 8, sprg_base + 12],
         }
     }
 }
