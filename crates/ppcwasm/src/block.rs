@@ -62,4 +62,7 @@ pub struct WasmBlock {
     /// Estimated cycle count (one cycle per instruction, matching the
     /// interpreter's default accounting).
     pub cycles: u32,
+    /// Opcode names (debug strings) for any instructions that fell through to
+    /// the `raise_exception` stub because they are not yet implemented.
+    pub unimplemented_ops: Vec<String>,
 }

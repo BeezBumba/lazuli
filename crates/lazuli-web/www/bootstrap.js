@@ -294,12 +294,21 @@ function getRamView(emu) {
  *
  * @param {Uint8Array} ram  Zero-copy view of guest RAM
  * @param {string[]}   log  Array to append exception/error messages to
+ * @param {string}     [pcContext]  Human-readable PC string for console messages
  */
 
 /** 25-bit physical address mask — matches Rust's `phys_addr` helper. */
 const PHYS_MASK = 0x01FFFFFF;
 
-function buildHooks(ram, log) {
+/**
+ * Total number of raise_exception calls since the last ISO load / Reset.
+ * Used to throttle console output so we log only the first few occurrences.
+ */
+let raiseExceptionTotal = 0;
+/** Maximum number of raise_exception events logged to the console. */
+const RAISE_EXCEPTION_LOG_LIMIT = 30;
+
+function buildHooks(ram, log, pcContext = "?") {
   return {
     read_u8(addr) {
       addr = (addr >>> 0) & PHYS_MASK;
@@ -339,6 +348,13 @@ function buildHooks(ram, log) {
     },
     raise_exception(kind) {
       if (log) log.push(`exception: kind=${kind}`);
+      raiseExceptionTotal++;
+      if (raiseExceptionTotal <= RAISE_EXCEPTION_LOG_LIMIT) {
+        console.warn(`[lazuli] raise_exception(kind=${kind}) in block @ ${pcContext} (total #${raiseExceptionTotal})`);
+        if (raiseExceptionTotal === RAISE_EXCEPTION_LOG_LIMIT) {
+          console.warn("[lazuli] raise_exception log limit reached — suppressing further messages");
+        }
+      }
     },
   };
 }
@@ -358,6 +374,7 @@ const moduleCache = new Map(); // u32 pc → WebAssembly.Module
 
 function clearModuleCache() {
   moduleCache.clear();
+  raiseExceptionTotal = 0;
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
@@ -388,12 +405,14 @@ function executeOneBlockSync(emu, ram, log) {
     try {
       wasmBytes = emu.compile_block(pc);
     } catch (e) {
+      console.error(`[lazuli] compile error @ ${pcHex}: ${e}`);
       if (log) log.push(`[${pcHex}] compile error: ${e}`);
       return false;
     }
     try {
       module = new WebAssembly.Module(wasmBytes);
     } catch (e) {
+      console.error(`[lazuli] WebAssembly.Module error @ ${pcHex}: ${e}`);
       if (log) log.push(`[${pcHex}] WebAssembly.Module error: ${e}`);
       return false;
     }
@@ -412,9 +431,10 @@ function executeOneBlockSync(emu, ram, log) {
   try {
     instance = new WebAssembly.Instance(module, {
       env:   { memory: regsMem },
-      hooks: buildHooks(ram, log),
+      hooks: buildHooks(ram, log, pcHex),
     });
   } catch (e) {
+    console.error(`[lazuli] instantiation error @ ${pcHex}: ${e}`);
     if (log) log.push(`[${pcHex}] instantiation error: ${e}`);
     return false;
   }
@@ -424,6 +444,7 @@ function executeOneBlockSync(emu, ram, log) {
   try {
     nextPc = instance.exports.execute(0 /* regs_ptr = 0 */);
   } catch (e) {
+    console.error(`[lazuli] execution error @ ${pcHex}: ${e}`);
     if (log) log.push(`[${pcHex}] execution error: ${e}`);
     return false;
   }
@@ -713,9 +734,24 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // Execute blocks for this frame
   const ram = getRamView(emu);
   let blocksThisFrame = 0;
+  let loopError = false;
   for (let i = 0; i < BLOCKS_PER_FRAME; i++) {
-    if (!executeOneBlockSync(emu, ram, null)) break;
+    if (!executeOneBlockSync(emu, ram, null)) {
+      loopError = true;
+      break;
+    }
     blocksThisFrame++;
+  }
+  if (loopError) {
+    const stuckPc = emu.get_pc();
+    const stuckHex = "0x" + stuckPc.toString(16).toUpperCase().padStart(8, "0");
+    console.error(
+      `[lazuli] gameLoop: execution stopped after ${blocksThisFrame} blocks ` +
+      `(total compiled: ${emu.blocks_compiled()}, executed: ${emu.blocks_executed()}) ` +
+      `— PC is now ${stuckHex}`
+    );
+    stopLoop();
+    return;
   }
 
   // Render XFB to canvas

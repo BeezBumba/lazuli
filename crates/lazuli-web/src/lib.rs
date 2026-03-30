@@ -313,13 +313,44 @@ impl WasmEmulator {
     pub fn compile_block(&mut self, guest_pc: u32) -> Result<js_sys::Uint8Array, JsValue> {
         let instructions = self.fetch_instructions(guest_pc);
         if instructions.is_empty() {
+            console_log!("[lazuli] compile_block 0x{:08X}: no instructions in RAM", guest_pc);
             return Err(JsValue::from_str("no instructions at guest PC"));
         }
+
+        // Build a human-readable disassembly string for the console.
+        let disasm: Vec<String> = instructions
+            .iter()
+            .map(|(pc, ins)| format!("0x{:08X}: {:?}", pc, ins.op))
+            .collect();
 
         let block = self
             .jit
             .build(instructions.into_iter())
             .ok_or_else(|| JsValue::from_str("JIT produced no block"))?;
+
+        // Log every block with its disassembly so unimplemented instructions
+        // are visible immediately in the browser console.
+        if block.unimplemented_ops.is_empty() {
+            console_log!(
+                "[lazuli] block #{} @ 0x{:08X} ({} insns, {} WASM bytes): {}",
+                self.blocks_compiled + 1,
+                guest_pc,
+                block.instruction_count,
+                block.bytes.len(),
+                disasm.join(" | "),
+            );
+        } else {
+            console_log!(
+                "[lazuli] block #{} @ 0x{:08X} ({} insns, {} WASM bytes) \
+                 ⚠ UNIMPLEMENTED [{}]: {}",
+                self.blocks_compiled + 1,
+                guest_pc,
+                block.instruction_count,
+                block.bytes.len(),
+                block.unimplemented_ops.join(", "),
+                disasm.join(" | "),
+            );
+        }
 
         self.blocks_compiled += 1;
         let bytes = js_sys::Uint8Array::from(block.bytes.as_slice());
