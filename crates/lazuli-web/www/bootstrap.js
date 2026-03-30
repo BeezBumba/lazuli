@@ -1,33 +1,37 @@
 /**
- * bootstrap.js — Lazuli web frontend glue
+ * bootstrap.js — Lazuli GameCube WASM emulator frontend
  *
- * This script:
- *  1. Loads the Lazuli WASM module produced by `wasm-pack build`.
- *  2. Creates a `WasmEmulator` instance.
- *  3. Wires up the UI so the user can:
- *     - Paste PowerPC hex words and see the compiled WASM bytecode.
- *     - Load a raw binary file into guest RAM.
- *     - Step through execution one compiled block at a time.
+ * Features implemented here:
+ *  • GameCube ISO loading: parses the disc header and boot DOL binary,
+ *    loads each section into the emulator's 24 MiB guest RAM.
+ *  • Dynarec game loop: uses `requestAnimationFrame` to drive the PPC→WASM
+ *    JIT pipeline; compiled WASM modules are cached in a JS Map keyed by
+ *    guest PC so each block is compiled at most once.
+ *  • Zero-copy RAM: accesses the emulator's RAM buffer through
+ *    `wasm_memory()` + `ram_ptr()` to avoid per-block copies.
+ *  • Hook closures: memory read/write hooks read from and write directly to
+ *    the zero-copy RAM view; no `get_ram_copy()` / `sync_ram()` in the loop.
+ *  • Keyboard controller: maps keyboard keys to GameCube button bits and
+ *    forwards the bitmask to the Rust emulator on every keydown/keyup.
+ *  • XFB rendering: converts the GameCube YUV422 external frame-buffer region
+ *    to RGBA and paints it onto a 640×480 canvas each frame.
+ *  • Web Audio: creates an AudioContext for future DSP output; a startup
+ *    chime confirms that audio is active.
  *
- * ## How to build and serve
+ * ## Build & serve
  *
- *   # Install wasm-pack (once):
- *   curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
- *
- *   # Build the WASM package (from workspace root):
  *   cd crates/lazuli-web && wasm-pack build --target web --out-dir www/pkg
+ *   cd www && python3 -m http.server 8080
  *
- *   # Serve on localhost:8080:
- *   cd crates/lazuli-web/www && python3 -m http.server 8080
+ * Or from the workspace root:
  *
- * Then open http://localhost:8080 in your browser.
- * Alternatively run `just web-serve` from the workspace root.
+ *   just web-serve
  */
 
-// ── Load the wasm-bindgen generated module ─────────────────────────────────
-import init, { WasmEmulator } from "./pkg/lazuli_web.js";
+// ── Imports ───────────────────────────────────────────────────────────────────
+import init, { WasmEmulator, wasm_memory } from "./pkg/lazuli_web.js";
 
-// ── DOM helpers ────────────────────────────────────────────────────────────
+// ── DOM helpers ───────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 
 function setStatus(msg, cls = "status-info") {
@@ -39,14 +43,14 @@ function setStatus(msg, cls = "status-info") {
 function updateStats(emu) {
   $("stat-compiled").textContent = emu.blocks_compiled();
   $("stat-executed").textContent = emu.blocks_executed();
-  $("stat-cache").textContent    = emu.cache_size();
+  $("stat-cache").textContent    = moduleCache.size;
+  $("stat-pad").textContent      = "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
 }
 
 function renderRegisters(emu) {
   const grid = $("reg-grid");
   grid.innerHTML = "";
 
-  // GPRs r0..r31
   for (let i = 0; i < 32; i++) {
     const cell = document.createElement("div");
     cell.className = "reg-cell";
@@ -57,7 +61,6 @@ function renderRegisters(emu) {
     grid.appendChild(cell);
   }
 
-  // PC
   const pcCell = document.createElement("div");
   pcCell.className = "reg-cell";
   const pc = emu.get_pc();
@@ -67,155 +70,616 @@ function renderRegisters(emu) {
   grid.appendChild(pcCell);
 }
 
-// ── Hex dump + simple WAT-like annotation ─────────────────────────────────
+// ── Hex dump helper ───────────────────────────────────────────────────────────
 function annotateWasm(bytes) {
   if (bytes.length === 0) return "(empty)";
-
   const hex = (b) => b.toString(16).padStart(2, "0");
-  const lines = [];
-
-  // Magic + version
-  lines.push("; WASM binary module");
-  lines.push(";");
-
-  // Print first 8 bytes (magic + version)
+  const lines = ["; WASM binary module", ";"];
   if (bytes.length >= 8) {
-    const magic   = Array.from(bytes.slice(0, 4)).map(hex).join(" ");
-    const version = Array.from(bytes.slice(4, 8)).map(hex).join(" ");
-    lines.push(`; magic:   ${magic}  (\\0asm)`);
-    lines.push(`; version: ${version}  (1)`);
+    lines.push(`; magic:   ${Array.from(bytes.slice(0, 4)).map(hex).join(" ")}  (\\0asm)`);
+    lines.push(`; version: ${Array.from(bytes.slice(4, 8)).map(hex).join(" ")}  (1)`);
     lines.push(";");
   }
-
-  // Hex dump, 16 bytes per row
   lines.push(`; Full bytecode (${bytes.length} bytes):`);
   for (let i = 0; i < bytes.length; i += 16) {
-    const chunk = bytes.slice(i, i + 16);
-    const hexPart = Array.from(chunk).map(hex).join(" ").padEnd(48, " ");
+    const chunk    = bytes.slice(i, i + 16);
+    const hexPart  = Array.from(chunk).map(hex).join(" ").padEnd(48, " ");
     const asciiPart = Array.from(chunk)
       .map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : "."))
       .join("");
     lines.push(`  ${i.toString(16).padStart(4, "0")}  ${hexPart}  ${asciiPart}`);
   }
-
   return lines.join("\n");
 }
 
-// ── Block execution via dynarec pipeline ──────────────────────────────────
-//
-// To execute a compiled block we need to:
-//  1. Compile the block at the current PC → raw WASM bytes.
-//  2. Copy the emulator's serialised CPU struct into a fresh WebAssembly.Memory.
-//  3. Instantiate the block with:
-//       • env.memory  — the memory holding the CPU registers.
-//       • hooks.*     — closures that read/write the emulator's guest RAM.
-//  4. Call instance.exports.execute(regs_ptr=0) → returns the next PC.
-//  5. Copy the (potentially modified) CPU bytes back into the Rust emulator.
-//
-// The hook closures hold a Uint8Array over a *snapshot* of the guest RAM
-// taken before execution.  Writes from the block are buffered in that
-// snapshot and flushed back to the Rust emulator afterwards via sync_ram().
-//
-const WASM_PAGE_SIZE = 65536;
+// ── GameCube ISO / DOL parsing ────────────────────────────────────────────────
 
-async function executeOneBlock(emu, execLog) {
-  const pc = emu.get_pc();
-  const pcHex = "0x" + pc.toString(16).toUpperCase().padStart(8, "0");
+/**
+ * Parse a GameCube DOL header and return a list of loadable sections plus the
+ * entry-point address.
+ *
+ * DOL header layout (all fields big-endian, header is 0x100 bytes):
+ *   0x000  text_offsets[7]   — file offset of each .text section
+ *   0x01C  data_offsets[11]  — file offset of each .data section
+ *   0x048  text_targets[7]   — guest load address of each .text section
+ *   0x064  data_targets[11]  — guest load address of each .data section
+ *   0x090  text_sizes[7]     — size in bytes of each .text section
+ *   0x0AC  data_sizes[11]    — size in bytes of each .data section
+ *   0x0D8  bss_target        — guest address of BSS region
+ *   0x0DC  bss_size          — size of BSS region
+ *   0x0E0  entry             — entry-point guest address
+ *
+ * @param {DataView}  view      DataView over the entire ISO/DOL ArrayBuffer
+ * @param {Uint8Array} bytes    Uint8Array over the same buffer
+ * @param {number}    dolOffset Byte offset of the DOL within the ISO
+ */
+function parseDol(view, bytes, dolOffset) {
+  const u32 = (off) => view.getUint32(dolOffset + off, false /* big-endian */);
 
-  // Step 1 – compile
-  let wasmBytes;
-  try {
-    wasmBytes = emu.compile_block(pc);
-  } catch (e) {
-    execLog.push(`[PC ${pcHex}] compile error: ${e}`);
-    return false;
+  const textOffsets = Array.from({ length: 7  }, (_, i) => u32(0x000 + i * 4));
+  const dataOffsets = Array.from({ length: 11 }, (_, i) => u32(0x01C + i * 4));
+  const textTargets = Array.from({ length: 7  }, (_, i) => u32(0x048 + i * 4));
+  const dataTargets = Array.from({ length: 11 }, (_, i) => u32(0x064 + i * 4));
+  const textSizes   = Array.from({ length: 7  }, (_, i) => u32(0x090 + i * 4));
+  const dataSizes   = Array.from({ length: 11 }, (_, i) => u32(0x0AC + i * 4));
+  const bssTarget   = u32(0x0D8);
+  const bssSize     = u32(0x0DC);
+  const entry       = u32(0x0E0);
+
+  const sections = [];
+
+  for (let i = 0; i < 7; i++) {
+    if (textOffsets[i] !== 0 && textSizes[i] !== 0) {
+      const start = dolOffset + textOffsets[i];
+      sections.push({ target: textTargets[i], data: bytes.slice(start, start + textSizes[i]) });
+    }
+  }
+  for (let i = 0; i < 11; i++) {
+    if (dataOffsets[i] !== 0 && dataSizes[i] !== 0) {
+      const start = dolOffset + dataOffsets[i];
+      sections.push({ target: dataTargets[i], data: bytes.slice(start, start + dataSizes[i]) });
+    }
   }
 
-  // Step 2 – allocate a WASM memory large enough for the CPU struct
-  const cpuSize   = emu.cpu_struct_size();
-  const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE_SIZE);
-  const regsMemory = new WebAssembly.Memory({ initial: pagesNeeded });
-  const regsView   = new Uint8Array(regsMemory.buffer);
+  return { sections, bssTarget, bssSize, entry };
+}
 
-  // Write the current CPU register state into the memory
-  const cpuBytes = emu.get_cpu_bytes();
-  regsView.set(cpuBytes, 0);
+/**
+ * Parse a GameCube ISO image, extract the boot DOL, load every section into
+ * the emulator's RAM, zero the BSS, and set the CPU entry point.
+ *
+ * GameCube ISO header layout (big-endian):
+ *   0x000  console_id (1 B) + game_id (5 B)
+ *   0x01C  magic word 0xC2339F3D
+ *   0x020  game name (null-terminated, ≤ 0x3E0 bytes)
+ *   0x420  bootfile_offset  — byte offset of the boot DOL within the ISO
+ *
+ * @param {ArrayBuffer} arrayBuffer Raw ISO bytes
+ * @param {WasmEmulator} emu        Emulator instance
+ * @returns {{ gameId: string, gameName: string, entry: number }}
+ */
+function parseAndLoadIso(arrayBuffer, emu) {
+  const view  = new DataView(arrayBuffer);
+  const bytes = new Uint8Array(arrayBuffer);
 
-  // Step 3 – snapshot guest RAM and build hook closures
-  const ramSnap = emu.get_ram_copy(); // Uint8Array copy
+  // Verify the GameCube magic word at 0x001C
+  const magic = view.getUint32(0x1C, false);
+  if (magic !== 0xC2339F3D) {
+    throw new Error(
+      `Not a valid GameCube ISO — magic word mismatch ` +
+      `(got 0x${magic.toString(16).toUpperCase()}, expected 0xC2339F3D)`
+    );
+  }
 
-  const hooks = {
-    read_u8:  (addr) => {
-      addr = addr >>> 0; // treat as unsigned
-      return addr < ramSnap.length ? ramSnap[addr] : 0;
-    },
-    read_u16: (addr) => {
+  // Game ID: bytes 0–5 (e.g. "GMSE01" for Super Mario Sunshine NTSC)
+  const gameId = String.fromCharCode(...bytes.slice(0, 6).filter(b => b !== 0));
+
+  // Game name: null-terminated string starting at 0x020
+  let gameName = "";
+  for (let i = 0x020; i < 0x400 && bytes[i] !== 0; i++) {
+    gameName += String.fromCharCode(bytes[i]);
+  }
+
+  // Boot DOL offset lives at 0x420 in the ISO header
+  const dolOffset = view.getUint32(0x420, false);
+  if (dolOffset === 0 || dolOffset >= arrayBuffer.byteLength) {
+    throw new Error(`Invalid DOL offset 0x${dolOffset.toString(16)} in ISO header`);
+  }
+
+  // Parse the DOL and load sections into emulator RAM.
+  // load_bytes() on the Rust side masks the target address with 0x01FFFFFF
+  // to convert GameCube virtual addresses (0x8xxxxxxx) to physical offsets.
+  const dol = parseDol(view, bytes, dolOffset);
+  for (const { target, data } of dol.sections) {
+    emu.load_bytes(target, data);
+  }
+
+  // Zero the BSS region
+  if (dol.bssSize > 0) {
+    emu.load_bytes(dol.bssTarget, new Uint8Array(dol.bssSize));
+  }
+
+  // Point the CPU at the entry point
+  emu.set_pc(dol.entry);
+
+  return { gameId, gameName, entry: dol.entry };
+}
+
+// ── GameCube button bitmask ───────────────────────────────────────────────────
+
+/** GameCube controller button bits used by set_pad_buttons(). */
+const GC_BTN = {
+  A:     0x0001,
+  B:     0x0002,
+  X:     0x0004,
+  Y:     0x0008,
+  Z:     0x0010,
+  START: 0x0020,
+  UP:    0x0040,
+  DOWN:  0x0080,
+  LEFT:  0x0100,
+  RIGHT: 0x0200,
+  L:     0x0400,
+  R:     0x0800,
+  // Analog stick pseudo-buttons (discrete, not analog — for demo purposes)
+  STICK_UP:    0x1000,
+  STICK_DOWN:  0x2000,
+  STICK_LEFT:  0x4000,
+  STICK_RIGHT: 0x8000,
+};
+
+/** Keyboard key → GameCube button mapping. */
+const KEY_MAP = {
+  "x":          GC_BTN.A,
+  "z":          GC_BTN.B,
+  "s":          GC_BTN.X,
+  "a":          GC_BTN.Y,
+  "d":          GC_BTN.Z,
+  "Enter":      GC_BTN.START,
+  "ArrowUp":    GC_BTN.UP,
+  "ArrowDown":  GC_BTN.DOWN,
+  "ArrowLeft":  GC_BTN.LEFT,
+  "ArrowRight": GC_BTN.RIGHT,
+  "q":          GC_BTN.L,
+  "e":          GC_BTN.R,
+  "i":          GC_BTN.STICK_UP,
+  "k":          GC_BTN.STICK_DOWN,
+  "j":          GC_BTN.STICK_LEFT,
+  "l":          GC_BTN.STICK_RIGHT,
+};
+
+// ── Zero-copy RAM view ────────────────────────────────────────────────────────
+
+/**
+ * Create (or refresh) a zero-copy live view of the Rust emulator's RAM.
+ *
+ * The view is backed by the WASM module's linear memory buffer.  It must be
+ * recreated after any WASM memory growth (detected by comparing buffers).
+ */
+let ramView = null;
+let lastMemoryBuffer = null;
+
+function getRamView(emu) {
+  const mem = wasm_memory();
+  if (!ramView || mem.buffer !== lastMemoryBuffer) {
+    lastMemoryBuffer = mem.buffer;
+    ramView = new Uint8Array(mem.buffer, emu.ram_ptr(), emu.ram_size());
+  }
+  return ramView;
+}
+
+// ── Hook closure factory ──────────────────────────────────────────────────────
+
+/**
+ * Build the `hooks` import object for a compiled JIT block.
+ *
+ * Each compiled block imports these functions from the `"hooks"` module:
+ *   read_u8(addr) / read_u16(addr) / read_u32(addr)
+ *   write_u8(addr, val) / write_u16(addr, val) / write_u32(addr, val)
+ *   raise_exception(kind)
+ *
+ * The closures operate directly on the zero-copy `ramView`, so reads and
+ * writes are immediately visible in the Rust emulator without any syncing.
+ *
+ * @param {Uint8Array} ram  Zero-copy view of guest RAM
+ * @param {string[]}   log  Array to append exception/error messages to
+ */
+function buildHooks(ram, log) {
+  return {
+    read_u8(addr) {
       addr = addr >>> 0;
-      if (addr + 1 >= ramSnap.length) return 0;
-      return (ramSnap[addr] << 8) | ramSnap[addr + 1];
+      return addr < ram.length ? ram[addr] : 0;
     },
-    read_u32: (addr) => {
+    read_u16(addr) {
       addr = addr >>> 0;
-      if (addr + 3 >= ramSnap.length) return 0;
-      return ((ramSnap[addr] << 24) | (ramSnap[addr + 1] << 16) |
-              (ramSnap[addr + 2] << 8)  |  ramSnap[addr + 3]) >>> 0;
+      if (addr + 1 >= ram.length) return 0;
+      return (ram[addr] << 8) | ram[addr + 1];
     },
-    write_u8: (addr, val) => {
+    read_u32(addr) {
       addr = addr >>> 0;
-      if (addr < ramSnap.length) ramSnap[addr] = val & 0xff;
+      if (addr + 3 >= ram.length) return 0;
+      return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
+               (ram[addr + 2] << 8) | ram[addr + 3]) >>> 0);
     },
-    write_u16: (addr, val) => {
+    write_u8(addr, val) {
       addr = addr >>> 0;
-      if (addr + 1 < ramSnap.length) {
-        ramSnap[addr]     = (val >> 8) & 0xff;
-        ramSnap[addr + 1] = val & 0xff;
+      if (addr < ram.length) ram[addr] = val & 0xff;
+    },
+    write_u16(addr, val) {
+      addr = addr >>> 0;
+      if (addr + 1 < ram.length) {
+        ram[addr]     = (val >> 8) & 0xff;
+        ram[addr + 1] = val & 0xff;
       }
     },
-    write_u32: (addr, val) => {
-      addr = addr >>> 0; val = val >>> 0;
-      if (addr + 3 < ramSnap.length) {
-        ramSnap[addr]     = (val >>> 24) & 0xff;
-        ramSnap[addr + 1] = (val >>> 16) & 0xff;
-        ramSnap[addr + 2] = (val >>>  8) & 0xff;
-        ramSnap[addr + 3] =  val         & 0xff;
+    write_u32(addr, val) {
+      addr = addr >>> 0;
+      val  = val  >>> 0;
+      if (addr + 3 < ram.length) {
+        ram[addr]     = (val >>> 24) & 0xff;
+        ram[addr + 1] = (val >>> 16) & 0xff;
+        ram[addr + 2] = (val >>>  8) & 0xff;
+        ram[addr + 3] =  val         & 0xff;
       }
     },
-    raise_exception: (kind) => {
-      execLog.push(`[PC ${pcHex}] exception raised: kind=${kind}`);
+    raise_exception(kind) {
+      if (log) log.push(`exception: kind=${kind}`);
     },
   };
+}
 
-  // Step 4 – instantiate and execute
-  let nextPc;
+// ── Compiled block cache ──────────────────────────────────────────────────────
+
+/**
+ * JavaScript-side module cache: maps guest PC → WebAssembly.Module.
+ *
+ * Each unique basic block is compiled by the Rust ppcwasm JIT exactly once
+ * and then cached here.  On cache hit, only a synchronous `new
+ * WebAssembly.Instance()` is needed, which is fast.
+ *
+ * The cache is cleared whenever a new ROM/ISO is loaded via `clearModuleCache`.
+ */
+const moduleCache = new Map(); // u32 pc → WebAssembly.Module
+
+function clearModuleCache() {
+  moduleCache.clear();
+}
+
+// ── Synchronous block execution ───────────────────────────────────────────────
+
+const WASM_PAGE = 65536;
+
+/**
+ * Compile (or fetch from cache), instantiate, and execute one PPC basic block.
+ *
+ * Uses the synchronous `new WebAssembly.Module()` / `new WebAssembly.Instance()`
+ * APIs so it can be called from a `requestAnimationFrame` callback without
+ * `await`.  Browsers allow synchronous WASM compilation for small modules on
+ * the main thread; our JIT blocks are always < 4 KB.
+ *
+ * @param {WasmEmulator} emu   Emulator instance
+ * @param {Uint8Array}   ram   Zero-copy RAM view (from getRamView)
+ * @param {string[]|null} log  Optional log array; pass null in tight loops
+ * @returns {boolean}  true on success, false on compile / execution error
+ */
+function executeOneBlockSync(emu, ram, log) {
+  const pc    = emu.get_pc();
+  const pcHex = "0x" + pc.toString(16).toUpperCase().padStart(8, "0");
+
+  // ── Step 1: compile (or load from JS cache) ──────────────────────────────
+  let module = moduleCache.get(pc);
+  if (!module) {
+    let wasmBytes;
+    try {
+      wasmBytes = emu.compile_block(pc);
+    } catch (e) {
+      if (log) log.push(`[${pcHex}] compile error: ${e}`);
+      return false;
+    }
+    try {
+      module = new WebAssembly.Module(wasmBytes);
+    } catch (e) {
+      if (log) log.push(`[${pcHex}] WebAssembly.Module error: ${e}`);
+      return false;
+    }
+    moduleCache.set(pc, module);
+  }
+
+  // ── Step 2: allocate a WASM memory page to hold the CPU register file ────
+  const cpuSize    = emu.cpu_struct_size();
+  const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE);
+  const regsMem    = new WebAssembly.Memory({ initial: pagesNeeded });
+  const regsView   = new Uint8Array(regsMem.buffer);
+  regsView.set(emu.get_cpu_bytes(), 0);
+
+  // ── Step 3: instantiate with hook closures that use the zero-copy RAM ────
+  let instance;
   try {
-    const { instance } = await WebAssembly.instantiate(wasmBytes, {
-      env: { memory: regsMemory },
-      hooks,
+    instance = new WebAssembly.Instance(module, {
+      env:   { memory: regsMem },
+      hooks: buildHooks(ram, log),
     });
-    nextPc = instance.exports.execute(0); // regs_ptr = 0
   } catch (e) {
-    execLog.push(`[PC ${pcHex}] instantiation/execution error: ${e}`);
+    if (log) log.push(`[${pcHex}] instantiation error: ${e}`);
     return false;
   }
 
-  // Step 5 – sync CPU state and RAM back to the Rust emulator
-  const updatedCpuBytes = new Uint8Array(regsMemory.buffer, 0, cpuSize);
-  emu.set_cpu_bytes(updatedCpuBytes);
-  emu.sync_ram(ramSnap);
+  // ── Step 4: execute ───────────────────────────────────────────────────────
+  let nextPc;
+  try {
+    nextPc = instance.exports.execute(0 /* regs_ptr = 0 */);
+  } catch (e) {
+    if (log) log.push(`[${pcHex}] execution error: ${e}`);
+    return false;
+  }
+
+  // ── Step 5: sync CPU state back; RAM is already in sync (zero-copy) ──────
+  emu.set_cpu_bytes(new Uint8Array(regsMem.buffer, 0, cpuSize));
   emu.record_block_executed();
 
-  // Determine the next PC: 0 means the block updated Cpu::pc itself
+  // nextPc == 0 means the block updated Cpu::pc itself (branch taken)
   const newPc = (nextPc >>> 0) !== 0 ? (nextPc >>> 0) : emu.get_pc();
   emu.set_pc(newPc);
 
-  const newPcHex = "0x" + newPc.toString(16).toUpperCase().padStart(8, "0");
-  execLog.push(
-    `[PC ${pcHex}] executed ${wasmBytes.length} byte block → next PC ${newPcHex}`
-  );
+  if (log) {
+    const newHex = "0x" + newPc.toString(16).toUpperCase().padStart(8, "0");
+    log.push(`[${pcHex}] executed → next PC ${newHex}`);
+  }
   return true;
 }
 
-// ── Demo programs ──────────────────────────────────────────────────────────
+// ── Canvas rendering ──────────────────────────────────────────────────────────
+
+/** Typical GameCube XFB physical base address. */
+const XFB_PHYS = 0x00C00000;
+const SCREEN_W = 640;
+const SCREEN_H = 480;
+
+/**
+ * Try to render the GameCube YUV422 external frame buffer (XFB) to the canvas.
+ *
+ * The GC XFB format stores pairs of pixels as [Cb, Y0, Cr, Y1] (4 bytes = 2
+ * pixels).  This function converts each pair to two RGBA pixels using
+ * standard BT.601 coefficients.
+ *
+ * If the XFB region contains only zero bytes (game not yet rendering), fall
+ * back to a "running" status overlay so the canvas is not just black.
+ *
+ * @param {Uint8Array} ram  Zero-copy RAM view
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {WasmEmulator} emu
+ */
+function renderXfb(ram, ctx, emu) {
+  const xfb = XFB_PHYS;
+  const totalYuv = SCREEN_W * SCREEN_H * 2; // YUV422: 2 bytes per pixel
+
+  // Check whether the XFB region is within mapped RAM
+  if (xfb + totalYuv > ram.length) {
+    drawPlaceholder(ctx, null, emu);
+    return;
+  }
+
+  // Check for any non-trivial data (games write non-zero YUV when rendering)
+  let hasContent = false;
+  for (let i = xfb; i < xfb + 64; i += 4) {
+    if (ram[i] !== 0 || ram[i + 1] !== 0 || ram[i + 2] !== 0 || ram[i + 3] !== 0) {
+      hasContent = true;
+      break;
+    }
+  }
+
+  if (!hasContent) {
+    drawPlaceholder(ctx, null, emu);
+    return;
+  }
+
+  // YUV422 → RGBA conversion into an ImageData
+  const imageData = ctx.createImageData(SCREEN_W, SCREEN_H);
+  const px        = imageData.data;
+  const pairs     = (SCREEN_W * SCREEN_H) >>> 1;
+
+  for (let i = 0; i < pairs; i++) {
+    const base = xfb + i * 4;
+    const cb = ram[base];
+    const y0 = ram[base + 1];
+    const cr = ram[base + 2];
+    const y1 = ram[base + 3];
+
+    const cbOff = cb - 128;
+    const crOff = cr - 128;
+
+    // BT.601: clamp to [0, 255]
+    const clamp = (v) => v < 0 ? 0 : v > 255 ? 255 : v;
+
+    const r0 = clamp(y0 + ((1402 * crOff) >> 10)) | 0;
+    const g0 = clamp(y0 - ((344  * cbOff) >> 10) - ((714 * crOff) >> 10)) | 0;
+    const b0 = clamp(y0 + ((1772 * cbOff) >> 10)) | 0;
+
+    const r1 = clamp(y1 + ((1402 * crOff) >> 10)) | 0;
+    const g1 = clamp(y1 - ((344  * cbOff) >> 10) - ((714 * crOff) >> 10)) | 0;
+    const b1 = clamp(y1 + ((1772 * cbOff) >> 10)) | 0;
+
+    const p = i * 8;
+    px[p]     = r0; px[p + 1] = g0; px[p + 2] = b0; px[p + 3] = 255;
+    px[p + 4] = r1; px[p + 5] = g1; px[p + 6] = b1; px[p + 7] = 255;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+/**
+ * Draw a placeholder screen when no XFB content is available.
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string|null} gameTitle  Game title or null if no game loaded
+ * @param {WasmEmulator|null} emu  Emulator for PC readout
+ */
+function drawPlaceholder(ctx, gameTitle, emu) {
+  const W = SCREEN_W, H = SCREEN_H;
+
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle grid
+  ctx.strokeStyle = "#1c2128";
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= W; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  for (let y = 0; y <= H; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  ctx.textAlign = "center";
+  if (gameTitle) {
+    ctx.fillStyle = "#58a6ff";
+    ctx.font = "bold 28px 'Consolas', monospace";
+    ctx.fillText(gameTitle, W / 2, H / 2 - 40);
+
+    ctx.fillStyle = "#3fb950";
+    ctx.font = "16px 'Consolas', monospace";
+    ctx.fillText("CPU running — waiting for first XFB write…", W / 2, H / 2);
+
+    if (emu) {
+      const pc = emu.get_pc();
+      ctx.fillStyle = "#8b949e";
+      ctx.font = "14px 'Consolas', monospace";
+      ctx.fillText(
+        `PC: 0x${pc.toString(16).toUpperCase().padStart(8, "0")}`,
+        W / 2, H / 2 + 30
+      );
+    }
+  } else {
+    ctx.fillStyle = "#58a6ff";
+    ctx.font = "bold 36px 'Consolas', monospace";
+    ctx.fillText("LAZULI", W / 2, H / 2 - 20);
+
+    ctx.fillStyle = "#8b949e";
+    ctx.font = "16px 'Consolas', monospace";
+    ctx.fillText("Load a GameCube ISO to start", W / 2, H / 2 + 20);
+  }
+}
+
+// ── Web Audio ─────────────────────────────────────────────────────────────────
+
+let audioCtx   = null;
+let audioActive = false;
+
+/**
+ * Initialise (or resume) the Web Audio context and play a short startup chime
+ * to confirm that audio routing is working.
+ *
+ * The AudioContext is created with a 32 kHz sample rate matching the
+ * GameCube's native audio output.  Actual DSP audio output will be routed
+ * here once the DSP emulation is integrated into the WASM frontend.
+ */
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new AudioContext({ sampleRate: 32000 });
+  }
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume();
+  }
+
+  // Short startup chime: C5 → G4 two-note sequence
+  const chime = [
+    { freq: 523.25, start: 0.00, dur: 0.15 },
+    { freq: 392.00, start: 0.10, dur: 0.15 },
+  ];
+  for (const { freq, start, dur } of chime) {
+    const osc  = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "triangle";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.08, audioCtx.currentTime + start);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + start + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(audioCtx.currentTime + start);
+    osc.stop(audioCtx.currentTime + start + dur + 0.05);
+  }
+
+  audioActive = true;
+}
+
+function suspendAudio() {
+  if (audioCtx) audioCtx.suspend();
+  audioActive = false;
+}
+
+// ── Game loop ─────────────────────────────────────────────────────────────────
+
+/** Number of JIT blocks to execute per animation frame (~60 Hz). */
+const BLOCKS_PER_FRAME = 500;
+
+let running        = false;
+let animFrameId    = null;
+let gameTitle      = null;
+let frameCount     = 0;
+let lastFpsTime    = 0;
+
+/**
+ * Main emulation loop — called by requestAnimationFrame at ~60 Hz.
+ *
+ * Each frame executes up to BLOCKS_PER_FRAME JIT blocks, renders the XFB to
+ * the canvas, and updates the stats display.
+ */
+function gameLoop(emu, canvas, ctx, timestamp) {
+  if (!running) return;
+
+  // Execute blocks for this frame
+  const ram = getRamView(emu);
+  let blocksThisFrame = 0;
+  for (let i = 0; i < BLOCKS_PER_FRAME; i++) {
+    if (!executeOneBlockSync(emu, ram, null)) break;
+    blocksThisFrame++;
+  }
+
+  // Render XFB to canvas
+  renderXfb(ram, ctx, emu);
+
+  // FPS counter (update every second)
+  frameCount++;
+  if (timestamp - lastFpsTime >= 1000) {
+    const fps = (frameCount * 1000 / (timestamp - lastFpsTime)).toFixed(1);
+    $("fps-display").textContent = fps;
+    frameCount  = 0;
+    lastFpsTime = timestamp;
+  }
+
+  // Update stats every ~10 frames to avoid layout thrashing
+  if (frameCount % 10 === 0) {
+    updateStats(emu);
+    renderRegisters(emu);
+  }
+
+  animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
+}
+
+function startLoop(emu, canvas, ctx) {
+  if (running) return;
+  running     = true;
+  frameCount  = 0;
+  lastFpsTime = performance.now();
+  animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
+  $("btn-start").disabled = true;
+  $("btn-stop").disabled  = false;
+  setStatus("▶ Emulation running…", "status-ok");
+}
+
+function stopLoop() {
+  running = false;
+  if (animFrameId !== null) {
+    cancelAnimationFrame(animFrameId);
+    animFrameId = null;
+  }
+  $("btn-start").disabled = false;
+  $("btn-stop").disabled  = true;
+  $("fps-display").textContent = "—";
+  setStatus("■ Emulation stopped", "status-info");
+}
+
+// ── Demo programs ─────────────────────────────────────────────────────────────
 const DEMO_PROGRAMS = {
   "addi+blr": {
     description: "li r3, 2  /  addis r3, r0, 1  /  ori r3, r3, 0  /  blr",
@@ -231,8 +695,8 @@ const DEMO_PROGRAMS = {
   },
 };
 
-// ── Execution log helpers ──────────────────────────────────────────────────
-const MAX_LOG_LINES = 200;
+// ── Execution log helpers ─────────────────────────────────────────────────────
+const MAX_LOG_LINES = 300;
 let execLogLines = [];
 
 function appendExecLog(line) {
@@ -242,24 +706,30 @@ function appendExecLog(line) {
   }
   const el = $("exec-log");
   el.textContent = execLogLines.join("\n");
-  el.scrollTop = el.scrollHeight;
+  el.scrollTop   = el.scrollHeight;
 }
 
-// ── Main ───────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   setStatus("Loading Lazuli WASM module…", "status-info");
 
   let emu;
+  const canvas = $("screen");
+  const ctx    = canvas.getContext("2d");
+
+  // Draw splash screen while WASM loads
+  drawPlaceholder(ctx, null, null);
+
   try {
     await init();
-    // 4 MiB of guest RAM (enough for most demo programs and small ROM blobs)
-    emu = new WasmEmulator(4 * 1024 * 1024);
+    // 24 MiB of guest RAM — matches the GameCube's main memory
+    emu = new WasmEmulator(24 * 1024 * 1024);
     emu.set_pc(0x80000000);
-    setStatus("✓ WASM module loaded — ready", "status-ok");
+    setStatus("✓ WASM module loaded — load an ISO or a demo program to begin", "status-ok");
     $("btn-compile").disabled  = false;
-    $("btn-load-rom").disabled = false;
-    $("btn-step").disabled     = false;
-    $("btn-run10").disabled    = false;
+    $("btn-load-iso").disabled = false;
+    $("btn-start").disabled    = false;
+    $("btn-audio").disabled    = false;
   } catch (e) {
     setStatus(`✗ Failed to load WASM module: ${e}`, "status-err");
     console.error(e);
@@ -269,136 +739,216 @@ async function main() {
   renderRegisters(emu);
   updateStats(emu);
 
-  // ── ROM file loader ────────────────────────────────────────────────────
-  $("btn-load-rom").addEventListener("click", () => {
-    const file = $("rom-file").files[0];
+  // ── Keyboard controller ────────────────────────────────────────────────────
+  document.addEventListener("keydown", (e) => {
+    const bit = KEY_MAP[e.key];
+    if (bit) {
+      e.preventDefault();
+      emu.set_pad_buttons(emu.get_pad_buttons() | bit);
+      $("stat-pad").textContent =
+        "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
+    }
+  });
+  document.addEventListener("keyup", (e) => {
+    const bit = KEY_MAP[e.key];
+    if (bit) {
+      emu.set_pad_buttons(emu.get_pad_buttons() & ~bit);
+      $("stat-pad").textContent =
+        "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
+    }
+  });
+
+  // ── Start button ───────────────────────────────────────────────────────────
+  $("btn-start").addEventListener("click", () => {
+    startLoop(emu, canvas, ctx);
+  });
+
+  // ── Stop button ────────────────────────────────────────────────────────────
+  $("btn-stop").addEventListener("click", () => {
+    stopLoop();
+    renderRegisters(emu);
+    updateStats(emu);
+  });
+
+  // ── Reset button ───────────────────────────────────────────────────────────
+  $("btn-reset").addEventListener("click", () => {
+    stopLoop();
+    clearModuleCache();
+    ramView = null; // force refresh of zero-copy view
+    // Re-zero RAM and reload last ISO if available — for now just reset PC
+    emu.set_pc(0x80000000);
+    drawPlaceholder(ctx, gameTitle, null);
+    renderRegisters(emu);
+    updateStats(emu);
+    setStatus("↺ Emulator reset — reload ISO to restart", "status-info");
+  });
+
+  // ── Audio toggle ───────────────────────────────────────────────────────────
+  $("btn-audio").addEventListener("click", () => {
+    if (!audioActive) {
+      initAudio();
+      $("btn-audio").textContent = "🔊 Audio: On";
+      setStatus("🔊 Audio enabled (32 kHz, GameCube native rate)", "status-ok");
+    } else {
+      suspendAudio();
+      $("btn-audio").textContent = "🔇 Audio: Off";
+      setStatus("🔇 Audio disabled", "status-info");
+    }
+  });
+
+  // ── ISO file loader ────────────────────────────────────────────────────────
+  $("iso-file").addEventListener("change", () => {
+    const file = $("iso-file").files[0];
+    if (file) {
+      $("iso-meta").textContent = `Selected: ${file.name} (${(file.size / 1048576).toFixed(1)} MiB)`;
+    }
+  });
+
+  $("btn-load-iso").addEventListener("click", () => {
+    const file = $("iso-file").files[0];
     if (!file) {
       setStatus("✗ No file selected", "status-err");
       return;
     }
 
-    const addrHex  = $("rom-addr").value.trim();
-    const guestAddr = parseInt(addrHex, 16) || 0x80000000;
+    setStatus(`Reading ${file.name}…`, "status-info");
 
     const reader = new FileReader();
     reader.onload = (evt) => {
-      const data = new Uint8Array(evt.target.result);
+      try {
+        stopLoop();
+        clearModuleCache();
+        ramView = null;
 
-      // The emulator's RAM starts at address 0 and is 4 MiB.
-      // We map the guest address modulo RAM size for the demo.
-      const ramOffset = guestAddr % (4 * 1024 * 1024);
-      emu.load_bytes(ramOffset, data);
+        const meta = parseAndLoadIso(evt.target.result, emu);
+        gameTitle = meta.gameName || meta.gameId || "Unknown Game";
 
-      // Set the PC to the load address (or override)
-      const pcHex = $("rom-pc").value.trim();
-      const newPc = pcHex ? parseInt(pcHex, 16) : guestAddr;
-      emu.set_pc(newPc % (4 * 1024 * 1024));
+        $("header-game").textContent = `— ${gameTitle}`;
+        $("iso-meta").textContent =
+          `Game ID: ${meta.gameId} | Title: ${meta.gameName} | ` +
+          `Entry: 0x${meta.entry.toString(16).toUpperCase()}`;
 
-      renderRegisters(emu);
-      updateStats(emu);
-      setStatus(
-        `✓ Loaded ${data.length} bytes from "${file.name}" at RAM offset 0x` +
-        ramOffset.toString(16).toUpperCase() +
-        ` — PC set to 0x` + (newPc % (4 * 1024 * 1024)).toString(16).toUpperCase(),
-        "status-ok"
-      );
+        $("btn-reset").disabled = false;
+
+        drawPlaceholder(ctx, gameTitle, emu);
+        renderRegisters(emu);
+        updateStats(emu);
+
+        setStatus(
+          `✓ Loaded "${meta.gameName}" (${meta.gameId}) — ` +
+          `entry 0x${meta.entry.toString(16).toUpperCase()} — press ▶ Start`,
+          "status-ok"
+        );
+      } catch (e) {
+        setStatus(`✗ ISO load failed: ${e}`, "status-err");
+        console.error(e);
+        $("iso-meta").textContent = `Error: ${e.message}`;
+      }
     };
     reader.onerror = () => setStatus("✗ Failed to read file", "status-err");
     reader.readAsArrayBuffer(file);
   });
 
-  // ── Compile button ─────────────────────────────────────────────────────
+  // Drag-and-drop ISO loading onto the drop-zone card
+  const dropZone = $("iso-drop-zone");
+  dropZone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    dropZone.classList.add("drop-active");
+  });
+  dropZone.addEventListener("dragleave", () => {
+    dropZone.classList.remove("drop-active");
+  });
+  dropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropZone.classList.remove("drop-active");
+    const file = e.dataTransfer?.files[0];
+    if (!file) return;
+    // Inject into the file input so the "Load ISO" button works as usual
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    $("iso-file").files = dt.files;
+    $("iso-meta").textContent = `Selected: ${file.name} (${(file.size / 1048576).toFixed(1)} MiB)`;
+    $("btn-load-iso").click();
+  });
+
+  // ── Compile → WASM button ─────────────────────────────────────────────────
   $("btn-compile").addEventListener("click", async () => {
     const rawLines = $("asm-input").value.trim().split(/\s+/);
-    const pcHex    = $("base-pc").value.trim();
-    const basePc   = parseInt(pcHex, 16) || 0x80000000;
+    const basePc   = parseInt($("base-pc").value.trim(), 16) || 0x80000000;
 
-    // Convert hex words to a Uint8Array (big-endian)
     const bytes = [];
     for (const line of rawLines) {
       const cleaned = line.replace(/^0x/i, "").replace(/[^0-9a-fA-F]/g, "");
-      if (cleaned.length === 0) continue;
+      if (!cleaned.length) continue;
       const word = parseInt(cleaned.padStart(8, "0"), 16);
-      bytes.push((word >>> 24) & 0xff);
-      bytes.push((word >>> 16) & 0xff);
-      bytes.push((word >>>  8) & 0xff);
-      bytes.push( word         & 0xff);
+      bytes.push((word >>> 24) & 0xff, (word >>> 16) & 0xff,
+                 (word >>>  8) & 0xff,  word         & 0xff);
     }
-
-    if (bytes.length === 0) {
+    if (!bytes.length) {
       setStatus("✗ No valid instructions entered", "status-err");
       return;
     }
 
-    // Load the instruction bytes into guest RAM at basePc
-    // (RAM starts at 0; map basePc to offset 0 for simplicity in the demo)
-    const insBytes = new Uint8Array(bytes);
-    emu.load_bytes(0, insBytes);
-    emu.set_pc(0);
+    // Load instructions into guest RAM at basePc
+    emu.load_bytes(basePc, new Uint8Array(bytes));
+    emu.set_pc(basePc);
+    clearModuleCache();
+    ramView = null;
 
     setStatus("Compiling…", "status-info");
     try {
-      // ── The dynarec-to-WASM step ──
-      const wasmBytes = emu.compile_block(0);
+      const wasmBytes = emu.compile_block(basePc);
+      await WebAssembly.compile(wasmBytes); // validate
 
-      // ── Verify with WebAssembly.compile() ──
-      await WebAssembly.compile(wasmBytes);
-      const moduleBytes = Array.from(wasmBytes);
-
-      // Display the bytecode
-      $("block-output").textContent = annotateWasm(moduleBytes);
-
-      // Update stats
-      $("stat-ins").textContent   = rawLines.filter(l => l.trim()).length;
-      $("stat-bytes").textContent = moduleBytes.length + " bytes";
+      $("block-output").textContent = annotateWasm(Array.from(wasmBytes));
+      $("stat-ins").textContent     = rawLines.filter(l => l.trim()).length;
+      $("stat-bytes").textContent   = wasmBytes.length + " bytes";
       updateStats(emu);
-
       setStatus(
-        `✓ Block compiled to ${moduleBytes.length} WASM bytes ` +
-        `and verified with WebAssembly.compile()`,
+        `✓ Block compiled to ${wasmBytes.length} WASM bytes — verified OK`,
         "status-ok"
       );
     } catch (e) {
       setStatus(`✗ Compilation failed: ${e}`, "status-err");
-      console.error(e);
       $("block-output").textContent = `Error: ${e}`;
     }
   });
 
-  // ── Demo programs ──────────────────────────────────────────────────────
+  // ── Demo loader ────────────────────────────────────────────────────────────
   $("btn-load-demo").addEventListener("click", () => {
     const keys = Object.keys(DEMO_PROGRAMS);
-    const key  = keys[Math.floor(Math.random() * keys.length)];
-    const prog = DEMO_PROGRAMS[key];
+    const prog = DEMO_PROGRAMS[keys[Math.floor(Math.random() * keys.length)]];
     $("asm-input").value = prog.words.join("\n");
+    const key = keys.find(k => DEMO_PROGRAMS[k] === prog);
     setStatus(`Loaded demo: "${key}" — ${prog.description}`, "status-info");
   });
 
-  // ── Step button (execute one block) ───────────────────────────────────
-  $("btn-step").addEventListener("click", async () => {
+  // ── Step button ────────────────────────────────────────────────────────────
+  $("btn-step").addEventListener("click", () => {
+    const ram = getRamView(emu);
     const log = [];
-    const ok  = await executeOneBlock(emu, log);
+    const ok  = executeOneBlockSync(emu, ram, log);
     for (const line of log) appendExecLog(line);
     renderRegisters(emu);
     updateStats(emu);
-    if (ok) {
-      setStatus(
-        `✓ Stepped — PC now 0x${emu.get_pc().toString(16).toUpperCase().padStart(8, "0")}`,
-        "status-ok"
-      );
-    } else {
-      setStatus("✗ Step failed — see execution log", "status-err");
-    }
+    setStatus(
+      ok
+        ? `✓ Stepped — PC now 0x${emu.get_pc().toString(16).toUpperCase().padStart(8, "0")}`
+        : "✗ Step failed — see execution log",
+      ok ? "status-ok" : "status-err"
+    );
   });
 
-  // ── Run 10 blocks button ───────────────────────────────────────────────
-  $("btn-run10").addEventListener("click", async () => {
+  // ── Run 10 blocks button ───────────────────────────────────────────────────
+  $("btn-run10").addEventListener("click", () => {
+    const ram = getRamView(emu);
     let count = 0;
     for (let i = 0; i < 10; i++) {
       const log = [];
-      const ok  = await executeOneBlock(emu, log);
-      for (const line of log) appendExecLog(line);
-      if (!ok) break;
+      if (!executeOneBlockSync(emu, ram, log)) {
+        for (const l of log) appendExecLog(l);
+        break;
+      }
       count++;
     }
     renderRegisters(emu);
@@ -406,11 +956,14 @@ async function main() {
     setStatus(
       count > 0
         ? `✓ Ran ${count} block(s) — PC now 0x${emu.get_pc().toString(16).toUpperCase().padStart(8, "0")}`
-        : "✗ Run failed at first block — see execution log",
+        : "✗ Run failed at first block",
       count > 0 ? "status-ok" : "status-err"
     );
   });
+
+  // Enable step/run buttons now that the emulator is ready
+  $("btn-step").disabled  = false;
+  $("btn-run10").disabled = false;
 }
 
 main();
-

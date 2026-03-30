@@ -28,6 +28,477 @@
     header {
       background: var(--panel);
       border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 1.1rem; color: var(--accent); }
+    header span { color: var(--muted); font-size: 0.82rem; }
+    #header-game { color: var(--green); font-size: 0.82rem; font-style: italic; }
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 660px 1fr;
+      gap: 14px;
+      padding: 14px;
+    }
+    @media (max-width: 1024px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .card-body { padding: 12px; }
+
+    /* Screen canvas */
+    #screen-card { background: #000; border-color: var(--border); }
+    #screen-card .card-body { padding: 0; display: flex; justify-content: center; background: #000; }
+    #screen {
+      display: block;
+      width: 640px;
+      height: 480px;
+      image-rendering: pixelated;
+    }
+
+    /* Controls strip */
+    .controls-strip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      background: var(--panel);
+      flex-wrap: wrap;
+    }
+
+    /* Form controls */
+    .controls { display: flex; flex-direction: column; gap: 8px; }
+    label { font-size: 0.82rem; color: var(--muted); }
+    input[type=number], input[type=text], textarea, select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 5px 8px;
+      font-size: 0.82rem;
+      font-family: "Consolas", "Courier New", monospace;
+    }
+    input[type=file] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      padding: 5px 8px;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    textarea { resize: vertical; min-height: 70px; }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      padding: 7px 14px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .btn-primary   { background: var(--accent); color: #000; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-success   { background: var(--green);  color: #000; }
+    .btn-success:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-danger    { background: var(--red);    color: #fff; }
+    .btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-secondary { background: var(--border); color: var(--text); }
+    .btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+    /* Status bar */
+    #status-bar {
+      padding: 5px 12px;
+      font-size: 0.75rem;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .status-ok   { color: var(--green); }
+    .status-err  { color: var(--red); }
+    .status-info { color: var(--yellow); }
+
+    /* Register grid */
+    .reg-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 3px;
+      font-family: "Consolas", monospace;
+      font-size: 0.72rem;
+    }
+    .reg-cell {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 3px 5px;
+    }
+    .reg-name { color: var(--muted); }
+    .reg-val  { color: var(--accent); }
+
+    /* Keyboard map */
+    .kbd-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+    }
+    .kbd-table th {
+      color: var(--muted);
+      font-weight: 600;
+      text-align: left;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .kbd-table td {
+      padding: 3px 8px;
+      border-bottom: 1px solid #1c2128;
+    }
+    .kbd-key {
+      display: inline-block;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 1px 6px;
+      font-family: monospace;
+      font-size: 0.75rem;
+      color: var(--accent);
+    }
+    .gc-btn {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    /* WAT / hex output */
+    #block-output {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px;
+      font-family: "Consolas", monospace;
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+
+    /* Stats */
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      padding: 3px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .stat-row:last-child { border-bottom: none; }
+    .stat-val { color: var(--accent); font-family: monospace; }
+
+    /* Execution log */
+    #exec-log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px;
+      font-family: "Consolas", monospace;
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      max-height: 160px;
+      overflow-y: auto;
+      color: var(--text);
+    }
+
+    /* Pipeline diagram */
+    .pipeline {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .stage {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 5px 8px;
+      text-align: center;
+    }
+    .stage-title { color: var(--muted); font-size: 0.65rem; }
+    .stage-body  { color: var(--accent); font-weight: 600; margin-top: 2px; }
+    .arrow { color: var(--muted); }
+
+    /* Left column wrapper */
+    .left-col { display: flex; flex-direction: column; gap: 12px; }
+    .right-col { display: flex; flex-direction: column; gap: 12px; }
+
+    /* Drag-drop highlight */
+    .drop-active { border-color: var(--accent) !important; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🎮 Lazuli</h1>
+  <span>GameCube · PowerPC → WebAssembly Dynarec</span>
+  <span id="header-game"></span>
+</header>
+
+<main>
+
+  <!-- ── Left column ── -->
+  <div class="left-col">
+
+    <!-- Game screen -->
+    <div class="card" id="screen-card">
+      <div class="card-header">Game Screen</div>
+      <div class="card-body">
+        <canvas id="screen" width="640" height="480"></canvas>
+      </div>
+      <div class="controls-strip">
+        <button class="btn-success" id="btn-start" disabled>▶ Start</button>
+        <button class="btn-danger"  id="btn-stop"  disabled>■ Stop</button>
+        <button class="btn-secondary" id="btn-reset" disabled>↺ Reset</button>
+        <button class="btn-secondary" id="btn-audio" disabled>🔇 Audio: Off</button>
+        <span style="margin-left:auto;font-size:0.75rem;color:var(--muted)">
+          <span id="fps-display">—</span> fps
+        </span>
+      </div>
+      <div id="status-bar" class="status-info">Loading WASM module…</div>
+    </div>
+
+    <!-- ISO loader -->
+    <div class="card" id="iso-drop-zone">
+      <div class="card-header">GameCube ISO Loader</div>
+      <div class="card-body controls">
+        <label>
+          Select a GameCube <code>.iso</code> / <code>.gcm</code> disc image.
+          The emulator parses the disc header, extracts the boot DOL executable,
+          loads each section into guest RAM, and sets the CPU entry point.
+        </label>
+        <input type="file" id="iso-file" accept=".iso,.gcm,.bin,.dol,.elf,.raw" />
+        <div id="iso-meta" style="font-size:0.78rem;color:var(--muted);min-height:1.4em;"></div>
+        <div class="btn-row">
+          <button class="btn-primary" id="btn-load-iso" disabled>Load ISO into RAM</button>
+          <button class="btn-secondary" id="btn-load-demo">Load demo program</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Keyboard controls reference -->
+    <div class="card">
+      <div class="card-header">Keyboard Controls</div>
+      <div class="card-body">
+        <table class="kbd-table">
+          <thead>
+            <tr><th>Key</th><th>GameCube Button</th><th>Key</th><th>GameCube Button</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="kbd-key">X</span></td><td class="gc-btn">A Button</td>
+              <td><span class="kbd-key">Z</span></td><td class="gc-btn">B Button</td>
+            </tr>
+            <tr>
+              <td><span class="kbd-key">S</span></td><td class="gc-btn">X Button</td>
+              <td><span class="kbd-key">A</span></td><td class="gc-btn">Y Button</td>
+            </tr>
+            <tr>
+              <td><span class="kbd-key">D</span></td><td class="gc-btn">Z Trigger</td>
+              <td><span class="kbd-key">Enter</span></td><td class="gc-btn">Start</td>
+            </tr>
+            <tr>
+              <td><span class="kbd-key">↑↓←→</span></td><td class="gc-btn">D-Pad</td>
+              <td><span class="kbd-key">IJKL</span></td><td class="gc-btn">Control Stick</td>
+            </tr>
+            <tr>
+              <td><span class="kbd-key">Q</span></td><td class="gc-btn">L Trigger</td>
+              <td><span class="kbd-key">E</span></td><td class="gc-btn">R Trigger</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="margin-top:8px;font-size:0.75rem;color:var(--muted);">
+          Button state is passed to the emulator on every keydown/keyup.
+          The current bitmask is shown in the JIT stats panel (pad buttons).
+        </p>
+      </div>
+    </div>
+
+    <!-- Advanced / raw binary loader -->
+    <div class="card">
+      <div class="card-header">PowerPC Instruction Input (hex words)</div>
+      <div class="card-body controls">
+        <label>Paste 32-bit big-endian instruction words (one per line, hex):</label>
+        <textarea id="asm-input" rows="5" spellcheck="false">38600002
+3C600001
+60630000
+4E800020</textarea>
+        <label>Base PC (hex):</label>
+        <input type="text" id="base-pc" value="80000000" style="font-family:monospace;" />
+        <div class="btn-row">
+          <button class="btn-primary" id="btn-compile" disabled>Compile → WASM</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Right column ── -->
+  <div class="right-col">
+
+    <!-- CPU register file -->
+    <div class="card">
+      <div class="card-header">CPU Register File</div>
+      <div class="card-body">
+        <div class="reg-grid" id="reg-grid">
+          <!-- filled by JS -->
+        </div>
+      </div>
+    </div>
+
+    <!-- JIT / emulator statistics -->
+    <div class="card">
+      <div class="card-header">Emulator Statistics</div>
+      <div class="card-body">
+        <div class="stat-row">
+          <span>Blocks compiled</span>
+          <span class="stat-val" id="stat-compiled">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Blocks executed</span>
+          <span class="stat-val" id="stat-executed">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Module cache entries</span>
+          <span class="stat-val" id="stat-cache">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Last block — PPC instructions</span>
+          <span class="stat-val" id="stat-ins">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Last block — WASM bytes</span>
+          <span class="stat-val" id="stat-bytes">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Pad buttons bitmask</span>
+          <span class="stat-val" id="stat-pad">0x0000</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Execution controls (step / run) -->
+    <div class="card">
+      <div class="card-header">Step Execution</div>
+      <div class="card-body controls">
+        <label>
+          Manually step through compiled blocks one at a time.
+          Each step compiles the block at the current PC, executes it,
+          and syncs the CPU state back.
+        </label>
+        <div class="btn-row">
+          <button class="btn-primary"   id="btn-step"  disabled>Step (1 block)</button>
+          <button class="btn-secondary" id="btn-run10" disabled>Run 10 blocks</button>
+        </div>
+        <label>Execution log:</label>
+        <div id="exec-log">(no execution yet)</div>
+      </div>
+    </div>
+
+    <!-- Dynarec pipeline diagram -->
+    <div class="card">
+      <div class="card-header">Dynarec-to-WASM Pipeline</div>
+      <div class="card-body">
+        <p style="font-size:0.78rem;color:var(--muted);margin-bottom:8px;">
+          Guest PowerPC code is translated once by the
+          <code style="color:var(--accent)">ppcwasm</code> Rust JIT into a
+          self-contained WASM binary, which is then compiled and cached by the
+          browser's native engine.  The same pattern is used by the
+          <strong style="color:var(--text)">Play!</strong> PS2 emulator.
+        </p>
+        <div class="pipeline">
+          <div class="stage">
+            <div class="stage-title">Guest ISA</div>
+            <div class="stage-body">PowerPC</div>
+          </div>
+          <span class="arrow">→</span>
+          <div class="stage">
+            <div class="stage-title">ppcwasm JIT</div>
+            <div class="stage-body">WASM bytes</div>
+          </div>
+          <span class="arrow">→</span>
+          <div class="stage">
+            <div class="stage-title">Browser</div>
+            <div class="stage-body">WA.Module</div>
+          </div>
+          <span class="arrow">→</span>
+          <div class="stage">
+            <div class="stage-title">Execute</div>
+            <div class="stage-body">native speed</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Compiled WASM block output -->
+    <div class="card">
+      <div class="card-header">Compiled WASM Block</div>
+      <div class="card-body">
+        <div id="block-output">(compile a block to see its WASM bytecode here)</div>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<script type="module" src="bootstrap.js"></script>
+</body>
+</html>
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lazuli — GameCube WASM Emulator</title>
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --panel:   #161b22;
+      --border:  #30363d;
+      --accent:  #58a6ff;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+      --text:    #c9d1d9;
+      --muted:   #8b949e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
       padding: 12px 24px;
       display: flex;
       align-items: center;
