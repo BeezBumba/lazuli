@@ -676,6 +676,17 @@ function suspendAudio() {
 // main thread responsive while making visible forward progress.
 const BLOCKS_PER_FRAME = 500;
 
+/**
+ * Time-base ticks to advance per animation frame.
+ *
+ * The GameCube's Gekko time base increments at CPU / 12 ≈ 40.5 MHz.
+ * At 60 fps that is 40,500,000 / 60 = 675,000 ticks per frame.  Games use
+ * `mftb` to drive all their timing loops (e.g. `OSWaitVBlank`); without a
+ * monotonically increasing time base they spin forever and the screen stays
+ * blank.
+ */
+const TIMEBASE_TICKS_PER_FRAME = 675_000;
+
 let running        = false;
 let animFrameId    = null;
 let gameTitle      = null;
@@ -694,6 +705,10 @@ let xfbAddr        = XFB_PHYS_DEFAULT;
  */
 function gameLoop(emu, canvas, ctx, timestamp) {
   if (!running) return;
+
+  // Advance the time base before executing blocks so that mftb-based timing
+  // loops inside the game see a non-zero delta on the very first frame.
+  emu.advance_timebase(TIMEBASE_TICKS_PER_FRAME);
 
   // Execute blocks for this frame
   const ram = getRamView(emu);

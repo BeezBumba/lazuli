@@ -284,6 +284,21 @@ impl WasmEmulator {
         self.pad_buttons
     }
 
+    // ── Timebase ──────────────────────────────────────────────────────────────
+
+    /// Advance the CPU time-base register by `delta` ticks.
+    ///
+    /// The GameCube's Gekko time base increments at approximately 40.5 MHz
+    /// (CPU clock / 12).  Call this once per animation frame so that
+    /// time-base polling loops (`mftb` / `OSWaitVBlank`) see a monotonically
+    /// increasing counter and do not spin forever.
+    ///
+    /// Suggested value: `675_000` ticks per frame (= 40.5 MHz / 60 fps).
+    pub fn advance_timebase(&mut self, delta: u32) {
+        self.cpu.supervisor.misc.tb =
+            self.cpu.supervisor.misc.tb.wrapping_add(delta as u64);
+    }
+
     // ── Block compilation ─────────────────────────────────────────────────────
 
     /// Compile the PowerPC basic block starting at `guest_pc` and return its
