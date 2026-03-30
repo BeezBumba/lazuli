@@ -144,6 +144,12 @@ impl<'a> BlockBuilder<'a> {
         self.body.push(Instruction::I32Load(self.m32(self.offsets.cr)));
     }
 
+    /// Push MSR.
+    fn push_msr(&mut self) {
+        self.push_base();
+        self.body.push(Instruction::I32Load(self.m32(self.offsets.msr)));
+    }
+
     // ── Store helpers ─────────────────────────────────────────────────────────
     //
     // Pattern: the caller first `push_base()`, then computes the value,
@@ -169,6 +175,10 @@ impl<'a> BlockBuilder<'a> {
 
     fn store_cr(&mut self) {
         self.body.push(Instruction::I32Store(self.m32(self.offsets.cr)));
+    }
+
+    fn store_msr(&mut self) {
+        self.body.push(Instruction::I32Store(self.m32(self.offsets.msr)));
     }
 
     // ── Effective-address helpers ─────────────────────────────────────────────
@@ -1504,6 +1514,22 @@ impl<'a> BlockBuilder<'a> {
                 self.push_base();
                 self.push_cr();
                 self.store_gpr(rd);
+            }
+
+            // mfmsr  rD  — move from MSR
+            Opcode::Mfmsr => {
+                let rd = ins.gpr_d() as u8;
+                self.push_base();
+                self.push_msr();
+                self.store_gpr(rd);
+            }
+
+            // mtmsr  rS  — move to MSR
+            Opcode::Mtmsr => {
+                let rs = ins.gpr_s() as u8;
+                self.push_base();
+                self.push_gpr(rs);
+                self.store_msr();
             }
 
             // mtcrf  CRM, rS
