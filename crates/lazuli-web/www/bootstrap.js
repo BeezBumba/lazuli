@@ -1,22 +1,33 @@
 /**
- * bootstrap.js — Lazuli GameCube WASM emulator frontend
+ * bootstrap.js — Lazuli GameCube browser emulator
  *
- * Features implemented here:
- *  • GameCube ISO loading: parses the disc header and boot DOL binary,
- *    loads each section into the emulator's 24 MiB guest RAM.
- *  • Dynarec game loop: uses `requestAnimationFrame` to drive the PPC→WASM
- *    JIT pipeline; compiled WASM modules are cached in a JS Map keyed by
- *    guest PC so each block is compiled at most once.
- *  • Zero-copy RAM: accesses the emulator's RAM buffer through
- *    `wasm_memory()` + `ram_ptr()` to avoid per-block copies.
- *  • Hook closures: memory read/write hooks read from and write directly to
- *    the zero-copy RAM view; no `get_ram_copy()` / `sync_ram()` in the loop.
- *  • Keyboard controller: maps keyboard keys to GameCube button bits and
- *    forwards the bitmask to the Rust emulator on every keydown/keyup.
- *  • XFB rendering: converts the GameCube YUV422 external frame-buffer region
- *    to RGBA and paints it onto a 640×480 canvas each frame.
- *  • Web Audio: creates an AudioContext for future DSP output; a startup
- *    chime confirms that audio is active.
+ * Implements the JavaScript side of a full in-browser GameCube emulator,
+ * mirroring the approach used by the Play! PS2 emulator
+ * (https://github.com/jpd002/Play-):
+ *
+ *  • CPU: PowerPC → WebAssembly dynarec via the Rust `ppcwasm` JIT.
+ *    Compiled WASM modules are cached in a JS Map keyed by guest PC so each
+ *    block is compiled at most once.
+ *
+ *  • GPU: WebGPU surface initialised from the game canvas via wgpu's
+ *    `webgpu` backend (wasm32 feature).  Falls back to the canvas-based
+ *    YUV422 XFB blitter when WebGPU is unavailable.
+ *
+ *  • Audio: `AudioWorkletNode`-based DSP output pipeline.  The worklet
+ *    maintains a per-channel ring buffer and drains it into the WebAudio
+ *    output on every 128-sample process() tick.  Interleaved stereo f32
+ *    PCM at 32 kHz (GameCube native rate) is pushed each frame via
+ *    `pushDspSamples()`.
+ *
+ *  • IO: Gamepad API controller input merged with keyboard fallback.
+ *    Gamepad state is polled every animation frame; the bitmask is ORed
+ *    with the keyboard bitmask before being forwarded to the Rust emulator.
+ *
+ *  • ROM loading: parses GameCube disc (ISO) headers and boot DOL binaries,
+ *    loads each section into the emulator's 24 MiB zero-copy guest RAM.
+ *
+ *  • XFB rendering: converts the GameCube YUV422 external frame-buffer to
+ *    RGBA and paints it onto a 640×480 canvas each frame.
  *
  * ## Build & serve
  *
@@ -250,6 +261,95 @@ const KEY_MAP = {
   "j":          GC_BTN.STICK_LEFT,
   "l":          GC_BTN.STICK_RIGHT,
 };
+
+/**
+ * Standard Gamepad API button index → GameCube button bitmask.
+ *
+ * Maps the W3C Standard Gamepad layout (Xbox / DualSense / etc.) to the
+ * GameCube controller button bits used by `set_pad_buttons()`.  Entries with
+ * value `0` have no GameCube equivalent and are ignored.
+ */
+const GAMEPAD_BTN_MAP = [
+  GC_BTN.A,      // 0  South  (A / ×)
+  GC_BTN.B,      // 1  East   (B / ○)
+  GC_BTN.X,      // 2  West   (X / □)
+  GC_BTN.Y,      // 3  North  (Y / △)
+  GC_BTN.L,      // 4  LB / L1 — GameCube L trigger (digital)
+  GC_BTN.R,      // 5  RB / R1 — GameCube R trigger (digital)
+  GC_BTN.L,      // 6  LT / L2 — GameCube L trigger (analog treated as digital)
+  GC_BTN.R,      // 7  RT / R2 — GameCube R trigger (analog treated as digital)
+  0,             // 8  Back / Select — no GameCube equivalent
+  GC_BTN.START,  // 9  Start / Menu
+  0,             // 10 Left Stick Press — no GameCube equivalent
+  0,             // 11 Right Stick Press — no GameCube equivalent
+  GC_BTN.UP,     // 12 D-Pad Up
+  GC_BTN.DOWN,   // 13 D-Pad Down
+  GC_BTN.LEFT,   // 14 D-Pad Left
+  GC_BTN.RIGHT,  // 15 D-Pad Right
+  GC_BTN.Z,      // 16 Guide / Home — mapped to GameCube Z for convenience
+];
+
+/** Analog stick deflection threshold for digital button emulation (0–1). */
+const GAMEPAD_AXIS_THRESHOLD = 0.25;
+
+// ── Input state ───────────────────────────────────────────────────────────────
+
+/**
+ * Button bitmask accumulated from keyboard `keydown` / `keyup` events.
+ * Separated from `gamepadBits` so that the two input sources can be merged
+ * without one clearing the other.
+ */
+let keyboardBits = 0;
+
+/**
+ * Button bitmask polled from the Gamepad API each animation frame.
+ * Updated by `pollGamepad()` and ORed with `keyboardBits` before forwarding
+ * to the Rust emulator.
+ */
+let gamepadBits = 0;
+
+/**
+ * Poll the Gamepad API and update `gamepadBits`.
+ *
+ * Uses the first connected gamepad.  Digital buttons are mapped via
+ * `GAMEPAD_BTN_MAP`; the left analog stick is converted to the four
+ * `STICK_*` pseudo-buttons using `GAMEPAD_AXIS_THRESHOLD`.
+ *
+ * Must be called once per animation frame (inside `gameLoop`) so that the
+ * emulator sees fresh controller state before executing the next batch of
+ * blocks.
+ *
+ * @param {import("./pkg/lazuli_web.js").WasmEmulator} emu
+ */
+function pollGamepad(emu) {
+  if (!navigator.getGamepads) return;
+
+  const gamepads = navigator.getGamepads();
+  gamepadBits = 0;
+
+  for (const gp of gamepads) {
+    if (!gp || !gp.connected) continue;
+
+    // Map digital buttons using the standard gamepad layout table.
+    for (let i = 0; i < Math.min(gp.buttons.length, GAMEPAD_BTN_MAP.length); i++) {
+      if (gp.buttons[i].pressed && GAMEPAD_BTN_MAP[i]) {
+        gamepadBits |= GAMEPAD_BTN_MAP[i];
+      }
+    }
+
+    // Map left analog stick (axes 0 = X, 1 = Y) to STICK_* pseudo-buttons.
+    const ax = gp.axes[0] ?? 0;
+    const ay = gp.axes[1] ?? 0;
+    if (ax < -GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_LEFT;
+    if (ax >  GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_RIGHT;
+    if (ay < -GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_UP;
+    if (ay >  GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_DOWN;
+
+    break; // Use the first connected gamepad only.
+  }
+
+  emu.set_pad_buttons(keyboardBits | gamepadBits);
+}
 
 // ── Zero-copy RAM view ────────────────────────────────────────────────────────
 
@@ -641,18 +741,134 @@ function drawPlaceholder(ctx, gameTitle, emu) {
   }
 }
 
-// ── Web Audio ─────────────────────────────────────────────────────────────────
-
-let audioCtx   = null;
-let audioActive = false;
+// ── Web Audio / DSP audio pipeline ───────────────────────────────────────────
 
 /**
- * Initialise (or resume) the Web Audio context and play a short startup chime
- * to confirm that audio routing is working.
+ * AudioWorklet processor source for the GameCube DSP audio output.
  *
- * The AudioContext is created with a 32 kHz sample rate matching the
- * GameCube's native audio output.  Actual DSP audio output will be routed
- * here once the DSP emulation is integrated into the WASM frontend.
+ * The processor maintains independent left/right ring buffers (8192 frames
+ * each).  The main thread feeds interleaved stereo f32 PCM samples via
+ * `postMessage`; the processor drains them into the Web Audio output on
+ * every 128-sample process() tick (the standard AudioWorklet quantum size).
+ *
+ * When the ring buffer is empty the processor outputs silence rather than
+ * repeating stale audio.
+ */
+const DSP_WORKLET_SOURCE = `
+class DspAudioProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super(options);
+    const SIZE    = 8192; // must be a power of two so that (pos + n) & MASK is equivalent to modulo
+    const MASK    = SIZE - 1;
+    this._ringL   = new Float32Array(SIZE);
+    this._ringR   = new Float32Array(SIZE);
+    this._writePos = 0;
+    this._readPos  = 0;
+    this._avail    = 0;
+    this._size     = SIZE;
+    this._mask     = MASK;
+
+    this.port.onmessage = ({ data }) => {
+      // data.left / data.right are Float32Array (transferred, not copied).
+      const { left, right } = data;
+      const n = Math.min(left.length, this._size - this._avail);
+      for (let i = 0; i < n; i++) {
+        const p = (this._writePos + i) & this._mask;
+        this._ringL[p] = left[i];
+        this._ringR[p] = right[i];
+      }
+      this._writePos = (this._writePos + n) & this._mask;
+      this._avail   += n;
+    };
+  }
+
+  process(_inputs, outputs) {
+    const out  = outputs[0];
+    const outL = out[0];
+    // Support both mono (1 channel) and stereo (2 channel) output nodes.
+    const outR = out.length > 1 ? out[1] : out[0];
+    const n    = outL.length; // typically 128
+
+    const canRead = Math.min(n, this._avail);
+    for (let i = 0; i < canRead; i++) {
+      const p = (this._readPos + i) & this._mask;
+      outL[i] = this._ringL[p];
+      outR[i] = this._ringR[p];
+    }
+    this._readPos = (this._readPos + canRead) & this._mask;
+    this._avail  -= canRead;
+    // Frames beyond canRead remain at the default 0.0 (silence).
+
+    return true; // Keep processor alive.
+  }
+}
+registerProcessor('dsp-audio-processor', DspAudioProcessor);
+`;
+
+let audioCtx    = null;
+let audioActive = false;
+/** The AudioWorkletNode that feeds GameCube DSP PCM to the speakers. */
+let dspWorkletNode = null;
+
+/**
+ * Initialise the DSP `AudioWorkletNode` pipeline.
+ *
+ * Registers the worklet processor via an inline Blob URL (no separate file
+ * needed) and connects the node to the AudioContext destination.  Called
+ * once from `initAudio()` after the AudioContext is created.
+ *
+ * @returns {Promise<void>}
+ */
+async function initDspAudioWorklet() {
+  if (!audioCtx) return;
+  try {
+    const blob = new Blob([DSP_WORKLET_SOURCE], { type: "application/javascript" });
+    const url  = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    dspWorkletNode = new AudioWorkletNode(audioCtx, "dsp-audio-processor", {
+      numberOfInputs:  0,
+      numberOfOutputs: 1,
+      outputChannelCount: [2], // Stereo output
+    });
+    dspWorkletNode.connect(audioCtx.destination);
+    console.log("[lazuli] DSP AudioWorklet pipeline ready (32 kHz stereo)");
+  } catch (e) {
+    console.warn("[lazuli] AudioWorklet init failed — audio will be silent:", e);
+  }
+}
+
+/**
+ * Push interleaved stereo f32 PCM samples to the DSP audio worklet.
+ *
+ * Call this once per animation frame with the samples produced by the
+ * GameCube DSP emulator.  Samples are transferred (not copied) to the
+ * worklet thread for zero-allocation audio delivery.
+ *
+ * @param {Float32Array} interleavedSamples  Interleaved L/R pairs:
+ *        [L0, R0, L1, R1, …] at 32 000 Hz.
+ *        Typically 32000/60 ≈ 533 frames = 1066 values per animation frame.
+ */
+function pushDspSamples(interleavedSamples) {
+  if (!dspWorkletNode || !interleavedSamples || interleavedSamples.length < 2) return;
+
+  const n    = interleavedSamples.length >> 1; // number of stereo frames
+  const left  = new Float32Array(n);
+  const right = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    left[i]  = interleavedSamples[i * 2];
+    right[i] = interleavedSamples[i * 2 + 1];
+  }
+  // Transfer the buffers to the worklet thread (zero-copy).
+  dspWorkletNode.port.postMessage({ left, right }, [left.buffer, right.buffer]);
+}
+
+/**
+ * Initialise (or resume) the Web Audio context and DSP audio worklet.
+ *
+ * Must be triggered by a user gesture (click) due to browser autoplay
+ * policies.  A short startup chime confirms that audio routing is working.
  */
 function initAudio() {
   if (!audioCtx) {
@@ -661,6 +877,12 @@ function initAudio() {
   if (audioCtx.state === "suspended") {
     audioCtx.resume();
   }
+
+  // Initialise the DSP AudioWorklet pipeline so it is ready to receive PCM
+  // samples from the GameCube DSP emulator.
+  initDspAudioWorklet().catch((e) =>
+    console.warn("[lazuli] DSP worklet setup failed:", e)
+  );
 
   // Short startup chime: C5 → G4 two-note sequence
   const chime = [
@@ -726,6 +948,10 @@ let xfbAddr        = XFB_PHYS_DEFAULT;
  */
 function gameLoop(emu, canvas, ctx, timestamp) {
   if (!running) return;
+
+  // Poll the Gamepad API and merge with keyboard state before executing
+  // blocks, so that the emulator reads the latest controller input.
+  pollGamepad(emu);
 
   // Advance the time base before executing blocks so that mftb-based timing
   // loops inside the game see a non-zero delta on the very first frame.
@@ -869,7 +1095,8 @@ async function main() {
     const bit = KEY_MAP[e.key];
     if (bit) {
       e.preventDefault();
-      emu.set_pad_buttons(emu.get_pad_buttons() | bit);
+      keyboardBits |= bit;
+      emu.set_pad_buttons(keyboardBits | gamepadBits);
       $("stat-pad").textContent =
         "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
     }
@@ -877,7 +1104,8 @@ async function main() {
   document.addEventListener("keyup", (e) => {
     const bit = KEY_MAP[e.key];
     if (bit) {
-      emu.set_pad_buttons(emu.get_pad_buttons() & ~bit);
+      keyboardBits &= ~bit;
+      emu.set_pad_buttons(keyboardBits | gamepadBits);
       $("stat-pad").textContent =
         "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
     }

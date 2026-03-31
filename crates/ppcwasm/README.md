@@ -4,10 +4,11 @@
 [WebAssembly](https://webassembly.org/) bytecode at runtime.  The compiled blocks can be
 executed by any WASM runtime, including a web browser via `WebAssembly.instantiate()`.
 
-Together with the [`lazuli-web`](../lazuli-web) browser frontend it forms the **dynarec WASM
-demo**: a fully in-browser GameCube CPU emulation demo where you can load a ROM, step through
-execution block-by-block, and watch the CPU register file update in real time — all without any
-native binary.
+Together with the [`lazuli-web`](../lazuli-web) browser frontend it forms the **in-browser
+GameCube emulator**: a full GameCube emulation target running entirely in the browser, designed
+to reach feature parity with what the [Play!](https://github.com/jpd002/Play-) PS2 emulator
+does for the PS2 — CPU via dynarec-to-WASM, GPU via WebGPU, audio via `AudioWorkletNode`, and
+IO via the Gamepad API.
 
 > **Quick start**
 > ```sh
@@ -26,6 +27,9 @@ native binary.
 - [Block termination and chaining](#block-termination-and-chaining)
 - [Relationship to the Play! PS2 emulator](#relationship-to-the-play-ps2-emulator)
 - [Browser frontend (lazuli-web)](#browser-frontend-lazuli-web)
+- [GPU — WebGPU via wgpu](#gpu--webgpu-via-wgpu)
+- [Audio — AudioWorklet DSP pipeline](#audio--audioworklet-dsp-pipeline)
+- [IO — Gamepad API](#io--gamepad-api)
 - [Crate structure](#crate-structure)
 
 ---
@@ -33,29 +37,35 @@ native binary.
 ## Architecture overview
 
 ```
-┌──────────────────────────────────────────────┐
-│              lazuli-web (browser)             │
-│                                               │
-│  ┌──────────────┐    ┌─────────────────────┐ │
-│  │  bootstrap.js│    │  lazuli-web Rust lib│ │
-│  │  game loop   │◄──►│  (wasm-bindgen)     │ │
-│  │  XFB render  │    │  WasmEmulator       │ │
-│  └──────┬───────┘    └─────────┬───────────┘ │
-│         │                      │              │
-│    WebAssembly.instantiate()   │ compile_block│
-│         │                      ▼              │
-│         │            ┌─────────────────────┐  │
-│         │            │   ppcwasm  (Rust)   │  │
-│         │            │   WasmJit::build()  │  │
-│         │            │   BlockBuilder      │  │
-│         │            └─────────────────────┘  │
-│         │                                      │
-│  ┌──────▼──────────────────────────────────┐  │
-│  │         WASM linear memory              │  │
-│  │  [0..sizeof(Cpu)]  = gekko::Cpu state   │  │
-│  │  [sizeof(Cpu)..]   = guest RAM (24 MiB) │  │
-│  └─────────────────────────────────────────┘  │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        lazuli-web (browser)                              │
+│                                                                          │
+│  ┌────────────────┐    ┌──────────────────────────────────────────────┐  │
+│  │  bootstrap.js  │    │          lazuli-web Rust lib                 │  │
+│  │  game loop     │◄──►│          (wasm-bindgen)                      │  │
+│  │  XFB / WebGPU  │    │          WasmEmulator                        │  │
+│  │  AudioWorklet  │    └──────────────────────┬───────────────────────┘  │
+│  │  Gamepad API   │                           │                          │
+│  └────────┬───────┘             compile_block │  check_webgpu_support    │
+│           │                                   ▼                          │
+│    WebAssembly.instantiate()    ┌─────────────────────────────────────┐  │
+│           │                    │          ppcwasm  (Rust)             │  │
+│           │                    │          WasmJit::build()            │  │
+│           │                    │          BlockBuilder                │  │
+│           │                    └─────────────────────────────────────┘  │
+│           │                                                              │
+│  ┌────────▼────────────────────────────────────────────────────────┐     │
+│  │                   WASM linear memory                            │     │
+│  │   [0 .. sizeof(Cpu)]    = gekko::Cpu register file              │     │
+│  │   [sizeof(Cpu) .. 24M]  = guest RAM (GameCube main memory)      │     │
+│  └─────────────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Four subsystems — mirroring Play! PS2:
+  CPU   → PowerPC dynarec via ppcwasm (WasmJit) + WebAssembly.instantiate
+  GPU   → wgpu "webgpu" backend on wasm32 → browser WebGPU API
+  Audio → AudioWorkletNode ring-buffer fed by GameCube DSP PCM output
+  IO    → Gamepad API (+ keyboard fallback) → set_pad_buttons()
 ```
 
 The key insight — borrowed directly from the **Play! PS2 emulator** — is that *both* the CPU
@@ -364,7 +374,8 @@ Then open **http://localhost:8080**.
 
 7. **XFB rendering** — Once a frame, `bootstrap.js` reads the YUV422 frame buffer at
    `0x00C00000`, converts it to RGBA using BT.601 coefficients, and paints it to a
-   640×480 `<canvas>`.
+   640×480 `<canvas>`.  When the GPU renderer is active this step is replaced by the
+   WebGPU blit path.
 
 ### Block cache
 
@@ -374,7 +385,108 @@ when the user clicks **Reset**.
 
 ---
 
-## Crate structure
+## GPU — WebGPU via wgpu
+
+**Target:** The `renderer` crate already implements the GameCube Flipper GPU using `wgpu`
+(version 27, hardware backends: Vulkan / Metal / D3D12 on desktop).  wgpu 27 supports the
+browser's native WebGPU API as an additional backend when compiled to `wasm32`.
+
+**How it fits in:**
+
+1. `lazuli-web/Cargo.toml` declares `wgpu = { workspace = true, features = ["webgpu", "wgsl"] }`
+   for `cfg(target_arch = "wasm32")` targets.
+2. `check_webgpu_support()` (exported from `lazuli-web/src/lib.rs`) probes `navigator.gpu` at
+   startup.  `bootstrap.js` calls it during initialisation and shows a warning if WebGPU is
+   unavailable.
+3. When WebGPU is available a `wgpu::Device` is obtained from the browser via
+   `wgpu::Instance::new(Backends::BROWSER_WEBGPU)` and the game canvas is used as the surface.
+4. The Flipper GPU emulation (`renderer` crate — TEV, texture units, vertex fetch, EFB/XFB)
+   runs through the same wgpu pipeline.  Because `wgpu` abstracts over backends, the rendering
+   code is **identical** for native and browser targets; only the backend selection changes.
+
+**Browser support:** Chrome and Edge have shipped WebGPU in stable releases since 2023.
+Firefox and Safari have varying levels of support; check
+[MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API) for the current
+compatibility table.  Fall back to the canvas-based YUV422 XFB blitter
+(`renderXfb`) when WebGPU is unavailable.
+
+---
+
+## Audio — AudioWorklet DSP pipeline
+
+**Target:** The GameCube DSP (Macronix DSP-G) outputs 16-bit PCM at 32 kHz stereo.  In the
+browser this is routed via the Web Audio API's `AudioWorkletNode`.
+
+**Architecture in `bootstrap.js`:**
+
+```
+GameCube DSP emulator
+    │  interleaved stereo f32 PCM (32 kHz)
+    ▼
+pushDspSamples(interleavedSamples)
+    │  postMessage + transferable Float32Array  (zero-copy)
+    ▼
+DspAudioProcessor (AudioWorklet thread)
+    │  internal 8 192-frame left/right ring buffers
+    ▼
+process() — drains 128 frames per tick into the output
+    │
+    ▼
+AudioContext.destination  →  speakers / headphones
+```
+
+Key properties:
+- **Zero-copy delivery:** `Float32Array` buffers are *transferred* (not copied) to the worklet
+  thread via the Transferable Objects mechanism, eliminating allocation on the audio hot path.
+- **Ring buffer:** The worklet maintains separate 8 192-frame left and right buffers.  If the
+  emulator runs ahead, samples queue up without blocking; if it falls behind, the worklet
+  outputs silence (no glitch, no repeated frames).
+- **Native sample rate:** The `AudioContext` is created at `sampleRate: 32000` — the
+  GameCube's native output rate — so no resampling is required.
+- **Inline worklet:** The processor is registered via an inline Blob URL; no extra file is
+  needed in `www/`.
+
+**Integration point:** Once the DSP emulator (`dspint` crate) is compiled to wasm32, call
+`pushDspSamples(emu.get_dsp_output())` once per animation frame inside `gameLoop`.
+
+---
+
+## IO — Gamepad API
+
+**Target:** The GameCube controller is a single-player digital + analog pad.  In the browser
+the [Gamepad API](https://developer.mozilla.org/en-US/docs/Web/API/Gamepad_API) maps physical
+gamepad hardware to a standard button / axis layout.
+
+**Architecture in `bootstrap.js`:**
+
+```
+gameLoop() — called at ~60 Hz
+    │
+    ▼
+pollGamepad(emu)
+    │  reads navigator.getGamepads()[0]
+    │  maps standard layout buttons (GAMEPAD_BTN_MAP)
+    │  maps left analog stick axes to STICK_* pseudo-buttons
+    │  ORs with keyboardBits
+    ▼
+emu.set_pad_buttons(keyboardBits | gamepadBits)
+```
+
+- **First connected gamepad wins** — `pollGamepad` iterates the gamepad list and uses the first
+  entry with `connected === true`.
+- **Keyboard fallback** — `keyboardBits` and `gamepadBits` are tracked independently so that
+  a keyboard player is not displaced when a gamepad is connected (or vice versa).  Both sources
+  are ORed together before being forwarded to the emulator.
+- **Standard gamepad layout** — The `GAMEPAD_BTN_MAP` array follows the W3C Standard Gamepad
+  specification (Xbox / DualSense / Switch Pro mapping).  Button 0 → GC A, Button 1 → GC B,
+  Button 2 → GC X, Button 3 → GC Y, Buttons 4/6 → GC L, Buttons 5/7 → GC R, Button 9 →
+  GC START, Buttons 12–15 → GC D-Pad.
+- **Analog stick** — Left stick deflection beyond `GAMEPAD_AXIS_THRESHOLD` (0.25) is
+  converted to the four `STICK_*` pseudo-buttons.  Full analog reporting will be added once the
+  SI (Serial Interface) emulation exposes analog axis values to the game.
+
+---
+
 
 ```
 crates/ppcwasm/
@@ -389,8 +501,10 @@ crates/ppcwasm/
 ```
 crates/lazuli-web/
 ├── src/
-│   └── lib.rs        — wasm-bindgen glue: WasmEmulator, compile_block(), advance_timebase()
+│   └── lib.rs        — wasm-bindgen glue: WasmEmulator, compile_block(),
+│                       advance_timebase(), check_webgpu_support()
 └── www/
     ├── index.html    — UI (register display, canvas, controls)
-    └── bootstrap.js  — game loop, ISO parser, hooks, XFB renderer
+    └── bootstrap.js  — game loop, ISO parser, hooks, XFB renderer,
+                        AudioWorklet DSP pipeline, Gamepad API
 ```
