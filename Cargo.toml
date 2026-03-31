@@ -12,6 +12,7 @@ members = [
     "crates/ppcjit",
     "crates/ppcint",
     "crates/ppcwasm",
+    "crates/ppcir",
     "crates/dspint",
     "crates/vtxjit",
     "crates/cores",
@@ -38,6 +39,7 @@ default-members = [
     "crates/ppcjit",
     "crates/ppcint",
     "crates/ppcwasm",
+    "crates/ppcir",
     "crates/dspint",
     "crates/vtxjit",
     "crates/cores",
@@ -145,6 +147,7 @@ vtxjit = { path = "./crates/vtxjit" }
 cores = { path = "./crates/cores" }
 renderer = { path = "./crates/renderer" }
 ppcwasm = { path = "./crates/ppcwasm" }
+ppcir = { path = "./crates/ppcir" }
 modules = { path = "./crates/modules" }
 
 # actual dependencies
