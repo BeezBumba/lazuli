@@ -101,12 +101,12 @@ WASM stack-machine instructions.  For example:
 
 ```
 addi r3, r0, 42
-  →  local.get  $regs_ptr        // push base pointer
-     local.get  $regs_ptr        // push base pointer (for the store)
-     i32.const  0                 // r0 is always 0 for addi
+  →  local.get  $regs_ptr        ;; push base pointer
+     local.get  $regs_ptr        ;; push base pointer (for the store)
+     i32.const  0                ;; r0 is always 0 for addi
      i32.const  42
      i32.add
-     i32.store  offset=<gpr[3]>  // write result into CPU struct
+     i32.store  offset=<gpr[3]>  ;; write result into CPU struct
 ```
 
 **Step 3 — Assemble.**  `BlockBuilder::finish()` wraps the accumulated instructions into a
@@ -222,8 +222,8 @@ loads.  Instead they call into the imported hook functions:
 lwz r3, 8(r4)
   →  local.get  $regs_ptr
      i32.load   offset=<gpr[4]>   ;; load base address from r4
-     i32.const  8                  ;; add displacement
-     i32.add
+     i32.const  8                  ;; displacement value
+     i32.add                       ;; add displacement to base address
      call $read_u32                ;; call into the JavaScript hook
      local.get  $regs_ptr
      i32.store  offset=<gpr[3]>   ;; write result into r3
