@@ -3899,6 +3899,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ppcir"
+version = "0.1.0"
+dependencies = [
+ "gekko",
+]
+
+[[package]]
 name = "ppcjit"
 version = "0.1.0"
 dependencies = [
@@ -3928,6 +3935,7 @@ name = "ppcwasm"
 version = "0.1.0"
 dependencies = [
  "gekko",
+ "ppcir",
  "wasm-encoder",
 ]
 

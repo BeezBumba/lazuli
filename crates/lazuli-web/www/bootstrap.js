@@ -377,8 +377,8 @@ function getRamView(emu) {
  * Build the `hooks` import object for a compiled JIT block.
  *
  * Each compiled block imports these functions from the `"hooks"` module:
- *   read_u8(addr) / read_u16(addr) / read_u32(addr)
- *   write_u8(addr, val) / write_u16(addr, val) / write_u32(addr, val)
+ *   read_u8(addr) / read_u16(addr) / read_u32(addr) / read_f64(addr)
+ *   write_u8(addr, val) / write_u16(addr, val) / write_u32(addr, val) / write_f64(addr, val)
  *   raise_exception(kind)
  *
  * The closures operate directly on the zero-copy `ramView`, so reads and
@@ -425,6 +425,13 @@ function buildHooks(ram, log, pcContext = "?") {
       return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
                (ram[addr + 2] << 8) | ram[addr + 3]) >>> 0);
     },
+    read_f64(addr) {
+      // Read a big-endian IEEE-754 double from guest address.
+      addr = (addr >>> 0) & PHYS_MASK;
+      if (addr + 7 >= ram.length) return 0.0;
+      const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
+      return view.getFloat64(0, false /* big-endian */);
+    },
     write_u8(addr, val) {
       addr = (addr >>> 0) & PHYS_MASK;
       if (addr < ram.length) ram[addr] = val & 0xff;
@@ -445,6 +452,13 @@ function buildHooks(ram, log, pcContext = "?") {
         ram[addr + 2] = (val >>>  8) & 0xff;
         ram[addr + 3] =  val         & 0xff;
       }
+    },
+    write_f64(addr, val) {
+      // Write a big-endian IEEE-754 double to guest address.
+      addr = (addr >>> 0) & PHYS_MASK;
+      if (addr + 7 >= ram.length) return;
+      const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
+      view.setFloat64(0, val, false /* big-endian */);
     },
     raise_exception(kind) {
       if (log) log.push(`exception: kind=${kind}`);
