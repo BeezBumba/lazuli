@@ -299,6 +299,35 @@ impl WasmEmulator {
             self.cpu.supervisor.misc.tb.wrapping_add(delta as u64);
     }
 
+    /// Tick the decrementer down by `delta` ticks and deliver a decrementer
+    /// exception if it wraps through zero.
+    ///
+    /// The GameCube decrementer counts down at the same 40.5 MHz rate as the
+    /// time base.  When it transitions from a non-negative value to a negative
+    /// value (i.e. bit 31 becomes set), the CPU fires the decrementer exception
+    /// at vector `0x00000900` — provided external interrupts are enabled in the
+    /// MSR (the `EE` / `interrupts` bit).
+    ///
+    /// Call this once per animation frame with the same `delta` as
+    /// `advance_timebase` so that decrementer-driven timing loops and OS timer
+    /// callbacks (`OSWaitVBlank`, alarms, etc.) see a ticking counter and do not
+    /// spin forever.
+    ///
+    /// Suggested value: `675_000` ticks per frame (= 40.5 MHz / 60 fps).
+    pub fn advance_decrementer(&mut self, delta: u32) {
+        let old_dec = self.cpu.supervisor.misc.dec;
+        let new_dec = old_dec.wrapping_sub(delta);
+        self.cpu.supervisor.misc.dec = new_dec;
+
+        // The decrementer exception fires on the transition from non-negative
+        // (bit 31 clear) to negative (bit 31 set), but only when external
+        // interrupts are enabled in the MSR.
+        let fired = (old_dec as i32) >= 0 && (new_dec as i32) < 0;
+        if fired && self.cpu.supervisor.config.msr.interrupts() {
+            self.cpu.raise_exception(gekko::Exception::Decrementer);
+        }
+    }
+
     // ── Block compilation ─────────────────────────────────────────────────────
 
     /// Compile the PowerPC basic block starting at `guest_pc` and return its
@@ -530,6 +559,7 @@ impl WasmEmulator {
         set("xer", offsets.xer);
         set("srr0", offsets.srr0);
         set("srr1", offsets.srr1);
+        set("dec", offsets.dec);
         let gpr_arr = js_sys::Array::new();
         for &off in &offsets.gpr {
             gpr_arr.push(&JsValue::from(off as u32));

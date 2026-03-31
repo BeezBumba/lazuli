@@ -1459,6 +1459,12 @@ impl<'a> BlockBuilder<'a> {
                         self.push_base();
                         self.body.push(Instruction::I32Load(self.m32(self.offsets.sprg[3])));
                     }
+                    // DEC (SPR 22) — decrementer register.
+                    // The rotate_right(5) encoding of 22 produces 22.
+                    22 => {
+                        self.push_base();
+                        self.body.push(Instruction::I32Load(self.m32(self.offsets.dec)));
+                    }
                     _ => {
                         // Unimplemented SPR: load 0
                         self.body.push(Instruction::I32Const(0));
@@ -1522,6 +1528,13 @@ impl<'a> BlockBuilder<'a> {
                         self.push_base();
                         self.push_gpr(rs);
                         self.body.push(Instruction::I32Store(self.m32(self.offsets.sprg[3])));
+                    }
+                    // DEC (SPR 22) — decrementer register.
+                    // The rotate_right(5) encoding of 22 produces 22.
+                    22 => {
+                        self.push_base();
+                        self.push_gpr(rs);
+                        self.body.push(Instruction::I32Store(self.m32(self.offsets.dec)));
                     }
                     // SPR 284 (TBWL) — write low 32 bits of the time base.
                     // The rotate_right(5) encoding of 284 produces 28.

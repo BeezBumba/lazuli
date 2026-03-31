@@ -730,6 +730,9 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // Advance the time base before executing blocks so that mftb-based timing
   // loops inside the game see a non-zero delta on the very first frame.
   emu.advance_timebase(TIMEBASE_TICKS_PER_FRAME);
+  // Tick the decrementer down by the same amount; this fires a decrementer
+  // exception when it wraps through zero, which drives OS timer callbacks.
+  emu.advance_decrementer(TIMEBASE_TICKS_PER_FRAME);
 
   // Execute blocks for this frame
   const ram = getRamView(emu);
