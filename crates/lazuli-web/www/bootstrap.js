@@ -56,6 +56,43 @@ function updateStats(emu) {
   $("stat-executed").textContent = emu.blocks_executed();
   $("stat-cache").textContent    = moduleCache.size;
   $("stat-pad").textContent      = "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
+
+  // LR register
+  const lr = emu.get_lr();
+  $("stat-lr").textContent = "0x" + lr.toString(16).toUpperCase().padStart(8, "0");
+
+  // Last compiled block details
+  const lastPc = emu.last_compiled_pc();
+  if (lastPc !== 0) {
+    $("stat-last-pc").textContent   = "0x" + lastPc.toString(16).toUpperCase().padStart(8, "0");
+    $("stat-last-ins").textContent  = emu.last_compiled_ins_count();
+    $("stat-last-wasm").textContent = emu.last_compiled_wasm_bytes() + " B";
+  }
+
+  // Exception / unimplemented counters
+  $("stat-exceptions").textContent   = emu.raise_exception_count();
+  $("stat-unimpl-blocks").textContent = emu.unimplemented_block_count();
+
+  // Hot block (most-executed PC)
+  let hotPc = 0, hotHits = 0;
+  for (const [pc, hits] of pcHitMap) {
+    if (hits > hotHits) { hotPc = pc; hotHits = hits; }
+  }
+  if (hotHits > 0) {
+    $("stat-hot-pc").textContent   = "0x" + hotPc.toString(16).toUpperCase().padStart(8, "0");
+    $("stat-hot-hits").textContent = hotHits;
+  } else {
+    $("stat-hot-pc").textContent   = "—";
+    $("stat-hot-hits").textContent = "—";
+  }
+
+  // Compiled block PC list
+  const pcs = Array.from(emu.get_compiled_block_pcs())
+    .map(pc => (pc >>> 0))
+    .sort((a, b) => a - b)
+    .map(pc => "0x" + pc.toString(16).toUpperCase().padStart(8, "0"))
+    .join("  ");
+  $("stat-block-list").textContent = pcs || "—";
 }
 
 function renderRegisters(emu) {
@@ -394,6 +431,7 @@ function getRamView(emu) {
  *
  * @param {Uint8Array} ram  Zero-copy view of guest RAM
  * @param {string[]}   log  Array to append exception/error messages to
+ * @param {object|null} emu  WasmEmulator instance (used to record exceptions)
  * @param {string}     [pcContext]  Human-readable PC string for console messages
  */
 
@@ -408,7 +446,7 @@ let raiseExceptionTotal = 0;
 /** Maximum number of raise_exception events logged to the console. */
 const RAISE_EXCEPTION_LOG_LIMIT = 30;
 
-function buildHooks(ram, log, pcContext = "?") {
+function buildHooks(ram, log, emu, pcContext = "?") {
   return {
     read_u8(addr) {
       addr = (addr >>> 0) & PHYS_MASK;
@@ -463,6 +501,7 @@ function buildHooks(ram, log, pcContext = "?") {
     raise_exception(kind) {
       if (log) log.push(`exception: kind=${kind}`);
       raiseExceptionTotal++;
+      if (emu) emu.record_raise_exception();
       if (raiseExceptionTotal <= RAISE_EXCEPTION_LOG_LIMIT) {
         console.warn(`[lazuli] raise_exception(kind=${kind}) in block @ ${pcContext} (total #${raiseExceptionTotal})`);
         if (raiseExceptionTotal === RAISE_EXCEPTION_LOG_LIMIT) {
@@ -486,8 +525,15 @@ function buildHooks(ram, log, pcContext = "?") {
  */
 const moduleCache = new Map(); // u32 pc → WebAssembly.Module
 
+/**
+ * Per-PC execution hit counts.  Incremented each time a block at that PC is
+ * executed; cleared alongside `moduleCache` on ISO load / Reset.
+ */
+const pcHitMap = new Map(); // u32 pc → number
+
 function clearModuleCache() {
   moduleCache.clear();
+  pcHitMap.clear();
   raiseExceptionTotal = 0;
 }
 
@@ -545,7 +591,7 @@ function executeOneBlockSync(emu, ram, log) {
   try {
     instance = new WebAssembly.Instance(module, {
       env:   { memory: regsMem },
-      hooks: buildHooks(ram, log, pcHex),
+      hooks: buildHooks(ram, log, emu, pcHex),
     });
   } catch (e) {
     console.error(`[lazuli] instantiation error @ ${pcHex}: ${e}`);
@@ -566,6 +612,7 @@ function executeOneBlockSync(emu, ram, log) {
   // ── Step 5: sync CPU state back; RAM is already in sync (zero-copy) ──────
   emu.set_cpu_bytes(new Uint8Array(regsMem.buffer, 0, cpuSize));
   emu.record_block_executed();
+  pcHitMap.set(pc, (pcHitMap.get(pc) ?? 0) + 1);
 
   // nextPc == 0 means the block updated Cpu::pc itself (branch taken)
   const newPc = (nextPc >>> 0) !== 0 ? (nextPc >>> 0) : emu.get_pc();
@@ -1276,8 +1323,6 @@ async function main() {
       await WebAssembly.compile(wasmBytes); // validate
 
       $("block-output").textContent = annotateWasm(Array.from(wasmBytes));
-      $("stat-ins").textContent     = rawLines.filter(l => l.trim()).length;
-      $("stat-bytes").textContent   = wasmBytes.length + " bytes";
       updateStats(emu);
       setStatus(
         `✓ Block compiled to ${wasmBytes.length} WASM bytes — verified OK`,

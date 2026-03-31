@@ -389,16 +389,44 @@
           <span class="stat-val" id="stat-cache">0</span>
         </div>
         <div class="stat-row">
-          <span>Last block — PPC instructions</span>
-          <span class="stat-val" id="stat-ins">—</span>
+          <span>Last compiled block — PC</span>
+          <span class="stat-val" id="stat-last-pc">—</span>
         </div>
         <div class="stat-row">
-          <span>Last block — WASM bytes</span>
-          <span class="stat-val" id="stat-bytes">—</span>
+          <span>Last compiled block — PPC instructions</span>
+          <span class="stat-val" id="stat-last-ins">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Last compiled block — WASM bytes</span>
+          <span class="stat-val" id="stat-last-wasm">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Blocks w/ unimplemented ops</span>
+          <span class="stat-val" id="stat-unimpl-blocks">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Exceptions raised</span>
+          <span class="stat-val" id="stat-exceptions">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Hot block — PC</span>
+          <span class="stat-val" id="stat-hot-pc">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Hot block — execution hits</span>
+          <span class="stat-val" id="stat-hot-hits">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Link Register (LR)</span>
+          <span class="stat-val" id="stat-lr">0x00000000</span>
         </div>
         <div class="stat-row">
           <span>Pad buttons bitmask</span>
           <span class="stat-val" id="stat-pad">0x0000</span>
+        </div>
+        <div class="stat-row" style="flex-direction:column;align-items:flex-start;gap:4px;">
+          <span>Compiled block PCs</span>
+          <span class="stat-val" id="stat-block-list" style="font-size:0.7rem;word-break:break-all;text-align:left;">—</span>
         </div>
       </div>
     </div>

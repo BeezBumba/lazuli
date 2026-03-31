@@ -183,6 +183,16 @@ pub struct WasmEmulator {
     blocks_executed: u64,
     /// GameCube controller button bitmask (set by JavaScript keyboard handler).
     pad_buttons: u32,
+    /// Guest PC of the most recently compiled block (0 if none yet).
+    last_compiled_pc: u32,
+    /// PPC instruction count of the most recently compiled block.
+    last_compiled_ins_count: u32,
+    /// WASM byte length of the most recently compiled block.
+    last_compiled_wasm_bytes: u32,
+    /// Number of blocks that contained at least one unimplemented opcode.
+    unimplemented_block_count: u64,
+    /// Number of `raise_exception` calls forwarded from the JS hook.
+    raise_exception_count: u64,
 }
 
 #[wasm_bindgen]
@@ -202,6 +212,11 @@ impl WasmEmulator {
             blocks_compiled: 0,
             blocks_executed: 0,
             pad_buttons: 0,
+            last_compiled_pc: 0,
+            last_compiled_ins_count: 0,
+            last_compiled_wasm_bytes: 0,
+            unimplemented_block_count: 0,
+            raise_exception_count: 0,
         }
     }
 
@@ -287,7 +302,57 @@ impl WasmEmulator {
         self.cache.len() as u32
     }
 
-    // ── Zero-copy RAM access ──────────────────────────────────────────────────
+    /// Guest PC of the most recently JIT-compiled block (0 if none compiled yet).
+    pub fn last_compiled_pc(&self) -> u32 {
+        self.last_compiled_pc
+    }
+
+    /// PPC instruction count of the most recently compiled block.
+    pub fn last_compiled_ins_count(&self) -> u32 {
+        self.last_compiled_ins_count
+    }
+
+    /// WASM byte length of the most recently compiled block.
+    pub fn last_compiled_wasm_bytes(&self) -> u32 {
+        self.last_compiled_wasm_bytes
+    }
+
+    /// Number of compiled blocks that contained at least one unimplemented opcode.
+    pub fn unimplemented_block_count(&self) -> u32 {
+        self.unimplemented_block_count as u32
+    }
+
+    /// Increment the `raise_exception` counter.
+    ///
+    /// Call this from the JavaScript `raise_exception` hook each time an
+    /// exception is raised by a compiled block, so the Rust side can expose
+    /// the total count to the stats panel.
+    pub fn record_raise_exception(&mut self) {
+        self.raise_exception_count += 1;
+    }
+
+    /// Total number of `raise_exception` calls since emulator creation.
+    pub fn raise_exception_count(&self) -> u32 {
+        self.raise_exception_count as u32
+    }
+
+    /// Current Link Register value.
+    pub fn get_lr(&self) -> u32 {
+        self.cpu.user.lr
+    }
+
+    /// Return a [`js_sys::Array`] containing the guest PC of every block
+    /// currently held in the compiled-block cache (module cache).
+    ///
+    /// Useful for debugging: shows which basic-block addresses have been JIT-
+    /// compiled so far.
+    pub fn get_compiled_block_pcs(&self) -> js_sys::Array {
+        let arr = js_sys::Array::new();
+        for &pc in self.cache.modules.keys() {
+            arr.push(&JsValue::from(pc));
+        }
+        arr
+    }
 
     /// Returns a raw pointer (WASM linear memory offset) to the start of the
     /// guest RAM buffer.
@@ -421,6 +486,12 @@ impl WasmEmulator {
         }
 
         self.blocks_compiled += 1;
+        self.last_compiled_pc = guest_pc;
+        self.last_compiled_ins_count = block.instruction_count;
+        self.last_compiled_wasm_bytes = block.bytes.len() as u32;
+        if !block.unimplemented_ops.is_empty() {
+            self.unimplemented_block_count += 1;
+        }
         let bytes = js_sys::Uint8Array::from(block.bytes.as_slice());
         Ok(bytes)
     }
@@ -443,6 +514,12 @@ impl WasmEmulator {
 
         self.cache.compile_and_cache(guest_pc, &block)?;
         self.blocks_compiled += 1;
+        self.last_compiled_pc = guest_pc;
+        self.last_compiled_ins_count = ins_count;
+        self.last_compiled_wasm_bytes = byte_len;
+        if !block.unimplemented_ops.is_empty() {
+            self.unimplemented_block_count += 1;
+        }
 
         let obj = js_sys::Object::new();
         js_sys::Reflect::set(&obj, &"pc".into(), &JsValue::from(guest_pc))?;
