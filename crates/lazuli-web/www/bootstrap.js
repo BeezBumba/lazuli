@@ -61,9 +61,9 @@ function updateStats(emu) {
   const lr = emu.get_lr();
   $("stat-lr").textContent = "0x" + lr.toString(16).toUpperCase().padStart(8, "0");
 
-  // Last compiled block details
-  const lastPc = emu.last_compiled_pc();
-  if (lastPc !== 0) {
+  // Last compiled block details — shown once at least one block has been compiled
+  if (emu.blocks_compiled() > 0) {
+    const lastPc = emu.last_compiled_pc() >>> 0;
     $("stat-last-pc").textContent   = "0x" + lastPc.toString(16).toUpperCase().padStart(8, "0");
     $("stat-last-ins").textContent  = emu.last_compiled_ins_count();
     $("stat-last-wasm").textContent = emu.last_compiled_wasm_bytes() + " B";
@@ -86,8 +86,10 @@ function updateStats(emu) {
     $("stat-hot-hits").textContent = "—";
   }
 
-  // Compiled block PC list
-  const pcs = Array.from(emu.get_compiled_block_pcs())
+  // Compiled block PC list — read from JS moduleCache (the Rust WasmBlockCache
+  // is a separate structure used only by the developer compile tool, not the
+  // main emulation loop which stores modules in the JS `moduleCache` Map).
+  const pcs = Array.from(moduleCache.keys())
     .map(pc => (pc >>> 0))
     .sort((a, b) => a - b)
     .map(pc => "0x" + pc.toString(16).toUpperCase().padStart(8, "0"))
