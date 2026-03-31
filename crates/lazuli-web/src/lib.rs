@@ -2,8 +2,14 @@
 //!
 //! ## Architecture overview
 //!
-//! This crate bridges the [`ppcwasm`] JIT backend to the web browser.  The
-//! overall data-flow mirrors the approach used by the Play! PS2 emulator:
+//! This crate bridges the [`ppcwasm`] JIT backend to the web browser and
+//! provides the Rust-side foundations for full in-browser emulation,
+//! mirroring the approach used by the [Play!] PS2 emulator:
+//!
+//! - **CPU:** PowerPC → WebAssembly dynarec via [`ppcwasm::WasmJit`]
+//! - **GPU:** WebGPU via `wgpu` (feature `webgpu` on wasm32) — see [`check_webgpu_support`]
+//! - **Audio:** Web Audio API `AudioWorkletNode` driven by GameCube DSP output
+//! - **IO:** GameCube controller via the browser Gamepad API
 //!
 //! ```text
 //!  PowerPC instructions
@@ -31,10 +37,10 @@
 //!
 //! Compiled blocks import memory-access functions from the `"hooks"` module.
 //! These are provided by JavaScript closures captured when the block is
-//! instantiated.  In a full emulator integration the hook closures would call
-//! back into Rust through [`wasm_bindgen`]; in this initial implementation
-//! they are thin JavaScript shims that forward to a typed array view of the
-//! emulator's RAM.
+//! instantiated.  The hook closures call back into the zero-copy RAM view
+//! backed by the emulator's WASM linear memory.
+//!
+//! [Play!]: https://github.com/jpd002/Play-
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -43,6 +49,33 @@ use gekko::disasm::{Extensions, Ins};
 use js_sys::WebAssembly;
 use ppcwasm::WasmJit;
 use wasm_bindgen::prelude::*;
+
+// ─── WebGPU support detection ─────────────────────────────────────────────────
+
+/// Returns `true` if the browser exposes `navigator.gpu` (WebGPU is available).
+///
+/// WebGPU is the GPU API used by `wgpu` on `wasm32` targets (enabled via the
+/// `webgpu` feature).  Call this from JavaScript before attempting to
+/// initialise the GPU renderer; fall back to the canvas-based XFB blitter if
+/// it returns `false`.
+///
+/// # Browser support
+///
+/// Browser WebGPU support is still evolving; check
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API) for the
+/// current compatibility table.  Chrome and Edge have shipped WebGPU in stable
+/// releases since 2023; Firefox and Safari have varying levels of support
+/// depending on the platform and flags in use.
+#[wasm_bindgen]
+pub fn check_webgpu_support() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    // `navigator.gpu` is `undefined` on browsers without WebGPU support.
+    js_sys::Reflect::get(&window.navigator(), &JsValue::from_str("gpu"))
+        .map(|v| !v.is_undefined() && !v.is_null())
+        .unwrap_or(false)
+}
 
 // ─── WASM memory export ───────────────────────────────────────────────────────
 
@@ -125,13 +158,19 @@ impl WasmBlockCache {
 
 // ─── WasmEmulator ────────────────────────────────────────────────────────────
 
-/// A minimal GameCube CPU emulator that runs in the browser using a
-/// PowerPC → WebAssembly dynarec.
+/// GameCube emulator running entirely in the browser via WebAssembly.
 ///
 /// Exported to JavaScript via `wasm-bindgen`.  The emulator maintains a
 /// [`gekko::Cpu`] register file and a flat RAM array.  Compiled PPC blocks are
 /// cached as [`WebAssembly::Module`]s and instantiated on demand with
 /// JavaScript hook closures for guest memory access.
+///
+/// This is the Rust counterpart to the JavaScript game loop in `bootstrap.js`.
+/// Together they implement the same architecture used by the [Play!] PS2
+/// emulator in the browser: CPU dynarec via WASM + GPU via WebGPU +
+/// audio via `AudioWorkletNode` + IO via the Gamepad API.
+///
+/// [Play!]: https://github.com/jpd002/Play-
 #[wasm_bindgen]
 pub struct WasmEmulator {
     cpu: gekko::Cpu,

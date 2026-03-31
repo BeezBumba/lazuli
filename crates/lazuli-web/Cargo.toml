@@ -20,7 +20,20 @@ features = [
     "console",
     "Window",
     "Performance",
+    # Used by check_webgpu_support() to probe navigator.gpu
+    "Navigator",
+    "HtmlCanvasElement",
 ]
+
+# ── WebGPU rendering backend (wasm32 targets only) ────────────────────────────
+# wgpu 27 supports the browser's native WebGPU API when targeting wasm32.
+# Adding the "webgpu" feature here enables check_webgpu_support() and lays the
+# foundation for porting the `renderer` crate to the browser.  Non-wasm builds
+# continue to use their platform-specific backends (Vulkan / Metal / D3D12)
+# declared in the `renderer` crate.
+[target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
+workspace = true
+features = ["webgpu", "wgsl"]
 
 # Disable wasm-opt during wasm-pack builds so that the package can be built
 # without a network connection.  Re-enable for distribution builds by removing
