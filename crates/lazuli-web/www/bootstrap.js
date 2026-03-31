@@ -92,7 +92,25 @@ function updateStats(emu) {
     .sort((a, b) => a - b)
     .map(pc => "0x" + pc.toString(16).toUpperCase().padStart(8, "0"))
     .join("  ");
-  $("stat-block-list").textContent = pcs || "—";
+  const blockRow = $("stat-block-row");
+  const blockList = $("stat-block-list");
+  if (pcs) {
+    blockRow.style.flexDirection = "column";
+    blockRow.style.alignItems = "flex-start";
+    blockRow.style.gap = "4px";
+    blockList.style.fontSize = "0.7rem";
+    blockList.style.wordBreak = "break-all";
+    blockList.style.textAlign = "left";
+    blockList.textContent = pcs;
+  } else {
+    blockRow.style.flexDirection = "";
+    blockRow.style.alignItems = "";
+    blockRow.style.gap = "";
+    blockList.style.fontSize = "";
+    blockList.style.wordBreak = "";
+    blockList.style.textAlign = "";
+    blockList.textContent = "—";
+  }
 }
 
 function renderRegisters(emu) {
