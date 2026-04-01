@@ -75,6 +75,10 @@ pub struct Renderer {
     color_blitter: ColorBlitter,
     depth_blitter: DepthBlitter,
     data_read_buffer: wgpu::Buffer,
+    // On WebGPU, pipeline immediates (UVs + LOD bias) are uploaded via a
+    // uniform buffer instead of push constants.
+    #[cfg(feature = "webgpu")]
+    pipeline_immediates_uniform: crate::push::PushUniform,
 
     // caches
     pipeline_cache: pipeline::Cache,
@@ -109,6 +113,17 @@ impl Renderer {
 
         let pipeline_cache = pipeline::Cache::new(&device);
         let texture_cache = texture::Cache::default();
+
+        // On WebGPU, create the uniform buffer for pipeline immediates using
+        // the layout already embedded in the pipeline cache, so the bind group
+        // is guaranteed to be compatible with all render pipelines.
+        #[cfg(feature = "webgpu")]
+        let pipeline_immediates_uniform = crate::push::PushUniform::with_layout(
+            &device,
+            pipeline_cache.push_uniform_layout().clone(),
+            96,
+            "pipeline immediates",
+        );
 
         let color = embedded_fb.color();
         let multisampled_color = embedded_fb.multisampled_color();
@@ -177,6 +192,8 @@ impl Renderer {
             color_blitter,
             depth_blitter,
             data_read_buffer,
+            #[cfg(feature = "webgpu")]
+            pipeline_immediates_uniform,
 
             pipeline_cache,
             texture_cache,
@@ -654,16 +671,31 @@ impl Renderer {
         let pipeline = self.pipeline_cache.get(&self.device, &self.pipeline_config);
 
         self.current_pass.set_pipeline(pipeline);
+
+        #[cfg(not(feature = "webgpu"))]
         self.current_pass.set_push_constants(
             wgpu::ShaderStages::FRAGMENT,
             0,
             scaling_array.as_bytes(),
         );
+        #[cfg(not(feature = "webgpu"))]
         self.current_pass.set_push_constants(
             wgpu::ShaderStages::FRAGMENT,
             64,
             lodbias_array.as_bytes(),
         );
+
+        #[cfg(feature = "webgpu")]
+        {
+            // Pack scaling (64 bytes) and lodbias (32 bytes) into a single 96-byte upload.
+            let mut data = [0u8; 96];
+            data[..64].copy_from_slice(scaling_array.as_bytes());
+            data[64..96].copy_from_slice(lodbias_array.as_bytes());
+            self.pipeline_immediates_uniform.update(&self.queue, &data);
+            self.pipeline_immediates_uniform
+                .set_bind_group(&mut self.current_pass, 2);
+        }
+
         self.current_pass.set_bind_group(0, Some(&data_group), &[]);
         self.current_pass
             .set_bind_group(1, Some(&textures_group), &[]);

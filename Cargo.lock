@@ -2679,6 +2679,7 @@ dependencies = [
  "gekko",
  "js-sys",
  "ppcwasm",
+ "renderer",
  "wasm-bindgen",
  "web-sys",
  "wgpu",

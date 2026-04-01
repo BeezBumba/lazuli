@@ -100,13 +100,18 @@ pub struct External {
 
 impl External {
     fn create_framebuffer(device: &wgpu::Device, size: wgpu::Extent3d) -> wgpu::TextureView {
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        #[cfg(feature = "webgpu")]
+        {
+            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
         device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("external framebuffer"),
                 dimension: wgpu::TextureDimension::D2,
                 size,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage,
                 view_formats: &[],
                 mip_level_count: 1,
                 sample_count: 1,
@@ -178,6 +183,8 @@ impl External {
     /// have been previously added with `insert_copy` and are consumed by this method.
     pub fn build(&mut self, encoder: &mut wgpu::CommandEncoder, parts: Vec<XfbPart>) {
         let framebuffer = self.framebuffer.texture();
+
+        #[cfg(not(feature = "webgpu"))]
         encoder.clear_texture(
             framebuffer,
             &wgpu::ImageSubresourceRange {
@@ -188,6 +195,29 @@ impl External {
                 array_layer_count: None,
             },
         );
+
+        // clear_texture requires the CLEAR_TEXTURE feature which is native-only.
+        // Use a render pass with LoadOp::Clear instead.
+        #[cfg(feature = "webgpu")]
+        {
+            let view = framebuffer.create_view(&Default::default());
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("xfb clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            drop(pass);
+        }
 
         for part in parts {
             let saved = self.copies.get(&part.id).unwrap();
@@ -298,6 +328,7 @@ impl Renderer {
         let color = self.embedded_fb.color();
         self.color_blitter.blit_to_texture(
             &self.device,
+            &self.queue,
             color,
             wgpu::Origin3d {
                 x: x as u32,
@@ -349,6 +380,7 @@ impl Renderer {
         let depth = self.embedded_fb.depth();
         self.depth_blitter.blit_to_texture(
             &self.device,
+            &self.queue,
             depth,
             wgpu::Origin3d {
                 x: x as u32,
@@ -386,7 +418,7 @@ impl Renderer {
 
         let view = output.create_view(&Default::default());
         self.converter
-            .convert_color(&self.device, format, color, &view, encoder);
+            .convert_color(&self.device, &self.queue, format, color, &view, encoder);
 
         view
     }
@@ -410,7 +442,7 @@ impl Renderer {
 
         let view = output.create_view(&Default::default());
         self.converter
-            .convert_depth(&self.device, format, depth, &view, encoder);
+            .convert_depth(&self.device, &self.queue, format, depth, &view, encoder);
 
         view
     }
@@ -491,7 +523,7 @@ impl Renderer {
         self.current_pass
             .set_viewport(0.0, 0.0, 640.0, 528.0, 0.0, 1.0);
         self.cleaner
-            .clear_target(color, depth, &mut self.current_pass);
+            .clear_target(color, depth, &mut self.current_pass, &self.queue);
     }
 
     pub fn copy_color(

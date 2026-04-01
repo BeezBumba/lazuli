@@ -3,6 +3,7 @@
 mod alloc;
 mod blit;
 mod clear;
+mod push;
 mod render;
 
 use std::sync::Arc;
@@ -28,8 +29,15 @@ pub struct Stats {
 
 struct Inner {
     device: wgpu::Device,
+    queue: wgpu::Queue,
     shared: Arc<render::Shared>,
     blitter: XfbBlitter,
+    // On wasm32, the renderer runs on the main thread. The background renderer
+    // thread is unavailable without SharedArrayBuffer + COOP/COEP headers.
+    #[cfg(target_arch = "wasm32")]
+    sync_renderer: std::sync::Mutex<RendererInner>,
+    #[cfg(target_arch = "wasm32")]
+    sync_receiver: flume::Receiver<Action>,
 }
 
 /// A WGPU based renderer implementation.
@@ -44,11 +52,14 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let blitter = XfbBlitter::new(&device, format);
-        let (renderer, shared) = RendererInner::new(device.clone(), queue);
+        let (renderer, shared) = RendererInner::new(device.clone(), queue.clone());
 
         const CAPACITY: usize = 1024 * 1024 / size_of::<Action>();
         let (sender, receiver) = flume::bounded(CAPACITY);
 
+        // On wasm32 there is no thread support without SharedArrayBuffer + COOP/COEP
+        // headers. Instead, actions are processed synchronously in `render` below.
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::Builder::new()
             .name("lazuli wgpu renderer".into())
             .spawn(move || worker(renderer, receiver))
@@ -57,20 +68,36 @@ impl Renderer {
         Self {
             inner: Arc::new(Inner {
                 device,
+                queue,
                 shared,
                 blitter,
+                #[cfg(target_arch = "wasm32")]
+                sync_renderer: std::sync::Mutex::new(renderer),
+                #[cfg(target_arch = "wasm32")]
+                sync_receiver: receiver,
             }),
             sender,
         }
     }
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
+        // On wasm32, drain and process all pending actions synchronously before
+        // blitting, since there is no background renderer thread.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut r = self.inner.sync_renderer.lock().unwrap();
+            while let Ok(action) = self.inner.sync_receiver.try_recv() {
+                r.exec(action);
+            }
+        }
+
         let output = self.inner.shared.output.lock().unwrap();
         let size = output.texture().size();
 
         // TODO: change this
         self.inner.blitter.blit_to_target(
             &self.inner.device,
+            &self.inner.queue,
             &output,
             wgpu::Origin3d::ZERO,
             size,
@@ -97,3 +124,4 @@ impl RenderModule for Renderer {
         self.sender.send(action).expect("rendering thread is alive");
     }
 }
+

@@ -1,0 +1,1249 @@
+From 3925755295cfab2d443258ad03c587c8a3fda63b Mon Sep 17 00:00:00 2001
+From: "copilot-swe-agent[bot]" <198982749+Copilot@users.noreply.github.com>
+Date: Wed, 1 Apr 2026 22:34:33 +0000
+Subject: [PATCH] feat: WebGPU browser compatibility
+
+- Add `webgpu` feature to renderer crate
+- Add push.rs: PushUniform abstraction for uniform-buffer-based push
+  constants on WebGPU targets (var<push_constant> is Vulkan-only)
+- Update build.rs to post-process compiled WGSL shaders into
+  *_webgpu.wgsl variants replacing var<push_constant> with
+  @group(N) @binding(0) var<uniform> when the webgpu feature is active
+- Update blit.rs, clear.rs: conditional PushUniform fields and pipeline
+  layouts; use push_constant on native, uniform buffer on WebGPU;
+  Converter uses separate layouts for color and depth pipelines
+- Update lib.rs: add queue to Inner, skip background thread on wasm32,
+  store sync_renderer/sync_receiver for synchronous action dispatch
+- Update render.rs: pipeline_immediates_uniform field for WebGPU,
+  conditional push_constants vs uniform buffer in flush()
+- Update render/pipeline.rs: conditional pipeline layout (group 2 for
+  push uniform on WebGPU), expose push_uniform_layout()
+- Update render/pipeline/shader.rs: replace push_constant declaration
+  in render.wesl source when compiling with webgpu feature
+- Update render/framebuffer.rs: replace encoder.clear_texture() with
+  render pass LoadOp::Clear for WebGPU (CLEAR_TEXTURE is native-only);
+  add RENDER_ATTACHMENT usage to external framebuffer on WebGPU;
+  pass queue to blit/converter methods
+- Gate modules/src/audio.rs behind cfg(not(target_arch = "wasm32"))
+- Move cpal/gilrs/resampler/hound to target-specific deps in modules
+- Add renderer with webgpu feature to lazuli-web wasm32 dependencies
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+
+Co-authored-by: BeezBumba <130922034+BeezBumba@users.noreply.github.com>
+---
+ Cargo.lock                                    |   1 +
+ crates/lazuli-web/Cargo.toml                  |   4 +
+ crates/modules/Cargo.toml                     |  10 +-
+ crates/modules/src/lib.rs                     |   1 +
+ crates/renderer/Cargo.toml                    |   3 +
+ crates/renderer/build.rs                      |  43 ++++
+ crates/renderer/src/blit.rs                   | 215 +++++++++++++++++-
+ crates/renderer/src/clear.rs                  |  46 +++-
+ crates/renderer/src/lib.rs                    |  30 ++-
+ crates/renderer/src/push.rs                   | 110 +++++++++
+ crates/renderer/src/render.rs                 |  32 +++
+ crates/renderer/src/render/framebuffer.rs     |  40 +++-
+ crates/renderer/src/render/pipeline.rs        |  34 +++
+ crates/renderer/src/render/pipeline/shader.rs |  16 +-
+ 14 files changed, 566 insertions(+), 19 deletions(-)
+ create mode 100644 crates/renderer/src/push.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 8f3ccca..8267511 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2679,6 +2679,7 @@ dependencies = [
+  "gekko",
+  "js-sys",
+  "ppcwasm",
++ "renderer",
+  "wasm-bindgen",
+  "web-sys",
+  "wgpu",
+diff --git a/crates/lazuli-web/Cargo.toml b/crates/lazuli-web/Cargo.toml
+index 65ecfbc..3720346 100644
+--- a/crates/lazuli-web/Cargo.toml
++++ b/crates/lazuli-web/Cargo.toml
+@@ -35,6 +35,10 @@ features = [
+ workspace = true
+ features = ["webgpu", "wgsl"]
+ 
++[target.'cfg(target_arch = "wasm32")'.dependencies.renderer]
++workspace = true
++features = ["webgpu"]
++
+ # Disable wasm-opt during wasm-pack builds so that the package can be built
+ # without a network connection.  Re-enable for distribution builds by removing
+ # this section or setting `wasm-opt = ["-O3"]`.
+diff --git a/crates/modules/Cargo.toml b/crates/modules/Cargo.toml
+index 75b2211..a208f4f 100644
+--- a/crates/modules/Cargo.toml
++++ b/crates/modules/Cargo.toml
+@@ -13,13 +13,15 @@ tracing.workspace = true
+ zerocopy.workspace = true
+ seq-macro.workspace = true
+ 
+-gilrs = "0.11"
+-cpal = "0.17"
+-resampler = "0.4"
+-hound = "3.5"
+ addr2line = { version = "0.25", features = [
+     "cpp_demangle",
+     "loader",
+ ], default-features = false }
+ mapfile_parser = "2.12"
+ cwdemangle = "1"
++
++[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++gilrs = "0.11"
++cpal = "0.17"
++resampler = "0.4"
++hound = "3.5"
+diff --git a/crates/modules/src/lib.rs b/crates/modules/src/lib.rs
+index 07bccb9..3cda55c 100644
+--- a/crates/modules/src/lib.rs
++++ b/crates/modules/src/lib.rs
+@@ -1,3 +1,4 @@
++#[cfg(not(target_arch = "wasm32"))]
+ pub mod audio;
+ pub mod debug;
+ pub mod disk;
+diff --git a/crates/renderer/Cargo.toml b/crates/renderer/Cargo.toml
+index 068834b..cd36b88 100644
+--- a/crates/renderer/Cargo.toml
++++ b/crates/renderer/Cargo.toml
+@@ -5,6 +5,9 @@ version = "0.1.0"
+ edition = "2024"
+ license = "GPL-3.0-only"
+ 
++[features]
++webgpu = []
++
+ [lints]
+ workspace = true
+ 
+diff --git a/crates/renderer/build.rs b/crates/renderer/build.rs
+index d66ac33..abfd005 100644
+--- a/crates/renderer/build.rs
++++ b/crates/renderer/build.rs
+@@ -20,4 +20,47 @@ fn main() {
+     wesl.build_artifact(&"package::color_convert".parse().unwrap(), "color_convert");
+     wesl.build_artifact(&"package::depth_convert".parse().unwrap(), "depth_convert");
+     wesl.build_artifact(&"package::depth_resolve".parse().unwrap(), "depth_resolve");
++
++    // When targeting WebGPU, generate push-constant-free shader variants.
++    // `var<push_constant>` is a Vulkan extension absent from browser WebGPU;
++    // we replace it with a `@group(N) @binding(0) var<uniform>` binding.
++    if std::env::var("CARGO_FEATURE_WEBGPU").is_ok() {
++        let out_dir = std::env::var("OUT_DIR").unwrap();
++        let out_dir = std::path::Path::new(&out_dir);
++
++        // (shader_artifact_name, uniform_group_index)
++        // The group index is chosen to be the first unused bind-group for
++        // that particular pipeline so it doesn't collide with existing groups.
++        let shaders: &[(&str, u32)] = &[
++            // clear: no existing groups → group 0
++            ("clear", 0),
++            // blit shaders: group 0 = texture + sampler → group 1
++            ("xfb_blit", 1),
++            ("color_blit", 1),
++            ("depth_blit", 1),
++            ("depth_resolve", 1),
++            // convert (compute): group 0 = input + output → group 1
++            ("color_convert", 1),
++            ("depth_convert", 1),
++        ];
++
++        for (name, group) in shaders {
++            let src_path = out_dir.join(format!("{name}.wgsl"));
++            let wgsl = std::fs::read_to_string(&src_path)
++                .unwrap_or_else(|e| panic!("failed to read {}: {e}", src_path.display()));
++
++            // Replace `var<push_constant> <name>: <type>;` with the uniform
++            // binding. The compiled WGSL uses either `var<push_constant>` (for
++            // variables bound in module scope) which we replace uniformly.
++            let patched = wgsl.replace(
++                "var<push_constant>",
++                &format!("@group({group}) @binding(0) var<uniform>"),
++            );
++
++            let dst_path = out_dir.join(format!("{name}_webgpu.wgsl"));
++            std::fs::write(&dst_path, patched)
++                .unwrap_or_else(|e| panic!("failed to write {}: {e}", dst_path.display()));
++        }
++    }
+ }
++
+diff --git a/crates/renderer/src/blit.rs b/crates/renderer/src/blit.rs
+index 3295786..398f219 100644
+--- a/crates/renderer/src/blit.rs
++++ b/crates/renderer/src/blit.rs
+@@ -7,6 +7,8 @@ pub struct XfbBlitter {
+     group_layout: wgpu::BindGroupLayout,
+     pipeline: wgpu::RenderPipeline,
+     sampler: wgpu::Sampler,
++    #[cfg(feature = "webgpu")]
++    push_uniform: crate::push::PushUniform,
+ }
+ 
+ impl XfbBlitter {
+@@ -33,6 +35,15 @@ impl XfbBlitter {
+             ],
+         });
+ 
++        #[cfg(feature = "webgpu")]
++        let push_uniform = crate::push::PushUniform::new(
++            device,
++            16,
++            "xfb blit push uniform",
++            wgpu::ShaderStages::VERTEX,
++        );
++
++        #[cfg(not(feature = "webgpu"))]
+         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: None,
+             bind_group_layouts: &[&group_layout],
+@@ -41,8 +52,18 @@ impl XfbBlitter {
+                 range: 0..16,
+             }],
+         });
++        #[cfg(feature = "webgpu")]
++        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[&group_layout, push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let shader = include_wesl!("xfb_blit");
++        #[cfg(feature = "webgpu")]
++        let shader = include_str!(concat!(env!("OUT_DIR"), "/xfb_blit_webgpu.wgsl"));
++
+         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: None,
+             source: wgpu::ShaderSource::Wgsl(shader.into()),
+@@ -97,12 +118,16 @@ impl XfbBlitter {
+             group_layout,
+             pipeline,
+             sampler,
++            #[cfg(feature = "webgpu")]
++            push_uniform,
+         }
+     }
+ 
+     pub fn blit_to_target(
+         &self,
+         device: &wgpu::Device,
++        #[cfg(feature = "webgpu")] queue: &wgpu::Queue,
++        #[cfg(not(feature = "webgpu"))] _queue: &wgpu::Queue,
+         texture: &wgpu::TextureView,
+         top_left: wgpu::Origin3d,
+         dimensions: wgpu::Extent3d,
+@@ -141,7 +166,16 @@ impl XfbBlitter {
+         });
+ 
+         pass.set_pipeline(&self.pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(wgpu::ShaderStages::VERTEX, 0, uvs.as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.push_uniform.update(queue, uvs.as_bytes());
++            self.push_uniform.set_bind_group(pass, 1);
++        }
++
+         pass.set_bind_group(0, &group, &[]);
+         pass.draw(0..4, 0..1);
+     }
+@@ -151,6 +185,8 @@ pub struct ColorBlitter {
+     group_layout: wgpu::BindGroupLayout,
+     pipeline: wgpu::RenderPipeline,
+     sampler: wgpu::Sampler,
++    #[cfg(feature = "webgpu")]
++    push_uniform: crate::push::PushUniform,
+ }
+ 
+ impl ColorBlitter {
+@@ -177,6 +213,15 @@ impl ColorBlitter {
+             ],
+         });
+ 
++        #[cfg(feature = "webgpu")]
++        let push_uniform = crate::push::PushUniform::new(
++            device,
++            16,
++            "color blit push uniform",
++            wgpu::ShaderStages::VERTEX,
++        );
++
++        #[cfg(not(feature = "webgpu"))]
+         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: None,
+             bind_group_layouts: &[&group_layout],
+@@ -185,8 +230,18 @@ impl ColorBlitter {
+                 range: 0..16,
+             }],
+         });
++        #[cfg(feature = "webgpu")]
++        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[&group_layout, push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let shader = include_wesl!("color_blit");
++        #[cfg(feature = "webgpu")]
++        let shader = include_str!(concat!(env!("OUT_DIR"), "/color_blit_webgpu.wgsl"));
++
+         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: None,
+             source: wgpu::ShaderSource::Wgsl(shader.into()),
+@@ -241,12 +296,16 @@ impl ColorBlitter {
+             group_layout,
+             pipeline,
+             sampler,
++            #[cfg(feature = "webgpu")]
++            push_uniform,
+         }
+     }
+ 
+     pub fn blit_to_target(
+         &self,
+         device: &wgpu::Device,
++        #[cfg(feature = "webgpu")] queue: &wgpu::Queue,
++        #[cfg(not(feature = "webgpu"))] _queue: &wgpu::Queue,
+         texture: &wgpu::TextureView,
+         top_left: wgpu::Origin3d,
+         dimensions: wgpu::Extent3d,
+@@ -283,7 +342,16 @@ impl ColorBlitter {
+         });
+ 
+         pass.set_pipeline(&self.pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(wgpu::ShaderStages::VERTEX, 0, uvs.as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.push_uniform.update(queue, uvs.as_bytes());
++            self.push_uniform.set_bind_group(pass, 1);
++        }
++
+         pass.set_bind_group(0, &group, &[]);
+         pass.draw(0..4, 0..1);
+     }
+@@ -291,6 +359,7 @@ impl ColorBlitter {
+     pub fn blit_to_texture(
+         &self,
+         device: &wgpu::Device,
++        queue: &wgpu::Queue,
+         source: &wgpu::TextureView,
+         top_left: wgpu::Origin3d,
+         dimensions: wgpu::Extent3d,
+@@ -310,7 +379,7 @@ impl ColorBlitter {
+             occlusion_query_set: None,
+         });
+ 
+-        self.blit_to_target(device, source, top_left, dimensions, &mut pass);
++        self.blit_to_target(device, queue, source, top_left, dimensions, &mut pass);
+         std::mem::drop(pass);
+     }
+ }
+@@ -321,6 +390,10 @@ pub struct DepthBlitter {
+     blit_group_layout: wgpu::BindGroupLayout,
+     blit_pipeline: wgpu::RenderPipeline,
+     sampler: wgpu::Sampler,
++    #[cfg(feature = "webgpu")]
++    resolve_push_uniform: crate::push::PushUniform,
++    #[cfg(feature = "webgpu")]
++    blit_push_uniform: crate::push::PushUniform,
+ }
+ 
+ impl DepthBlitter {
+@@ -362,6 +435,22 @@ impl DepthBlitter {
+             ],
+         });
+ 
++        #[cfg(feature = "webgpu")]
++        let resolve_push_uniform = crate::push::PushUniform::new(
++            device,
++            16,
++            "depth resolve push uniform",
++            wgpu::ShaderStages::VERTEX,
++        );
++        #[cfg(feature = "webgpu")]
++        let blit_push_uniform = crate::push::PushUniform::new(
++            device,
++            16,
++            "depth blit push uniform",
++            wgpu::ShaderStages::VERTEX,
++        );
++
++        #[cfg(not(feature = "webgpu"))]
+         let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: None,
+             bind_group_layouts: &[&resolve_group_layout],
+@@ -370,7 +459,14 @@ impl DepthBlitter {
+                 range: 0..16,
+             }],
+         });
++        #[cfg(feature = "webgpu")]
++        let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[&resolve_group_layout, resolve_push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: None,
+             bind_group_layouts: &[&blit_group_layout],
+@@ -379,14 +475,28 @@ impl DepthBlitter {
+                 range: 0..16,
+             }],
+         });
++        #[cfg(feature = "webgpu")]
++        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[&blit_group_layout, blit_push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let resolve_shader = include_wesl!("depth_resolve");
++        #[cfg(feature = "webgpu")]
++        let resolve_shader = include_str!(concat!(env!("OUT_DIR"), "/depth_resolve_webgpu.wgsl"));
++
+         let resolve_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("depth resolve"),
+             source: wgpu::ShaderSource::Wgsl(resolve_shader.into()),
+         });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let blit_shader = include_wesl!("depth_blit");
++        #[cfg(feature = "webgpu")]
++        let blit_shader = include_str!(concat!(env!("OUT_DIR"), "/depth_blit_webgpu.wgsl"));
++
+         let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("depth blit"),
+             source: wgpu::ShaderSource::Wgsl(blit_shader.into()),
+@@ -477,12 +587,18 @@ impl DepthBlitter {
+             blit_group_layout,
+             blit_pipeline,
+             sampler,
++            #[cfg(feature = "webgpu")]
++            resolve_push_uniform,
++            #[cfg(feature = "webgpu")]
++            blit_push_uniform,
+         }
+     }
+ 
+     fn resolve_depth(
+         &self,
+         device: &wgpu::Device,
++        #[cfg(feature = "webgpu")] queue: &wgpu::Queue,
++        #[cfg(not(feature = "webgpu"))] _queue: &wgpu::Queue,
+         texture: &wgpu::TextureView,
+         top_left: wgpu::Origin3d,
+         dimensions: wgpu::Extent3d,
+@@ -538,7 +654,16 @@ impl DepthBlitter {
+         });
+ 
+         pass.set_pipeline(&self.resolve_pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(wgpu::ShaderStages::VERTEX, 0, uvs.as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.resolve_push_uniform.update(queue, uvs.as_bytes());
++            self.resolve_push_uniform.set_bind_group(&mut pass, 1);
++        }
++
+         pass.set_bind_group(0, &group, &[]);
+         pass.draw(0..4, 0..1);
+ 
+@@ -548,6 +673,8 @@ impl DepthBlitter {
+     fn blit_resolved_to_target(
+         &self,
+         device: &wgpu::Device,
++        #[cfg(feature = "webgpu")] queue: &wgpu::Queue,
++        #[cfg(not(feature = "webgpu"))] _queue: &wgpu::Queue,
+         texture: &wgpu::TextureView,
+         top_left: wgpu::Origin3d,
+         dimensions: wgpu::Extent3d,
+@@ -584,7 +711,16 @@ impl DepthBlitter {
+         });
+ 
+         pass.set_pipeline(&self.blit_pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(wgpu::ShaderStages::VERTEX, 0, uvs.as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.blit_push_uniform.update(queue, uvs.as_bytes());
++            self.blit_push_uniform.set_bind_group(pass, 1);
++        }
++
+         pass.set_bind_group(0, &group, &[]);
+         pass.draw(0..4, 0..1);
+     }
+@@ -592,13 +728,14 @@ impl DepthBlitter {
+     pub fn blit_to_texture(
+         &self,
+         device: &wgpu::Device,
++        queue: &wgpu::Queue,
+         source: &wgpu::TextureView,
+         top_left: wgpu::Origin3d,
+         dimensions: wgpu::Extent3d,
+         target: &wgpu::TextureView,
+         encoder: &mut wgpu::CommandEncoder,
+     ) {
+-        let resolved = self.resolve_depth(device, source, top_left, dimensions, encoder);
++        let resolved = self.resolve_depth(device, queue, source, top_left, dimensions, encoder);
+         let resolved_view = resolved.create_view(&Default::default());
+ 
+         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+@@ -616,6 +753,7 @@ impl DepthBlitter {
+ 
+         self.blit_resolved_to_target(
+             device,
++            queue,
+             &resolved_view,
+             wgpu::Origin3d::ZERO,
+             dimensions,
+@@ -630,6 +768,10 @@ pub struct Converter {
+     group_layout: wgpu::BindGroupLayout,
+     color_pipeline: wgpu::ComputePipeline,
+     depth_pipeline: wgpu::ComputePipeline,
++    #[cfg(feature = "webgpu")]
++    color_push_uniform: crate::push::PushUniform,
++    #[cfg(feature = "webgpu")]
++    depth_push_uniform: crate::push::PushUniform,
+ }
+ 
+ impl Converter {
+@@ -660,6 +802,22 @@ impl Converter {
+             ],
+         });
+ 
++        #[cfg(feature = "webgpu")]
++        let color_push_uniform = crate::push::PushUniform::new(
++            device,
++            4,
++            "color convert push uniform",
++            wgpu::ShaderStages::COMPUTE,
++        );
++        #[cfg(feature = "webgpu")]
++        let depth_push_uniform = crate::push::PushUniform::new(
++            device,
++            4,
++            "depth convert push uniform",
++            wgpu::ShaderStages::COMPUTE,
++        );
++
++        #[cfg(not(feature = "webgpu"))]
+         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: None,
+             bind_group_layouts: &[&group_layout],
+@@ -668,14 +826,34 @@ impl Converter {
+                 range: 0..4,
+             }],
+         });
++        #[cfg(feature = "webgpu")]
++        let color_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[&group_layout, color_push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
++        #[cfg(feature = "webgpu")]
++        let depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[&group_layout, depth_push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let color_shader = include_wesl!("color_convert");
++        #[cfg(feature = "webgpu")]
++        let color_shader = include_str!(concat!(env!("OUT_DIR"), "/color_convert_webgpu.wgsl"));
++
+         let color_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("color convert"),
+             source: wgpu::ShaderSource::Wgsl(color_shader.into()),
+         });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let depth_shader = include_wesl!("depth_convert");
++        #[cfg(feature = "webgpu")]
++        let depth_shader = include_str!(concat!(env!("OUT_DIR"), "/depth_convert_webgpu.wgsl"));
++
+         let depth_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("depth convert"),
+             source: wgpu::ShaderSource::Wgsl(depth_shader.into()),
+@@ -683,7 +861,10 @@ impl Converter {
+ 
+         let color_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+             label: Some("color convert pipeline"),
++            #[cfg(not(feature = "webgpu"))]
+             layout: Some(&layout),
++            #[cfg(feature = "webgpu")]
++            layout: Some(&color_layout),
+             module: &color_module,
+             entry_point: None,
+             compilation_options: wgpu::PipelineCompilationOptions {
+@@ -695,7 +876,10 @@ impl Converter {
+ 
+         let depth_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+             label: Some("depth convert pipeline"),
++            #[cfg(not(feature = "webgpu"))]
+             layout: Some(&layout),
++            #[cfg(feature = "webgpu")]
++            layout: Some(&depth_layout),
+             module: &depth_module,
+             entry_point: None,
+             compilation_options: wgpu::PipelineCompilationOptions {
+@@ -709,12 +893,18 @@ impl Converter {
+             group_layout,
+             color_pipeline,
+             depth_pipeline,
++            #[cfg(feature = "webgpu")]
++            color_push_uniform,
++            #[cfg(feature = "webgpu")]
++            depth_push_uniform,
+         }
+     }
+ 
+     pub fn convert_color(
+         &self,
+         device: &wgpu::Device,
++        #[cfg(feature = "webgpu")] queue: &wgpu::Queue,
++        #[cfg(not(feature = "webgpu"))] _queue: &wgpu::Queue,
+         format: ColorCopyFormat,
+         color: &wgpu::TextureView,
+         output: &wgpu::TextureView,
+@@ -742,7 +932,16 @@ impl Converter {
+ 
+         let size = color.texture().size();
+         pass.set_pipeline(&self.color_pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(0, (format as u32).as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.color_push_uniform.update(queue, (format as u32).as_bytes());
++            self.color_push_uniform.set_bind_group_compute(&mut pass, 1);
++        }
++
+         pass.set_bind_group(0, &group, &[]);
+         pass.dispatch_workgroups(size.width.div_ceil(8), size.height.div_ceil(8), 1);
+ 
+@@ -752,6 +951,8 @@ impl Converter {
+     pub fn convert_depth(
+         &self,
+         device: &wgpu::Device,
++        #[cfg(feature = "webgpu")] queue: &wgpu::Queue,
++        #[cfg(not(feature = "webgpu"))] _queue: &wgpu::Queue,
+         format: DepthCopyFormat,
+         depth: &wgpu::TextureView,
+         output: &wgpu::TextureView,
+@@ -779,10 +980,20 @@ impl Converter {
+ 
+         let size = depth.texture().size();
+         pass.set_pipeline(&self.depth_pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(0, (format as u32).as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.depth_push_uniform.update(queue, (format as u32).as_bytes());
++            self.depth_push_uniform.set_bind_group_compute(&mut pass, 1);
++        }
++
+         pass.set_bind_group(0, &group, &[]);
+         pass.dispatch_workgroups(size.width.div_ceil(8), size.height.div_ceil(8), 1);
+ 
+         std::mem::drop(pass);
+     }
+ }
++
+diff --git a/crates/renderer/src/clear.rs b/crates/renderer/src/clear.rs
+index 52832ca..155246a 100644
+--- a/crates/renderer/src/clear.rs
++++ b/crates/renderer/src/clear.rs
+@@ -13,20 +13,43 @@ pub struct Cleaner {
+     pipeline_color: wgpu::RenderPipeline,
+     pipeline_depth: wgpu::RenderPipeline,
+     pipeline_both: wgpu::RenderPipeline,
++    #[cfg(feature = "webgpu")]
++    push_uniform: crate::push::PushUniform,
+ }
+ 
+ impl Cleaner {
+     pub fn new(device: &wgpu::Device) -> Self {
++        #[cfg(not(feature = "webgpu"))]
++        let push_constant_ranges = &[wgpu::PushConstantRange {
++            stages: wgpu::ShaderStages::FRAGMENT,
++            range: 0..20,
++        }];
++        #[cfg(feature = "webgpu")]
++        let push_uniform = crate::push::PushUniform::new(
++            device,
++            20,
++            "clear push uniform",
++            wgpu::ShaderStages::FRAGMENT,
++        );
++
++        #[cfg(feature = "webgpu")]
++        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[push_uniform.layout()],
++            push_constant_ranges: &[],
++        });
++        #[cfg(not(feature = "webgpu"))]
+         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: None,
+             bind_group_layouts: &[],
+-            push_constant_ranges: &[wgpu::PushConstantRange {
+-                stages: wgpu::ShaderStages::FRAGMENT,
+-                range: 0..20,
+-            }],
++            push_constant_ranges,
+         });
+ 
++        #[cfg(not(feature = "webgpu"))]
+         let shader = include_wesl!("clear");
++        #[cfg(feature = "webgpu")]
++        let shader = include_str!(concat!(env!("OUT_DIR"), "/clear_webgpu.wgsl"));
++
+         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: None,
+             source: wgpu::ShaderSource::Wgsl(shader.into()),
+@@ -92,6 +115,8 @@ impl Cleaner {
+             pipeline_color,
+             pipeline_depth,
+             pipeline_both,
++            #[cfg(feature = "webgpu")]
++            push_uniform,
+         }
+     }
+ 
+@@ -100,7 +125,10 @@ impl Cleaner {
+         color: Option<Rgba>,
+         depth: Option<f32>,
+         pass: &mut wgpu::RenderPass<'_>,
++        queue: &wgpu::Queue,
+     ) {
++        #[cfg(not(feature = "webgpu"))]
++        let _ = queue;
+         let pipeline = match (color, depth) {
+             (Some(_), Some(_)) => &self.pipeline_both,
+             (Some(_), None) => &self.pipeline_color,
+@@ -114,7 +142,17 @@ impl Cleaner {
+         };
+ 
+         pass.set_pipeline(pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, state.as_bytes());
++
++        #[cfg(feature = "webgpu")]
++        {
++            self.push_uniform.update(queue, state.as_bytes());
++            self.push_uniform.set_bind_group(pass, 0);
++        }
++
+         pass.draw(0..4, 0..1);
+     }
+ }
++
+diff --git a/crates/renderer/src/lib.rs b/crates/renderer/src/lib.rs
+index 274cb9c..4d9997a 100644
+--- a/crates/renderer/src/lib.rs
++++ b/crates/renderer/src/lib.rs
+@@ -3,6 +3,7 @@
+ mod alloc;
+ mod blit;
+ mod clear;
++mod push;
+ mod render;
+ 
+ use std::sync::Arc;
+@@ -28,8 +29,15 @@ pub struct Stats {
+ 
+ struct Inner {
+     device: wgpu::Device,
++    queue: wgpu::Queue,
+     shared: Arc<render::Shared>,
+     blitter: XfbBlitter,
++    // On wasm32, the renderer runs on the main thread. The background renderer
++    // thread is unavailable without SharedArrayBuffer + COOP/COEP headers.
++    #[cfg(target_arch = "wasm32")]
++    sync_renderer: std::sync::Mutex<RendererInner>,
++    #[cfg(target_arch = "wasm32")]
++    sync_receiver: flume::Receiver<Action>,
+ }
+ 
+ /// A WGPU based renderer implementation.
+@@ -44,11 +52,14 @@ pub struct Renderer {
+ impl Renderer {
+     pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+         let blitter = XfbBlitter::new(&device, format);
+-        let (renderer, shared) = RendererInner::new(device.clone(), queue);
++        let (renderer, shared) = RendererInner::new(device.clone(), queue.clone());
+ 
+         const CAPACITY: usize = 1024 * 1024 / size_of::<Action>();
+         let (sender, receiver) = flume::bounded(CAPACITY);
+ 
++        // On wasm32 there is no thread support without SharedArrayBuffer + COOP/COEP
++        // headers. Instead, actions are processed synchronously in `render` below.
++        #[cfg(not(target_arch = "wasm32"))]
+         std::thread::Builder::new()
+             .name("lazuli wgpu renderer".into())
+             .spawn(move || worker(renderer, receiver))
+@@ -57,20 +68,36 @@ impl Renderer {
+         Self {
+             inner: Arc::new(Inner {
+                 device,
++                queue,
+                 shared,
+                 blitter,
++                #[cfg(target_arch = "wasm32")]
++                sync_renderer: std::sync::Mutex::new(renderer),
++                #[cfg(target_arch = "wasm32")]
++                sync_receiver: receiver,
+             }),
+             sender,
+         }
+     }
+ 
+     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
++        // On wasm32, drain and process all pending actions synchronously before
++        // blitting, since there is no background renderer thread.
++        #[cfg(target_arch = "wasm32")]
++        {
++            let mut r = self.inner.sync_renderer.lock().unwrap();
++            while let Ok(action) = self.inner.sync_receiver.try_recv() {
++                r.exec(action);
++            }
++        }
++
+         let output = self.inner.shared.output.lock().unwrap();
+         let size = output.texture().size();
+ 
+         // TODO: change this
+         self.inner.blitter.blit_to_target(
+             &self.inner.device,
++            &self.inner.queue,
+             &output,
+             wgpu::Origin3d::ZERO,
+             size,
+@@ -97,3 +124,4 @@ impl RenderModule for Renderer {
+         self.sender.send(action).expect("rendering thread is alive");
+     }
+ }
++
+diff --git a/crates/renderer/src/push.rs b/crates/renderer/src/push.rs
+new file mode 100644
+index 0000000..fb6a2c4
+--- /dev/null
++++ b/crates/renderer/src/push.rs
+@@ -0,0 +1,110 @@
++//! Push-constant replacement using uniform buffers for WebGPU targets.
++//!
++//! WebGPU does not support push constants (`var<push_constant>` in WGSL is a
++//! Vulkan extension unavailable in browsers). When the `webgpu` crate feature
++//! is enabled every pipeline that would normally use push constants uses a
++//! small `UNIFORM | COPY_DST` buffer with a dedicated bind group instead.
++
++/// A small per-pipeline uniform buffer that replaces push constants.
++///
++/// Call [`PushUniform::new`] once during pipeline construction to allocate the
++/// buffer and bind-group. Before each draw call `update` to upload the data,
++/// then bind the group with `set_bind_group`.
++pub struct PushUniform {
++    layout: wgpu::BindGroupLayout,
++    buffer: wgpu::Buffer,
++    bind_group: wgpu::BindGroup,
++}
++
++impl PushUniform {
++    /// Create a uniform buffer of `size` bytes and a bind group for it.
++    ///
++    /// `size` is rounded up to a multiple of 16 as required by the WebGPU
++    /// spec for uniform buffers.
++    pub fn new(device: &wgpu::Device, size: u64, label: &str, visibility: wgpu::ShaderStages) -> Self {
++        let aligned = (size.max(16) + 15) & !15;
++
++        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some(label),
++            entries: &[wgpu::BindGroupLayoutEntry {
++                binding: 0,
++                visibility,
++                ty: wgpu::BindingType::Buffer {
++                    ty: wgpu::BufferBindingType::Uniform,
++                    has_dynamic_offset: false,
++                    min_binding_size: None,
++                },
++                count: None,
++            }],
++        });
++
++        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
++            label: Some(label),
++            size: aligned,
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++            mapped_at_creation: false,
++        });
++
++        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some(label),
++            layout: &layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 0,
++                resource: buffer.as_entire_binding(),
++            }],
++        });
++
++        Self { layout, buffer, bind_group }
++    }
++
++    /// Create a uniform buffer using a pre-existing `BindGroupLayout`.
++    ///
++    /// Use this when the layout is already owned by a pipeline to avoid
++    /// creating a redundant layout object.
++    pub fn with_layout(
++        device: &wgpu::Device,
++        layout: wgpu::BindGroupLayout,
++        size: u64,
++        label: &str,
++    ) -> Self {
++        let aligned = (size.max(16) + 15) & !15;
++
++        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
++            label: Some(label),
++            size: aligned,
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++            mapped_at_creation: false,
++        });
++
++        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some(label),
++            layout: &layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 0,
++                resource: buffer.as_entire_binding(),
++            }],
++        });
++
++        Self { layout, buffer, bind_group }
++    }
++
++    /// Write `data` into the uniform buffer via the queue.
++    pub fn update(&self, queue: &wgpu::Queue, data: &[u8]) {
++        queue.write_buffer(&self.buffer, 0, data);
++    }
++
++    /// Return the bind group layout for use in pipeline layout construction.
++    pub fn layout(&self) -> &wgpu::BindGroupLayout {
++        &self.layout
++    }
++
++    /// Bind this uniform buffer at the given group index.
++    pub fn set_bind_group(&self, pass: &mut wgpu::RenderPass<'_>, index: u32) {
++        pass.set_bind_group(index, &self.bind_group, &[]);
++    }
++
++    /// Bind this uniform buffer at the given group index for a compute pass.
++    pub fn set_bind_group_compute(&self, pass: &mut wgpu::ComputePass<'_>, index: u32) {
++        pass.set_bind_group(index, &self.bind_group, &[]);
++    }
++}
+diff --git a/crates/renderer/src/render.rs b/crates/renderer/src/render.rs
+index bef7ecd..e967c74 100644
+--- a/crates/renderer/src/render.rs
++++ b/crates/renderer/src/render.rs
+@@ -75,6 +75,10 @@ pub struct Renderer {
+     color_blitter: ColorBlitter,
+     depth_blitter: DepthBlitter,
+     data_read_buffer: wgpu::Buffer,
++    // On WebGPU, pipeline immediates (UVs + LOD bias) are uploaded via a
++    // uniform buffer instead of push constants.
++    #[cfg(feature = "webgpu")]
++    pipeline_immediates_uniform: crate::push::PushUniform,
+ 
+     // caches
+     pipeline_cache: pipeline::Cache,
+@@ -110,6 +114,17 @@ impl Renderer {
+         let pipeline_cache = pipeline::Cache::new(&device);
+         let texture_cache = texture::Cache::default();
+ 
++        // On WebGPU, create the uniform buffer for pipeline immediates using
++        // the layout already embedded in the pipeline cache, so the bind group
++        // is guaranteed to be compatible with all render pipelines.
++        #[cfg(feature = "webgpu")]
++        let pipeline_immediates_uniform = crate::push::PushUniform::with_layout(
++            &device,
++            pipeline_cache.push_uniform_layout().clone(),
++            96,
++            "pipeline immediates",
++        );
++
+         let color = embedded_fb.color();
+         let multisampled_color = embedded_fb.multisampled_color();
+         let depth = embedded_fb.depth();
+@@ -177,6 +192,8 @@ impl Renderer {
+             color_blitter,
+             depth_blitter,
+             data_read_buffer,
++            #[cfg(feature = "webgpu")]
++            pipeline_immediates_uniform,
+ 
+             pipeline_cache,
+             texture_cache,
+@@ -654,16 +671,31 @@ impl Renderer {
+         let pipeline = self.pipeline_cache.get(&self.device, &self.pipeline_config);
+ 
+         self.current_pass.set_pipeline(pipeline);
++
++        #[cfg(not(feature = "webgpu"))]
+         self.current_pass.set_push_constants(
+             wgpu::ShaderStages::FRAGMENT,
+             0,
+             scaling_array.as_bytes(),
+         );
++        #[cfg(not(feature = "webgpu"))]
+         self.current_pass.set_push_constants(
+             wgpu::ShaderStages::FRAGMENT,
+             64,
+             lodbias_array.as_bytes(),
+         );
++
++        #[cfg(feature = "webgpu")]
++        {
++            // Pack scaling (64 bytes) and lodbias (32 bytes) into a single 96-byte upload.
++            let mut data = [0u8; 96];
++            data[..64].copy_from_slice(scaling_array.as_bytes());
++            data[64..96].copy_from_slice(lodbias_array.as_bytes());
++            self.pipeline_immediates_uniform.update(&self.queue, &data);
++            self.pipeline_immediates_uniform
++                .set_bind_group(&mut self.current_pass, 2);
++        }
++
+         self.current_pass.set_bind_group(0, Some(&data_group), &[]);
+         self.current_pass
+             .set_bind_group(1, Some(&textures_group), &[]);
+diff --git a/crates/renderer/src/render/framebuffer.rs b/crates/renderer/src/render/framebuffer.rs
+index e55308f..64d4d97 100644
+--- a/crates/renderer/src/render/framebuffer.rs
++++ b/crates/renderer/src/render/framebuffer.rs
+@@ -100,13 +100,18 @@ pub struct External {
+ 
+ impl External {
+     fn create_framebuffer(device: &wgpu::Device, size: wgpu::Extent3d) -> wgpu::TextureView {
++        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
++        #[cfg(feature = "webgpu")]
++        {
++            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
++        }
+         device
+             .create_texture(&wgpu::TextureDescriptor {
+                 label: Some("external framebuffer"),
+                 dimension: wgpu::TextureDimension::D2,
+                 size,
+                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
+-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++                usage,
+                 view_formats: &[],
+                 mip_level_count: 1,
+                 sample_count: 1,
+@@ -178,6 +183,8 @@ impl External {
+     /// have been previously added with `insert_copy` and are consumed by this method.
+     pub fn build(&mut self, encoder: &mut wgpu::CommandEncoder, parts: Vec<XfbPart>) {
+         let framebuffer = self.framebuffer.texture();
++
++        #[cfg(not(feature = "webgpu"))]
+         encoder.clear_texture(
+             framebuffer,
+             &wgpu::ImageSubresourceRange {
+@@ -189,6 +196,29 @@ impl External {
+             },
+         );
+ 
++        // clear_texture requires the CLEAR_TEXTURE feature which is native-only.
++        // Use a render pass with LoadOp::Clear instead.
++        #[cfg(feature = "webgpu")]
++        {
++            let view = framebuffer.create_view(&Default::default());
++            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("xfb clear"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &view,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                depth_stencil_attachment: None,
++                timestamp_writes: None,
++                occlusion_query_set: None,
++            });
++            drop(pass);
++        }
++
+         for part in parts {
+             let saved = self.copies.get(&part.id).unwrap();
+             let saved_size = saved.texture().size();
+@@ -298,6 +328,7 @@ impl Renderer {
+         let color = self.embedded_fb.color();
+         self.color_blitter.blit_to_texture(
+             &self.device,
++            &self.queue,
+             color,
+             wgpu::Origin3d {
+                 x: x as u32,
+@@ -349,6 +380,7 @@ impl Renderer {
+         let depth = self.embedded_fb.depth();
+         self.depth_blitter.blit_to_texture(
+             &self.device,
++            &self.queue,
+             depth,
+             wgpu::Origin3d {
+                 x: x as u32,
+@@ -386,7 +418,7 @@ impl Renderer {
+ 
+         let view = output.create_view(&Default::default());
+         self.converter
+-            .convert_color(&self.device, format, color, &view, encoder);
++            .convert_color(&self.device, &self.queue, format, color, &view, encoder);
+ 
+         view
+     }
+@@ -410,7 +442,7 @@ impl Renderer {
+ 
+         let view = output.create_view(&Default::default());
+         self.converter
+-            .convert_depth(&self.device, format, depth, &view, encoder);
++            .convert_depth(&self.device, &self.queue, format, depth, &view, encoder);
+ 
+         view
+     }
+@@ -491,7 +523,7 @@ impl Renderer {
+         self.current_pass
+             .set_viewport(0.0, 0.0, 640.0, 528.0, 0.0, 1.0);
+         self.cleaner
+-            .clear_target(color, depth, &mut self.current_pass);
++            .clear_target(color, depth, &mut self.current_pass, &self.queue);
+     }
+ 
+     pub fn copy_color(
+diff --git a/crates/renderer/src/render/pipeline.rs b/crates/renderer/src/render/pipeline.rs
+index a49ae65..071f8d0 100644
+--- a/crates/renderer/src/render/pipeline.rs
++++ b/crates/renderer/src/render/pipeline.rs
+@@ -29,6 +29,8 @@ mod cache {
+         layout: wgpu::PipelineLayout,
+         cached_pipelines: FxHashMap<Config, wgpu::RenderPipeline>,
+         cached_shaders: FxHashMap<shader::Config, wgpu::ShaderModule>,
++        #[cfg(feature = "webgpu")]
++        push_uniform_layout: wgpu::BindGroupLayout,
+     }
+ 
+     fn split_factor(factor: wgpu::BlendFactor) -> (wgpu::BlendFactor, wgpu::BlendFactor) {
+@@ -243,6 +245,7 @@ mod cache {
+                 entries: &entries,
+             });
+ 
++            #[cfg(not(feature = "webgpu"))]
+             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                 label: None,
+                 bind_group_layouts: &[&group0_layout, &group1_layout],
+@@ -252,12 +255,38 @@ mod cache {
+                 }],
+             });
+ 
++            // On WebGPU, the pipeline immediates (96 bytes) live in group 2
++            // as a uniform buffer since push constants are unsupported.
++            #[cfg(feature = "webgpu")]
++            let push_uniform_layout =
++                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                    label: Some("pipeline immediates uniform layout"),
++                    entries: &[wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::FRAGMENT,
++                        ty: wgpu::BindingType::Buffer {
++                            ty: wgpu::BufferBindingType::Uniform,
++                            has_dynamic_offset: false,
++                            min_binding_size: None,
++                        },
++                        count: None,
++                    }],
++                });
++            #[cfg(feature = "webgpu")]
++            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                label: None,
++                bind_group_layouts: &[&group0_layout, &group1_layout, &push_uniform_layout],
++                push_constant_ranges: &[],
++            });
++
+             Self {
+                 group0_layout,
+                 group1_layout,
+                 layout,
+                 cached_pipelines: Default::default(),
+                 cached_shaders: Default::default(),
++                #[cfg(feature = "webgpu")]
++                push_uniform_layout,
+             }
+         }
+ 
+@@ -269,6 +298,11 @@ mod cache {
+             &self.group1_layout
+         }
+ 
++        #[cfg(feature = "webgpu")]
++        pub fn push_uniform_layout(&self) -> &wgpu::BindGroupLayout {
++            &self.push_uniform_layout
++        }
++
+         pub fn get(&mut self, device: &wgpu::Device, config: &Config) -> &wgpu::RenderPipeline {
+             let len = self.cached_pipelines.len() as u32;
+             match self.cached_pipelines.entry(config.clone()) {
+diff --git a/crates/renderer/src/render/pipeline/shader.rs b/crates/renderer/src/render/pipeline/shader.rs
+index c780ffc..3c37910 100644
+--- a/crates/renderer/src/render/pipeline/shader.rs
++++ b/crates/renderer/src/render/pipeline/shader.rs
+@@ -353,10 +353,18 @@ pub fn compile(config: &Config) -> String {
+         Cow::Borrowed(include_str!("../../../shaders/common.wesl")),
+     );
+ 
+-    resolver.add_module(
+-        "package::render".parse().unwrap(),
+-        Cow::Borrowed(include_str!("../../../shaders/render.wesl")),
+-    );
++    let render_src = include_str!("../../../shaders/render.wesl");
++    // On WebGPU, replace the push_constant declaration with a uniform buffer
++    // binding at group 2, since push constants are unsupported in browsers.
++    #[cfg(feature = "webgpu")]
++    let render_src = Cow::Owned(render_src.replace(
++        "var<push_constant> pipeline_immediates: PipelineImmediates;",
++        "@group(2) @binding(0) var<uniform> pipeline_immediates: PipelineImmediates;",
++    ));
++    #[cfg(not(feature = "webgpu"))]
++    let render_src = Cow::Borrowed(render_src);
++
++    resolver.add_module("package::render".parse().unwrap(), render_src);
+     resolver.add_module(
+         "package::render::lighting".parse().unwrap(),
+         Cow::Borrowed(include_str!("../../../shaders/render/lighting.wesl")),
+-- 
+2.53.0
+
