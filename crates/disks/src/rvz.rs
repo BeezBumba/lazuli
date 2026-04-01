@@ -349,14 +349,16 @@ fn unpack(data: &[u8], offset: u32) -> Vec<u8> {
 
 enum Decompressor {
     None,
+    #[cfg(not(target_arch = "wasm32"))]
     Zstd(zstd::bulk::Decompressor<'static>),
 }
 
 impl Decompressor {
-    fn decompress(&mut self, data: &[u8], length: usize) -> Vec<u8> {
+    fn decompress(&mut self, data: &[u8], _length: usize) -> Vec<u8> {
         match self {
             Self::None => data.to_vec(),
-            Self::Zstd(decompressor) => decompressor.decompress(data, length).unwrap(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Zstd(decompressor) => decompressor.decompress(data, _length).unwrap(),
         }
     }
 }
@@ -462,6 +464,7 @@ where
 
         let mut decompressor = match disk.compression {
             Compression::None => Decompressor::None,
+            #[cfg(not(target_arch = "wasm32"))]
             Compression::Zstd => Decompressor::Zstd(zstd::bulk::Decompressor::new().unwrap()),
             _ => return Err(RvzError::UnsupportedCompression(disk.compression)),
         };

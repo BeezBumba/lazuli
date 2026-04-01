@@ -2661,7 +2661,6 @@ dependencies = [
  "indicatif",
  "oneshot",
  "ordered-float",
- "ppcjit",
  "ring-arena",
  "seq-macro",
  "static_assertions",
