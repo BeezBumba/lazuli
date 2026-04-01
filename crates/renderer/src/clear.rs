@@ -1,4 +1,5 @@
 use lazuli::system::gx::color::Rgba;
+#[cfg(not(feature = "webgpu"))]
 use wesl::include_wesl;
 use zerocopy::{Immutable, IntoBytes};
 

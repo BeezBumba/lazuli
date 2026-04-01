@@ -119,6 +119,12 @@ impl Renderer {
     }
 }
 
+// SAFETY: When the `webgpu` feature is enabled the target is wasm32, which is
+// single-threaded. `wgpu::Buffer` uses `RefCell` internally in the webgpu
+// backend, making it non-`Sync`, but no data races can occur without threads.
+#[cfg(feature = "webgpu")]
+unsafe impl Send for Renderer {}
+
 impl RenderModule for Renderer {
     fn exec(&mut self, action: Action) {
         self.sender.send(action).expect("rendering thread is alive");
