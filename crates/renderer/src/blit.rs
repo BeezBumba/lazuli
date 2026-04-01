@@ -1,5 +1,6 @@
 use glam::Vec4;
 use lazuli::system::gx::pix::{ColorCopyFormat, DepthCopyFormat};
+#[cfg(not(feature = "webgpu"))]
 use wesl::include_wesl;
 use zerocopy::IntoBytes;
 
