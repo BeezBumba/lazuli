@@ -124,7 +124,7 @@ impl App {
 
         let cores = Cores {
             dsp: Box::new(cores::dsp::interpreter::Core::default()),
-         /*   cpu: Box::new(cores::cpu::jit::Core::new(cores::cpu::jit::Config {
+            cpu: Box::new(cores::cpu::jit::Core::new(cores::cpu::jit::Config {
                 instr_per_block: cfg.ppcjit.instr_per_block,
                 jit_settings: cores::cpu::jit::ppcjit::Settings {
                     codegen: cores::cpu::jit::ppcjit::CodegenSettings {
@@ -135,8 +135,8 @@ impl App {
                     },
                     cache_path: Some(jit_cache_path),
                 },
-            })), */
-            cpu: Box::new(ppcint::Core::new()),
+            })), 
+           // cpu: Box::new(ppcint::Core::new()),
         };
 
         let input = GilrsModule::new();
