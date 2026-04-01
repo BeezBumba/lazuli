@@ -29,6 +29,8 @@ mod cache {
         layout: wgpu::PipelineLayout,
         cached_pipelines: FxHashMap<Config, wgpu::RenderPipeline>,
         cached_shaders: FxHashMap<shader::Config, wgpu::ShaderModule>,
+        #[cfg(feature = "webgpu")]
+        push_uniform_layout: wgpu::BindGroupLayout,
     }
 
     fn split_factor(factor: wgpu::BlendFactor) -> (wgpu::BlendFactor, wgpu::BlendFactor) {
@@ -243,6 +245,7 @@ mod cache {
                 entries: &entries,
             });
 
+            #[cfg(not(feature = "webgpu"))]
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
                 bind_group_layouts: &[&group0_layout, &group1_layout],
@@ -252,12 +255,38 @@ mod cache {
                 }],
             });
 
+            // On WebGPU, the pipeline immediates (96 bytes) live in group 2
+            // as a uniform buffer since push constants are unsupported.
+            #[cfg(feature = "webgpu")]
+            let push_uniform_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pipeline immediates uniform layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+            #[cfg(feature = "webgpu")]
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&group0_layout, &group1_layout, &push_uniform_layout],
+                push_constant_ranges: &[],
+            });
+
             Self {
                 group0_layout,
                 group1_layout,
                 layout,
                 cached_pipelines: Default::default(),
                 cached_shaders: Default::default(),
+                #[cfg(feature = "webgpu")]
+                push_uniform_layout,
             }
         }
 
@@ -267,6 +296,11 @@ mod cache {
 
         pub fn textures_group_layout(&self) -> &wgpu::BindGroupLayout {
             &self.group1_layout
+        }
+
+        #[cfg(feature = "webgpu")]
+        pub fn push_uniform_layout(&self) -> &wgpu::BindGroupLayout {
+            &self.push_uniform_layout
         }
 
         pub fn get(&mut self, device: &wgpu::Device, config: &Config) -> &wgpu::RenderPipeline {

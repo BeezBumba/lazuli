@@ -353,10 +353,18 @@ pub fn compile(config: &Config) -> String {
         Cow::Borrowed(include_str!("../../../shaders/common.wesl")),
     );
 
-    resolver.add_module(
-        "package::render".parse().unwrap(),
-        Cow::Borrowed(include_str!("../../../shaders/render.wesl")),
-    );
+    let render_src = include_str!("../../../shaders/render.wesl");
+    // On WebGPU, replace the push_constant declaration with a uniform buffer
+    // binding at group 2, since push constants are unsupported in browsers.
+    #[cfg(feature = "webgpu")]
+    let render_src = Cow::Owned(render_src.replace(
+        "var<push_constant> pipeline_immediates: PipelineImmediates;",
+        "@group(2) @binding(0) var<uniform> pipeline_immediates: PipelineImmediates;",
+    ));
+    #[cfg(not(feature = "webgpu"))]
+    let render_src = Cow::Borrowed(render_src);
+
+    resolver.add_module("package::render".parse().unwrap(), render_src);
     resolver.add_module(
         "package::render::lighting".parse().unwrap(),
         Cow::Borrowed(include_str!("../../../shaders/render/lighting.wesl")),

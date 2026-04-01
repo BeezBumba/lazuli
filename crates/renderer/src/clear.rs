@@ -13,20 +13,43 @@ pub struct Cleaner {
     pipeline_color: wgpu::RenderPipeline,
     pipeline_depth: wgpu::RenderPipeline,
     pipeline_both: wgpu::RenderPipeline,
+    #[cfg(feature = "webgpu")]
+    push_uniform: crate::push::PushUniform,
 }
 
 impl Cleaner {
     pub fn new(device: &wgpu::Device) -> Self {
+        #[cfg(not(feature = "webgpu"))]
+        let push_constant_ranges = &[wgpu::PushConstantRange {
+            stages: wgpu::ShaderStages::FRAGMENT,
+            range: 0..20,
+        }];
+        #[cfg(feature = "webgpu")]
+        let push_uniform = crate::push::PushUniform::new(
+            device,
+            20,
+            "clear push uniform",
+            wgpu::ShaderStages::FRAGMENT,
+        );
+
+        #[cfg(feature = "webgpu")]
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[push_uniform.layout()],
+            push_constant_ranges: &[],
+        });
+        #[cfg(not(feature = "webgpu"))]
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[],
-            push_constant_ranges: &[wgpu::PushConstantRange {
-                stages: wgpu::ShaderStages::FRAGMENT,
-                range: 0..20,
-            }],
+            push_constant_ranges,
         });
 
+        #[cfg(not(feature = "webgpu"))]
         let shader = include_wesl!("clear");
+        #[cfg(feature = "webgpu")]
+        let shader = include_str!(concat!(env!("OUT_DIR"), "/clear_webgpu.wgsl"));
+
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(shader.into()),
@@ -92,6 +115,8 @@ impl Cleaner {
             pipeline_color,
             pipeline_depth,
             pipeline_both,
+            #[cfg(feature = "webgpu")]
+            push_uniform,
         }
     }
 
@@ -100,7 +125,10 @@ impl Cleaner {
         color: Option<Rgba>,
         depth: Option<f32>,
         pass: &mut wgpu::RenderPass<'_>,
+        queue: &wgpu::Queue,
     ) {
+        #[cfg(not(feature = "webgpu"))]
+        let _ = queue;
         let pipeline = match (color, depth) {
             (Some(_), Some(_)) => &self.pipeline_both,
             (Some(_), None) => &self.pipeline_color,
@@ -114,7 +142,17 @@ impl Cleaner {
         };
 
         pass.set_pipeline(pipeline);
+
+        #[cfg(not(feature = "webgpu"))]
         pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, state.as_bytes());
+
+        #[cfg(feature = "webgpu")]
+        {
+            self.push_uniform.update(queue, state.as_bytes());
+            self.push_uniform.set_bind_group(pass, 0);
+        }
+
         pass.draw(0..4, 0..1);
     }
 }
+
