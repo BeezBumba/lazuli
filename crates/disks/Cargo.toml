@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 easyerr.workspace = true
 binrw.workspace = true
-zstd.workspace = true
 
 elf = "0.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd.workspace = true
