@@ -2,6 +2,7 @@
 //! `lib.rs` that test `builder::ppc_mask`.
 
 /// Generate a PowerPC rotate/mask bitmask (MB, ME in PPC big-endian bit numbering).
+#[cfg(test)]
 pub(crate) fn ppc_mask(mb: u32, me: u32) -> u32 {
     ppcir::decode::ppc_mask(mb, me)
 }
