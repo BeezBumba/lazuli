@@ -441,17 +441,25 @@ function getRamView(emu) {
  * The closures operate directly on the zero-copy `ramView`, so reads and
  * writes are immediately visible in the Rust emulator without any syncing.
  *
- * Addresses are masked with PHYS_MASK before indexing into `ram`.  This
- * mirrors the `phys_addr` helper in the Rust emulator: GameCube virtual
- * addresses like 0x80xxxxxx and hardware-register addresses like 0xCCxxxxxx
- * both strip their high bits, leaving a 25-bit physical offset that fits
- * within the 24 MiB guest RAM.  Without this mask every 0x80xxxxxx read
- * returns 0 and every write is silently dropped because the index exceeds
- * the ram buffer length.
+ * ## Address routing — hardware registers vs. guest RAM
+ *
+ * GameCube hardware-register addresses have the prefix `0xCC` (e.g. the DVD
+ * Interface lives at `0xCC003000`).  These addresses must be intercepted
+ * **before** `PHYS_MASK` is applied, because `0xCC003000 & 0x01FFFFFF` equals
+ * `0x00003000` — an address inside guest RAM — causing silent corruption.
+ *
+ * For 32-bit reads/writes the Rust `hw_read_u32` / `hw_write_u32` exports are
+ * called instead; they dispatch to the appropriate hardware module (currently
+ * the DVD Interface).  Sub-32-bit accesses to hardware space return 0 / are
+ * ignored since all GameCube MMIO registers are 32-bit wide.
+ *
+ * For all non-hardware addresses `PHYS_MASK` is applied as before, converting
+ * `0x80xxxxxx` guest virtual addresses to 25-bit physical RAM offsets.
  *
  * @param {Uint8Array} ram  Zero-copy view of guest RAM
  * @param {string[]}   log  Array to append exception/error messages to
- * @param {object|null} emu  WasmEmulator instance (used to record exceptions)
+ * @param {object|null} emu  WasmEmulator instance (used for HW register I/O
+ *                           and to record exceptions)
  * @param {string}     [pcContext]  Human-readable PC string for console messages
  */
 
@@ -469,41 +477,69 @@ const RAISE_EXCEPTION_LOG_LIMIT = 30;
 function buildHooks(ram, log, emu, pcContext = "?") {
   return {
     read_u8(addr) {
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
+      // Hardware-register space (0xCCxxxxxx): all GC MMIO is 32-bit wide;
+      // sub-word reads to HW space are not meaningful, return 0.
+      if ((addr >>> 24) === 0xCC) return 0;
+      addr &= PHYS_MASK;
       return addr < ram.length ? ram[addr] : 0;
     },
     read_u16(addr) {
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
+      if ((addr >>> 24) === 0xCC) return 0;
+      addr &= PHYS_MASK;
       if (addr + 1 >= ram.length) return 0;
       return (ram[addr] << 8) | ram[addr + 1];
     },
     read_u32(addr) {
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
+      // Route hardware-register reads to hw_read_u32 before masking so that
+      // 0xCC003000 (DVD Interface) reaches the correct handler instead of
+      // aliasing to RAM offset 0x00003000.
+      if ((addr >>> 24) === 0xCC) {
+        return emu ? (emu.hw_read_u32(addr) >>> 0) : 0;
+      }
+      addr &= PHYS_MASK;
       if (addr + 3 >= ram.length) return 0;
       return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
                (ram[addr + 2] << 8) | ram[addr + 3]) >>> 0);
     },
     read_f64(addr) {
       // Read a big-endian IEEE-754 double from guest address.
-      addr = (addr >>> 0) & PHYS_MASK;
+      // GC hardware registers do not hold IEEE doubles — return 0.0.
+      addr = addr >>> 0;
+      if ((addr >>> 24) === 0xCC) return 0.0;
+      addr &= PHYS_MASK;
       if (addr + 7 >= ram.length) return 0.0;
       const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
       return view.getFloat64(0, false /* big-endian */);
     },
     write_u8(addr, val) {
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
+      if ((addr >>> 24) === 0xCC) return; // HW registers are 32-bit only
+      addr &= PHYS_MASK;
       if (addr < ram.length) ram[addr] = val & 0xff;
     },
     write_u16(addr, val) {
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
+      if ((addr >>> 24) === 0xCC) return; // HW registers are 32-bit only
+      addr &= PHYS_MASK;
       if (addr + 1 < ram.length) {
         ram[addr]     = (val >> 8) & 0xff;
         ram[addr + 1] = val & 0xff;
       }
     },
     write_u32(addr, val) {
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
       val  = val  >>> 0;
+      // Route hardware-register writes to hw_write_u32 before masking.
+      // Writing 0xCC003000-0xCC003027 drives the DVD Interface; bit 0 of
+      // DICR (0x1C) triggers a DMA from the stored disc image into guest RAM.
+      if ((addr >>> 24) === 0xCC) {
+        if (emu) emu.hw_write_u32(addr, val);
+        return;
+      }
+      addr &= PHYS_MASK;
       if (addr + 3 < ram.length) {
         ram[addr]     = (val >>> 24) & 0xff;
         ram[addr + 1] = (val >>> 16) & 0xff;
@@ -513,7 +549,9 @@ function buildHooks(ram, log, emu, pcContext = "?") {
     },
     write_f64(addr, val) {
       // Write a big-endian IEEE-754 double to guest address.
-      addr = (addr >>> 0) & PHYS_MASK;
+      addr = addr >>> 0;
+      if ((addr >>> 24) === 0xCC) return; // HW registers are not doubles
+      addr &= PHYS_MASK;
       if (addr + 7 >= ram.length) return;
       const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
       view.setFloat64(0, val, false /* big-endian */);
@@ -1262,6 +1300,10 @@ async function main() {
         xfbAddr       = XFB_PHYS_DEFAULT;
 
         const meta = parseAndLoadIso(evt.target.result, emu);
+        // Store the raw ISO bytes in the Rust DiscImageDevice so the emulated
+        // DVD controller can service in-game sector reads (streams, audio,
+        // textures) without re-reading from the JS File object.
+        emu.load_disc_image(new Uint8Array(evt.target.result));
         gameTitle     = meta.gameName || meta.gameId || "Unknown Game";
         lastEntryPoint = meta.entry;
 

@@ -156,6 +156,106 @@ impl WasmBlockCache {
     }
 }
 
+// ─── DiscImageDevice / DVD Interface ─────────────────────────────────────────
+
+/// Physical base address of the GameCube DVD Interface (DI) registers.
+///
+/// See YAGCD §9.3 for the complete register map.
+const DI_BASE: u32 = 0xCC00_3000;
+/// Number of bytes covered by the DI register bank (10 × 4-byte registers).
+const DI_SIZE: u32 = 0x28;
+
+/// DVD Interface hardware register file.
+///
+/// Mirrors the ten memory-mapped I/O registers at `0xCC003000–0xCC003027`.
+/// This is the Rust-side counterpart of Play!'s `Js_DiscImageDeviceStream`:
+/// the emulated disc controller that reads sectors from the stored ISO image
+/// and DMAs them into guest RAM when the game issues a DVD Read command.
+///
+/// ## Register map
+///
+/// | Offset | Name       | Description                                   |
+/// |--------|------------|-----------------------------------------------|
+/// | 0x00   | DISTATUS   | Status & interrupt flags (TCINT at bit 1)     |
+/// | 0x04   | DICOVER    | Lid/cover state (bit 2 = closed = disc present) |
+/// | 0x08   | DICMDBUF0  | Command word (command byte in bits 31–24)     |
+/// | 0x0C   | DICMDBUF1  | Disc byte offset for Read command             |
+/// | 0x10   | DICMDBUF2  | Reserved / command parameter 2                |
+/// | 0x14   | DIMAR      | DMA destination address in main RAM           |
+/// | 0x18   | DILENGTH   | DMA transfer length in bytes                  |
+/// | 0x1C   | DICR       | Control — bit 0 = TSTART (begin transfer)     |
+/// | 0x20   | DIIMMBUF   | Immediate data buffer                         |
+/// | 0x24   | DICFG      | Configuration register                        |
+#[derive(Default)]
+struct DiState {
+    /// DISTATUS (0x00): status and interrupt flags.
+    status: u32,
+    /// DICOVER (0x04): lid/cover state.  Bit 2 = 1 → cover closed (disc present).
+    cover: u32,
+    /// DICMDBUF0 (0x08): command word; bits 31–24 hold the command code.
+    cmd_buf0: u32,
+    /// DICMDBUF1 (0x0C): disc byte offset used by the DVD Read command.
+    cmd_buf1: u32,
+    /// DICMDBUF2 (0x10): second command parameter (reserved for most commands).
+    cmd_buf2: u32,
+    /// DIMAR (0x14): physical RAM destination for DMA transfers.
+    dma_addr: u32,
+    /// DILENGTH (0x18): number of bytes to transfer.
+    dma_len: u32,
+    /// DICR (0x1C): control register.  Writing bit 0 (TSTART) begins the transfer.
+    control: u32,
+    /// DIIMMBUF (0x20): immediate data returned by non-DMA commands.
+    imm_buf: u32,
+    /// DICFG (0x24): drive configuration.
+    config: u32,
+}
+
+impl DiState {
+    /// Read a 32-bit value from the DI register at `offset` bytes from `DI_BASE`.
+    fn read_reg(&self, offset: u32) -> u32 {
+        match offset {
+            0x00 => self.status,
+            0x04 => self.cover,
+            0x08 => self.cmd_buf0,
+            0x0C => self.cmd_buf1,
+            0x10 => self.cmd_buf2,
+            0x14 => self.dma_addr,
+            0x18 => self.dma_len,
+            0x1C => self.control,
+            0x20 => self.imm_buf,
+            0x24 => self.config,
+            _ => 0,
+        }
+    }
+
+    /// Write `val` to the DI register at `offset` bytes from `DI_BASE`.
+    ///
+    /// Returns `true` if the write sets the TSTART bit in DICR, signalling
+    /// that a disc command should be processed immediately.
+    fn write_reg(&mut self, offset: u32, val: u32) -> bool {
+        match offset {
+            0x00 => self.status = val,
+            0x04 => self.cover = val,
+            0x08 => self.cmd_buf0 = val,
+            0x0C => self.cmd_buf1 = val,
+            0x10 => self.cmd_buf2 = val,
+            0x14 => self.dma_addr = val,
+            0x18 => self.dma_len = val,
+            0x1C => {
+                let tstart = (val & 0x1) != 0;
+                self.control = val;
+                if tstart {
+                    return true;
+                }
+            }
+            0x20 => self.imm_buf = val,
+            0x24 => self.config = val,
+            _ => {}
+        }
+        false
+    }
+}
+
 // ─── WasmEmulator ────────────────────────────────────────────────────────────
 
 /// GameCube emulator running entirely in the browser via WebAssembly.
@@ -193,6 +293,11 @@ pub struct WasmEmulator {
     unimplemented_block_count: u64,
     /// Number of `raise_exception` calls forwarded from the JS hook.
     raise_exception_count: u64,
+    /// Raw ISO disc image bytes, stored so the emulated DVD controller can
+    /// service in-game sector reads.  `None` until [`load_disc_image`] is called.
+    disc: Option<Vec<u8>>,
+    /// DVD Interface (DI) hardware register state.
+    di: DiState,
 }
 
 #[wasm_bindgen]
@@ -217,6 +322,8 @@ impl WasmEmulator {
             last_compiled_wasm_bytes: 0,
             unimplemented_block_count: 0,
             raise_exception_count: 0,
+            disc: None,
+            di: DiState::default(),
         }
     }
 
@@ -253,6 +360,70 @@ impl WasmEmulator {
             self.cache.invalidate(pc);
         }
         console_log!("[lazuli-web] loaded {} bytes at physical 0x{:08X}", data.len(), start);
+    }
+
+    // ── DiscImageDevice — Play!-style streaming disc reads ────────────────────
+
+    /// Store a raw GameCube ISO disc image for runtime sector reads.
+    ///
+    /// This is the Rust counterpart of Play!'s `DiscImageDevice.ts` +
+    /// `Js_DiscImageDeviceStream.cpp`: once the ISO bytes are stored here the
+    /// emulated DVD Interface can service `A8h` (DVD Read) DMA commands during
+    /// gameplay, so that games that stream textures, audio, or level data from
+    /// disc continue to work after the initial boot DOL has been loaded.
+    ///
+    /// Call this in addition to (not instead of) the DOL-loading path in
+    /// `parseAndLoadIso` / `load_bytes`.
+    pub fn load_disc_image(&mut self, data: &[u8]) {
+        let disc_size_mib = data.len() / (1024 * 1024);
+        self.disc = Some(data.to_vec());
+        // Mark the cover as closed (bit 2 = DICVR_STATE = 1 → cover closed,
+        // disc present) so games that poll DICOVER before issuing commands see
+        // a valid disc in the drive.
+        self.di.cover = 0x4;
+        console_log!("[lazuli] DiscImageDevice: stored {} MiB disc image for runtime reads", disc_size_mib);
+    }
+
+    // ── Hardware-register I/O (hook bridge) ───────────────────────────────────
+
+    /// Read a 32-bit value from a GameCube hardware register.
+    ///
+    /// Called by the JavaScript `read_u32` hook when the guest address has
+    /// the prefix `0xCC` (GameCube memory-mapped I/O space), **before** the
+    /// `PHYS_MASK` is applied.  This is necessary because applying
+    /// `addr & 0x01FFFFFF` to `0xCC003008` yields `0x00003008`, which would
+    /// silently alias into guest RAM instead of the DVD Interface registers.
+    ///
+    /// Currently handles:
+    /// - **DVD Interface** (`0xCC003000–0xCC003027`): full register read
+    /// - All other hardware registers: returns `0`
+    pub fn hw_read_u32(&self, addr: u32) -> u32 {
+        if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
+            return self.di.read_reg(addr - DI_BASE);
+        }
+        0
+    }
+
+    /// Write a 32-bit value to a GameCube hardware register.
+    ///
+    /// Called by the JavaScript `write_u32` hook when the guest address has
+    /// the prefix `0xCC`, before `PHYS_MASK` is applied (for the same reason
+    /// as documented on [`hw_read_u32`]).
+    ///
+    /// Writing `DICR` (offset `0x1C`) with bit 0 set triggers an immediate
+    /// disc DMA: the stored [`DiState`] command registers are decoded and the
+    /// requested bytes are copied from `disc` into guest RAM.
+    ///
+    /// Currently handles:
+    /// - **DVD Interface** (`0xCC003000–0xCC003027`): full register write + DMA
+    /// - All other hardware registers: silently ignored
+    pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
+        if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
+            if self.di.write_reg(addr - DI_BASE, val) {
+                self.process_di_command();
+            }
+        }
+        // All other hardware addresses are ignored (reads return 0 via hw_read_u32).
     }
 
     // ── Register access (for JS debugging) ───────────────────────────────────
@@ -744,6 +915,70 @@ impl WasmEmulator {
         }
 
         out
+    }
+
+    /// Process a DVD Interface DMA command (called when DICR bit 0 is written 1).
+    ///
+    /// Decodes the command in `DICMDBUF0` bits 31–24 and acts on it:
+    ///
+    /// - **`0xA8` — DVD Read**: copies `DILENGTH` bytes from the stored disc
+    ///   image at byte offset `DICMDBUF1` into guest RAM at `DIMAR`.
+    /// - **`0xAB` — Seek**: no-op (block device, seek has no physical effect).
+    /// - **`0xE0` — Request Error**: zeroes `DIIMMBUF` and completes.
+    /// - **`0xE3` — Stop Motor**: no-op.
+    /// - Any other command: logged and completed without action.
+    ///
+    /// On completion (all paths), `DICR` bit 0 (TSTART) is cleared and
+    /// `DISTATUS` bit 1 (TCINT — transfer complete) is set.  The CPU decrementer
+    /// interrupt path is not currently modelled; games that spin on TCINT via
+    /// polling (rather than an interrupt handler) will see the bit immediately.
+    fn process_di_command(&mut self) {
+        let cmd = (self.di.cmd_buf0 >> 24) as u8;
+        let disc_offset = self.di.cmd_buf1 as usize; // byte offset in disc image
+        let dma_len = self.di.dma_len as usize;
+        let dma_dest = Self::phys_addr(self.di.dma_addr);
+
+        match cmd {
+            0xA8 => {
+                // DVD Read: copy `dma_len` bytes from disc at `disc_offset` to RAM.
+                // `self.disc` and `self.ram` are separate fields with disjoint heap
+                // allocations; `as_deref()` borrows only the former, so Rust allows
+                // a simultaneous mutable borrow of the latter.
+                if let Some(disc) = self.disc.as_deref() {
+                    let src_end = disc_offset.saturating_add(dma_len);
+                    if src_end <= disc.len() && dma_dest + dma_len <= self.ram.len() {
+                        self.ram[dma_dest..dma_dest + dma_len]
+                            .copy_from_slice(&disc[disc_offset..src_end]);
+                    } else {
+                        console_log!(
+                            "[lazuli] DI: DVD Read out of bounds \
+                             (disc_off={:#010x}, len={}, disc_len={}, \
+                             ram_dest={:#010x}, ram_len={})",
+                            disc_offset,
+                            dma_len,
+                            disc.len(),
+                            dma_dest,
+                            self.ram.len()
+                        );
+                    }
+                } else {
+                    console_log!("[lazuli] DI: DVD Read with no disc loaded — call load_disc_image() first");
+                }
+            }
+            0xAB => { /* Seek — no-op on a block device */ }
+            0xE0 => {
+                // Request Error — return 0 via DIIMMBUF
+                self.di.imm_buf = 0;
+            }
+            0xE3 => { /* Stop Motor — no-op in emulation */ }
+            other => {
+                console_log!("[lazuli] DI: unrecognised command {:#04x}", other);
+            }
+        }
+
+        // Mark transfer complete: clear TSTART, set TCINT.
+        self.di.control &= !0x1; // clear TSTART
+        self.di.status  |=  0x2; // set   TCINT
     }
 }
 
