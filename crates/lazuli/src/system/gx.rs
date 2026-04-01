@@ -524,11 +524,11 @@ impl VertexStream {
 
 #[derive(Debug, Clone)]
 #[repr(transparent)]
-pub struct MatrixSet(BitArray<[u64; 2]>);
+pub struct MatrixSet(BitArray<[u32; 4]>);
 
 impl Default for MatrixSet {
     fn default() -> Self {
-        Self(BitArray::new([0; 2]))
+        Self(BitArray::new([0; 4]))
     }
 }
 
