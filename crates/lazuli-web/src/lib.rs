@@ -160,14 +160,19 @@ impl WasmBlockCache {
 
 /// Physical base address of the GameCube DVD Interface (DI) registers.
 ///
-/// See YAGCD §9.3 for the complete register map.
-const DI_BASE: u32 = 0xCC00_3000;
+/// The DI lives at MMIO offset 0x6000 from the GameCube's hardware base
+/// (0x0C000000 uncached / 0xCC000000 cached), giving a virtual address of
+/// `0xCC006000`.  See YAGCD §9.3 for the complete register map.
+///
+/// Note: the Processor Interface (PI) occupies offset 0x3000 (0xCC003000) and
+/// must not be confused with the DVD Interface.
+const DI_BASE: u32 = 0xCC00_6000;
 /// Number of bytes covered by the DI register bank (10 × 4-byte registers).
 const DI_SIZE: u32 = 0x28;
 
 /// DVD Interface hardware register file.
 ///
-/// Mirrors the ten memory-mapped I/O registers at `0xCC003000–0xCC003027`.
+/// Mirrors the ten memory-mapped I/O registers at `0xCC006000–0xCC006027`.
 /// This is the Rust-side counterpart of Play!'s `Js_DiscImageDeviceStream`:
 /// the emulated disc controller that reads sectors from the stored ISO image
 /// and DMAs them into guest RAM when the game issues a DVD Read command.
@@ -391,11 +396,11 @@ impl WasmEmulator {
     /// Called by the JavaScript `read_u32` hook when the guest address has
     /// the prefix `0xCC` (GameCube memory-mapped I/O space), **before** the
     /// `PHYS_MASK` is applied.  This is necessary because applying
-    /// `addr & 0x01FFFFFF` to `0xCC003008` yields `0x00003008`, which would
+    /// `addr & 0x01FFFFFF` to `0xCC006008` yields `0x00006008`, which would
     /// silently alias into guest RAM instead of the DVD Interface registers.
     ///
     /// Currently handles:
-    /// - **DVD Interface** (`0xCC003000–0xCC003027`): full register read
+    /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register read
     /// - All other hardware registers: returns `0`
     pub fn hw_read_u32(&self, addr: u32) -> u32 {
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
@@ -415,7 +420,7 @@ impl WasmEmulator {
     /// requested bytes are copied from `disc` into guest RAM.
     ///
     /// Currently handles:
-    /// - **DVD Interface** (`0xCC003000–0xCC003027`): full register write + DMA
+    /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register write + DMA
     /// - All other hardware registers: silently ignored
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {

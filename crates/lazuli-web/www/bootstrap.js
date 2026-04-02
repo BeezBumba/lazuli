@@ -463,9 +463,9 @@ function getRamView(emu) {
  * ## Address routing — hardware registers vs. guest RAM
  *
  * GameCube hardware-register addresses have the prefix `0xCC` (e.g. the DVD
- * Interface lives at `0xCC003000`).  These addresses must be intercepted
- * **before** `PHYS_MASK` is applied, because `0xCC003000 & 0x01FFFFFF` equals
- * `0x00003000` — an address inside guest RAM — causing silent corruption.
+ * Interface lives at `0xCC006000`).  These addresses must be intercepted
+ * **before** `PHYS_MASK` is applied, because `0xCC006000 & 0x01FFFFFF` equals
+ * `0x00006000` — an address inside guest RAM — causing silent corruption.
  *
  * For 32-bit reads/writes the Rust `hw_read_u32` / `hw_write_u32` exports are
  * called instead; they dispatch to the appropriate hardware module (currently
@@ -558,8 +558,8 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     read_u32(addr) {
       addr = addr >>> 0;
       // Route hardware-register reads to hw_read_u32 before masking so that
-      // 0xCC003000 (DVD Interface) reaches the correct handler instead of
-      // aliasing to RAM offset 0x00003000.
+      // 0xCC006000 (DVD Interface) reaches the correct handler instead of
+      // aliasing to RAM offset 0x00006000.
       if ((addr >>> 24) === 0xCC) {
         if (emu) return emu.hw_read_u32(addr) >>> 0;
         return 0;
@@ -598,7 +598,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       addr = addr >>> 0;
       val  = val  >>> 0;
       // Route hardware-register writes to hw_write_u32 before masking.
-      // Writing 0xCC003000-0xCC003027 drives the DVD Interface; bit 0 of
+      // Writing 0xCC006000-0xCC006027 drives the DVD Interface; bit 0 of
       // DICR (0x1C) triggers a DMA from the stored disc image into guest RAM.
       if ((addr >>> 24) === 0xCC) {
         if (emu) emu.hw_write_u32(addr, val);
