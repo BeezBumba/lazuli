@@ -117,7 +117,10 @@ impl Decoder {
     /// return 0 for any NaN input, so the unordered flag is simply the logical
     /// NOT of `lt | gt | eq`.
     fn update_cr_float(&self, b: &mut IrBlock, cr_fd: u8, la: IrLocal, lb: IrLocal) {
-        let lt_bit = 31u32.wrapping_sub((cr_fd as u32) * 4);
+        /// Number of bits occupied by each CR field (LT, GT, EQ, SO).
+        const CR_BITS: u32 = 4;
+
+        let lt_bit = 31u32.wrapping_sub((cr_fd as u32) * CR_BITS);
         let gt_bit = lt_bit.wrapping_sub(1);
         let eq_bit = lt_bit.wrapping_sub(2);
         let so_bit = lt_bit.wrapping_sub(3);
@@ -149,15 +152,28 @@ impl Decoder {
         b.push(IrInst::LocalSet(l_so));
 
         // Build the new CR: clear the 4 bits of cr_fd, then OR in the new values.
+        // Each bit is shifted into position and OR-ed into the accumulator via
+        // push_shifted_or (avoids inline repetition of the 4-instruction pattern).
         b.push(IrInst::LoadCr);
         b.push(IrInst::I32Const(!mask as i32)); b.push(IrInst::I32And);
 
-        b.push(IrInst::LocalGet(l_lt)); b.push(IrInst::I32Const(lt_bit as i32)); b.push(IrInst::I32Shl); b.push(IrInst::I32Or);
-        b.push(IrInst::LocalGet(l_gt)); b.push(IrInst::I32Const(gt_bit as i32)); b.push(IrInst::I32Shl); b.push(IrInst::I32Or);
-        b.push(IrInst::LocalGet(l_eq)); b.push(IrInst::I32Const(eq_bit as i32)); b.push(IrInst::I32Shl); b.push(IrInst::I32Or);
-        b.push(IrInst::LocalGet(l_so)); b.push(IrInst::I32Const(so_bit as i32)); b.push(IrInst::I32Shl); b.push(IrInst::I32Or);
+        Self::push_shifted_or(b, l_lt, lt_bit);
+        Self::push_shifted_or(b, l_gt, gt_bit);
+        Self::push_shifted_or(b, l_eq, eq_bit);
+        Self::push_shifted_or(b, l_so, so_bit);
 
         b.push(IrInst::StoreCr);
+    }
+
+    /// Emit `LocalGet(loc)`, `I32Const(shift)`, `I32Shl`, `I32Or` — the
+    /// four-instruction sequence for ORing a 0/1 value into an i32 accumulator
+    /// at the given bit position.
+    #[inline]
+    fn push_shifted_or(b: &mut IrBlock, loc: IrLocal, shift: u32) {
+        b.push(IrInst::LocalGet(loc));
+        b.push(IrInst::I32Const(shift as i32));
+        b.push(IrInst::I32Shl);
+        b.push(IrInst::I32Or);
     }
 
     // ── Branch condition ──────────────────────────────────────────────────────
