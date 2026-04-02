@@ -496,6 +496,10 @@ function buildHooks(ram, log, emu, pcContext = "?") {
       // Route hardware-register reads to hw_read_u32 before masking so that
       // 0xCC003000 (DVD Interface) reaches the correct handler instead of
       // aliasing to RAM offset 0x00003000.
+      if ((addr >>> 24) === 0xCC) {
+        if (emu) return emu.hw_read_u32(addr) >>> 0;
+        return 0;
+      }
       addr &= PHYS_MASK;
       if (addr + 3 >= ram.length) return 0;
       return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
@@ -528,11 +532,6 @@ function buildHooks(ram, log, emu, pcContext = "?") {
     },
     write_u32(addr, val) {
       addr = addr >>> 0;
-  if ((addr >>> 24) === 0xCC) {
-    console.log(`[HW READ] addr=0x${addr.toString(16).toUpperCase()}`);
-    if (emu) return emu.hw_read_u32(addr) >>> 0;
-    return 0;
-  }
       val  = val  >>> 0;
       // Route hardware-register writes to hw_write_u32 before masking.
       // Writing 0xCC003000-0xCC003027 drives the DVD Interface; bit 0 of
