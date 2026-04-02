@@ -496,9 +496,6 @@ function buildHooks(ram, log, emu, pcContext = "?") {
       // Route hardware-register reads to hw_read_u32 before masking so that
       // 0xCC003000 (DVD Interface) reaches the correct handler instead of
       // aliasing to RAM offset 0x00003000.
-      if ((addr >>> 24) === 0xCC) {
-        return emu ? (emu.hw_read_u32(addr) >>> 0) : 0;
-      }
       addr &= PHYS_MASK;
       if (addr + 3 >= ram.length) return 0;
       return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
