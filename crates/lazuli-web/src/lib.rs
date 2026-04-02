@@ -744,9 +744,11 @@ impl WasmEmulator {
                     "read_u8",
                     "read_u16",
                     "read_u32",
+                    "read_f64",
                     "write_u8",
                     "write_u16",
                     "write_u32",
+                    "write_f64",
                     "raise_exception",
                 ] {
                     arr.push(&JsValue::from_str(name));

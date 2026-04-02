@@ -249,6 +249,12 @@ fn emit_inst(
         IrInst::F64Abs  => b.push(Instruction::F64Abs),
         IrInst::F64Sqrt => b.push(Instruction::F64Sqrt),
 
+        // ── Float comparisons → i32 ────────────────────────────────────────────
+        // WASM comparison instructions return i32 0/1; NaN inputs always yield 0.
+        IrInst::F64Lt => b.push(Instruction::F64Lt),
+        IrInst::F64Gt => b.push(Instruction::F64Gt),
+        IrInst::F64Eq => b.push(Instruction::F64Eq),
+
         // ── Float conversions ──────────────────────────────────────────────────
         IrInst::F64FromI32S => b.push(Instruction::F64ConvertI32S),
         IrInst::I32TruncF64S => b.push(Instruction::I32TruncF64S),

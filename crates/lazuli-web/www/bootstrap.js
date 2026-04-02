@@ -1321,7 +1321,7 @@ const DEMO_PROGRAMS = {
   },
   "loop (cmpi+bc)": {
     description: "li r3, 0  /  addi r3, r3, 1  /  cmpi cr0, r3, 10  /  bne -8",
-    words: ["38600000", "38630001", "2C030000", "40820000"],
+    words: ["38600000", "38630001", "2C03000A", "4082FFF8"],
   },
   "store+load": {
     description: "li r4, 42  /  stw r4, 0(r1)  /  lwz r5, 0(r1)  /  blr",

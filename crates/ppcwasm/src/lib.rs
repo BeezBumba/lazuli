@@ -174,4 +174,59 @@ mod tests {
         // If it falls through to unimpl, that's also fine for the wasm output
         assert_eq!(&b.bytes[..4], b"\0asm");
     }
+
+    #[test]
+    fn fcmpu_no_unimpl() {
+        // fcmpu cr0, f1, f2 — opcode 63, xo 0
+        // encoding: primary=63 (0x3F), fd=cr0<<2=0, fa=1, fb=2, xo=0, rc=0
+        // bits: 111111_00000_00001_00010_0000000000_0 = 0xFC01_1000
+        let b = WasmJit::new().build([(0x8000_0000u32, ins(0xFC01_1000))].into_iter()).unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(), "fcmpu hit unimpl: {:?}", b.unimplemented_ops);
+    }
+
+    #[test]
+    fn fcmpo_no_unimpl() {
+        // fcmpo cr0, f1, f2 — opcode 63, xo 32 (0x20)
+        // bits: 111111_00000_00001_00010_0000000100_0 = 0xFC01_1040
+        let b = WasmJit::new().build([(0x8000_0000u32, ins(0xFC01_1040))].into_iter()).unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(), "fcmpo hit unimpl: {:?}", b.unimplemented_ops);
+    }
+
+    #[test]
+    fn lhzu_no_unimpl() {
+        // lhzu r3, 2(r4) — opcode 41
+        // bits: 101001_00011_00100_0000000000000010 = 0xA464_0002
+        let b = WasmJit::new().build([(0x8000_0000u32, ins(0xA464_0002))].into_iter()).unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(), "lhzu hit unimpl: {:?}", b.unimplemented_ops);
+    }
+
+    #[test]
+    fn lbzu_no_unimpl() {
+        // lbzu r3, 1(r4) — opcode 35
+        // bits: 100011_00011_00100_0000000000000001 = 0x8C64_0001
+        let b = WasmJit::new().build([(0x8000_0000u32, ins(0x8C64_0001))].into_iter()).unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(), "lbzu hit unimpl: {:?}", b.unimplemented_ops);
+    }
+
+    #[test]
+    fn sthu_no_unimpl() {
+        // sthu r3, 2(r4) — opcode 45
+        // bits: 101101_00011_00100_0000000000000010 = 0xB464_0002
+        let b = WasmJit::new().build([(0x8000_0000u32, ins(0xB464_0002))].into_iter()).unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(), "sthu hit unimpl: {:?}", b.unimplemented_ops);
+    }
+
+    #[test]
+    fn stbu_no_unimpl() {
+        // stbu r3, 1(r4) — opcode 39
+        // bits: 100111_00011_00100_0000000000000001 = 0x9C64_0001
+        let b = WasmJit::new().build([(0x8000_0000u32, ins(0x9C64_0001))].into_iter()).unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(), "stbu hit unimpl: {:?}", b.unimplemented_ops);
+    }
 }
