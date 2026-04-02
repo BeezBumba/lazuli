@@ -66,8 +66,8 @@ function updateStats(emu) {
   const stuckEl = $("stat-stuck-runs");
   stuckEl.textContent = stuckConsecutiveRuns;
   stuckEl.style.color =
-    stuckConsecutiveRuns > 200 ? "var(--red)" :
-    stuckConsecutiveRuns > 50  ? "var(--yellow)" : "";
+    stuckConsecutiveRuns > STUCK_PC_THRESHOLD * 4 ? "var(--red)" :
+    stuckConsecutiveRuns > STUCK_PC_THRESHOLD      ? "var(--yellow)" : "";
 
   // Last exception info
   if (lastRaisedExceptionPc !== 0) {
@@ -504,6 +504,11 @@ let lastRaisedExceptionKind = -1;
  * Resets to 0 whenever the PC advances to a new address.
  */
 let stuckConsecutiveRuns = 0;
+/**
+ * Number of consecutive same-PC blocks that triggers a stuck-PC warning.
+ * Also used to colour the stat row (yellow above this value, red above 4×).
+ */
+const STUCK_PC_THRESHOLD = 50;
 /** Ring buffer of the last DEBUG_EVENT_MAX notable emulation events. */
 let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
@@ -1208,21 +1213,20 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     const newBlockPc = emu.get_pc();
     if (newBlockPc === blockPc) {
       stuckConsecutiveRuns++;
-      if (stuckConsecutiveRuns === 50) {
+      if (stuckConsecutiveRuns === STUCK_PC_THRESHOLD) {
         const stuckHex = "0x" + blockPc.toString(16).toUpperCase().padStart(8, "0");
         const excInfo  = lastRaisedExceptionPc === blockPc
           ? `exception(${lastRaisedExceptionKind}) loop`
           : "branch-to-self or nextPc=0";
         const msg =
-          `PC stuck at ${stuckHex} for 50 consecutive blocks — ${excInfo}` +
-          ` (exceptions raised: ${emu.raise_exception_count()},` +
-          ` compiled: ${emu.blocks_compiled()})`;
+          `PC stuck at ${stuckHex} for ${STUCK_PC_THRESHOLD} consecutive blocks — ${excInfo}` +
+          ` (exceptions raised: ${emu.raise_exception_count()}, compiled: ${emu.blocks_compiled()})`;
         console.warn(`[lazuli] ${msg}`);
         pushDebugEvent(`⚠ STUCK ${stuckHex} — ${excInfo}`);
         setStatus(`⚠ PC stuck at ${stuckHex} — ${excInfo}`, "status-info");
       }
     } else {
-      if (stuckConsecutiveRuns >= 50) {
+      if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD) {
         const newHex = "0x" + newBlockPc.toString(16).toUpperCase().padStart(8, "0");
         console.info(`[lazuli] PC unstuck → ${newHex} after ${stuckConsecutiveRuns} same-PC blocks`);
         pushDebugEvent(`✓ unstuck → ${newHex} (was stuck for ${stuckConsecutiveRuns} blocks)`);
