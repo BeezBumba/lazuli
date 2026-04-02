@@ -57,6 +57,25 @@ function updateStats(emu) {
   $("stat-cache").textContent    = moduleCache.size;
   $("stat-pad").textContent      = "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
 
+  // Live current PC
+  const curPc = emu.get_pc();
+  $("stat-current-pc").textContent =
+    "0x" + curPc.toString(16).toUpperCase().padStart(8, "0");
+
+  // Stuck-PC streak indicator
+  const stuckEl = $("stat-stuck-runs");
+  stuckEl.textContent = stuckConsecutiveRuns;
+  stuckEl.style.color =
+    stuckConsecutiveRuns > 200 ? "var(--red)" :
+    stuckConsecutiveRuns > 50  ? "var(--yellow)" : "";
+
+  // Last exception info
+  if (lastRaisedExceptionPc !== 0) {
+    $("stat-exc-pc").textContent =
+      "0x" + lastRaisedExceptionPc.toString(16).toUpperCase().padStart(8, "0") +
+      ` (kind=${lastRaisedExceptionKind})`;
+  }
+
   // LR register
   const lr = emu.get_lr();
   $("stat-lr").textContent = "0x" + lr.toString(16).toUpperCase().padStart(8, "0");
@@ -474,7 +493,47 @@ let raiseExceptionTotal = 0;
 /** Maximum number of raise_exception events logged to the console. */
 const RAISE_EXCEPTION_LOG_LIMIT = 30;
 
-function buildHooks(ram, log, emu, pcContext = "?") {
+// ── Debug state ───────────────────────────────────────────────────────────────
+
+/** Numeric guest PC of the most recent raise_exception call (0 = none yet). */
+let lastRaisedExceptionPc   = 0;
+/** Exception kind of the most recent raise_exception call (-1 = none yet). */
+let lastRaisedExceptionKind = -1;
+/**
+ * Number of consecutive block executions where the PC did not change.
+ * Resets to 0 whenever the PC advances to a new address.
+ */
+let stuckConsecutiveRuns = 0;
+/** Ring buffer of the last DEBUG_EVENT_MAX notable emulation events. */
+let debugEvents = [];
+const DEBUG_EVENT_MAX = 30;
+
+/**
+ * Append a human-readable event to the debug event ring buffer and refresh
+ * the on-screen debug log panel.
+ *
+ * @param {string} msg  Short description of the event.
+ */
+function pushDebugEvent(msg) {
+  const ts = performance.now().toFixed(0);
+  debugEvents.push(`[${ts}ms] ${msg}`);
+  if (debugEvents.length > DEBUG_EVENT_MAX) debugEvents.shift();
+  const el = $("debug-log");
+  if (el) {
+    el.textContent = debugEvents.slice().reverse().join("\n");
+    el.scrollTop = 0;
+  }
+}
+
+/**
+ * @param {Uint8Array} ram  Zero-copy view of guest RAM
+ * @param {string[]}   log  Array to append exception/error messages to
+ * @param {object|null} emu  WasmEmulator instance (used for HW register I/O
+ *                           and to record exceptions)
+ * @param {number}     numericPc  Numeric guest PC of the block being executed.
+ * @param {string}     [pcContext]  Human-readable PC string for console messages
+ */
+function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
   return {
     read_u8(addr) {
       addr = addr >>> 0;
@@ -558,6 +617,8 @@ function buildHooks(ram, log, emu, pcContext = "?") {
       view.setFloat64(0, val, false /* big-endian */);
     },
     raise_exception(kind) {
+      lastRaisedExceptionPc   = numericPc;
+      lastRaisedExceptionKind = kind;
       if (log) log.push(`exception: kind=${kind}`);
       raiseExceptionTotal++;
       if (emu) emu.record_raise_exception();
@@ -567,6 +628,7 @@ function buildHooks(ram, log, emu, pcContext = "?") {
           console.warn("[lazuli] raise_exception log limit reached — suppressing further messages");
         }
       }
+      pushDebugEvent(`⚡ exception(${kind}) at ${pcContext}`);
     },
   };
 }
@@ -595,6 +657,13 @@ function clearModuleCache() {
   pcHitMap.clear();
   raiseExceptionTotal = 0;
   regsMemCache = null;
+  // Reset debug state so stale info from a previous ISO does not carry over.
+  lastRaisedExceptionPc   = 0;
+  lastRaisedExceptionKind = -1;
+  stuckConsecutiveRuns    = 0;
+  debugEvents             = [];
+  const el = $("debug-log");
+  if (el) el.textContent = "(no events yet)";
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
@@ -651,15 +720,19 @@ function executeOneBlockSync(emu, ram, log) {
     try {
       wasmBytes = emu.compile_block(pc);
     } catch (e) {
-      console.error(`[lazuli] compile error @ ${pcHex}: ${e}`);
+      const msg = `compile error @ ${pcHex}: ${e}`;
+      console.error(`[lazuli] ${msg}`);
       if (log) log.push(`[${pcHex}] compile error: ${e}`);
+      pushDebugEvent(`✗ ${msg}`);
       return false;
     }
     try {
       module = new WebAssembly.Module(wasmBytes);
     } catch (e) {
-      console.error(`[lazuli] WebAssembly.Module error @ ${pcHex}: ${e}`);
+      const msg = `WebAssembly.Module error @ ${pcHex}: ${e}`;
+      console.error(`[lazuli] ${msg}`);
       if (log) log.push(`[${pcHex}] WebAssembly.Module error: ${e}`);
+      pushDebugEvent(`✗ ${msg}`);
       return false;
     }
     moduleCache.set(pc, module);
@@ -675,11 +748,13 @@ function executeOneBlockSync(emu, ram, log) {
   try {
     instance = new WebAssembly.Instance(module, {
       env:   { memory: regsMem },
-      hooks: buildHooks(ram, log, emu, pcHex),
+      hooks: buildHooks(ram, log, emu, pc, pcHex),
     });
   } catch (e) {
-    console.error(`[lazuli] instantiation error @ ${pcHex}: ${e}`);
+    const msg = `instantiation error @ ${pcHex}: ${e}`;
+    console.error(`[lazuli] ${msg}`);
     if (log) log.push(`[${pcHex}] instantiation error: ${e}`);
+    pushDebugEvent(`✗ ${msg}`);
     return false;
   }
 
@@ -688,8 +763,10 @@ function executeOneBlockSync(emu, ram, log) {
   try {
     nextPc = instance.exports.execute(0 /* regs_ptr = 0 */);
   } catch (e) {
-    console.error(`[lazuli] execution error @ ${pcHex}: ${e}`);
+    const msg = `execution error @ ${pcHex}: ${e}`;
+    console.error(`[lazuli] ${msg}`);
     if (log) log.push(`[${pcHex}] execution error: ${e}`);
+    pushDebugEvent(`✗ ${msg}`);
     return false;
   }
 
@@ -698,8 +775,16 @@ function executeOneBlockSync(emu, ram, log) {
   emu.record_block_executed();
   pcHitMap.set(pc, (pcHitMap.get(pc) ?? 0) + 1);
 
-  // nextPc == 0 means the block updated Cpu::pc itself (branch taken)
+  // nextPc == 0 means the block updated Cpu::pc itself (branch taken or
+  // raise_exception was emitted and returned 0).
   const newPc = (nextPc >>> 0) !== 0 ? (nextPc >>> 0) : emu.get_pc();
+  if ((nextPc >>> 0) === 0 && lastRaisedExceptionPc === pc) {
+    // Exception was raised; PC was not updated — log so it is visible.
+    console.debug(
+      `[lazuli] ${pcHex}: exception(${lastRaisedExceptionKind}) raised, nextPc=0, ` +
+      `PC stays at ${pcHex} (raised_exception_total=${raiseExceptionTotal})`,
+    );
+  }
   emu.set_pc(newPc);
 
   if (log) {
@@ -1110,21 +1195,55 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   let blocksThisFrame = 0;
   let loopError = false;
   for (let i = 0; i < BLOCKS_PER_FRAME; i++) {
+    const blockPc = emu.get_pc();
     if (!executeOneBlockSync(emu, ram, null)) {
       loopError = true;
       break;
     }
     blocksThisFrame++;
+
+    // Stuck-PC detection: track how many consecutive blocks leave the PC
+    // unchanged.  This catches both "branch to self" tight loops and the
+    // raise_exception path where WASM returns 0 without advancing the PC.
+    const newBlockPc = emu.get_pc();
+    if (newBlockPc === blockPc) {
+      stuckConsecutiveRuns++;
+      if (stuckConsecutiveRuns === 50) {
+        const stuckHex = "0x" + blockPc.toString(16).toUpperCase().padStart(8, "0");
+        const excInfo  = lastRaisedExceptionPc === blockPc
+          ? `exception(${lastRaisedExceptionKind}) loop`
+          : "branch-to-self or nextPc=0";
+        const msg =
+          `PC stuck at ${stuckHex} for 50 consecutive blocks — ${excInfo}` +
+          ` (exceptions raised: ${emu.raise_exception_count()},` +
+          ` compiled: ${emu.blocks_compiled()})`;
+        console.warn(`[lazuli] ${msg}`);
+        pushDebugEvent(`⚠ STUCK ${stuckHex} — ${excInfo}`);
+        setStatus(`⚠ PC stuck at ${stuckHex} — ${excInfo}`, "status-info");
+      }
+    } else {
+      if (stuckConsecutiveRuns >= 50) {
+        const newHex = "0x" + newBlockPc.toString(16).toUpperCase().padStart(8, "0");
+        console.info(`[lazuli] PC unstuck → ${newHex} after ${stuckConsecutiveRuns} same-PC blocks`);
+        pushDebugEvent(`✓ unstuck → ${newHex} (was stuck for ${stuckConsecutiveRuns} blocks)`);
+        setStatus("▶ Emulation running…", "status-ok");
+      }
+      stuckConsecutiveRuns = 0;
+    }
   }
   if (loopError) {
-    const stuckPc = emu.get_pc();
-    const stuckHex = "0x" + stuckPc.toString(16).toUpperCase().padStart(8, "0");
-    console.error(
+    const errPc  = emu.get_pc();
+    const errHex = "0x" + errPc.toString(16).toUpperCase().padStart(8, "0");
+    const errMsg =
       `[lazuli] gameLoop: execution stopped after ${blocksThisFrame} blocks ` +
       `(total compiled: ${emu.blocks_compiled()}, executed: ${emu.blocks_executed()}) ` +
-      `— PC is now ${stuckHex}`
-    );
+      `— PC is now ${errHex}`;
+    console.error(errMsg);
+    pushDebugEvent(`✗ loop stopped at ${errHex} (${blocksThisFrame} blocks this frame)`);
     stopLoop();
+    setStatus(`✗ Stopped at ${errHex} — see console / debug log`, "status-err");
+    updateStats(emu);
+    renderRegisters(emu);
     return;
   }
 
@@ -1467,6 +1586,13 @@ async function main() {
         : "✗ Run failed at first block",
       count > 0 ? "status-ok" : "status-err"
     );
+  });
+
+  // ── Clear debug log button ────────────────────────────────────────────────
+  $("btn-clear-debug").addEventListener("click", () => {
+    debugEvents = [];
+    const el = $("debug-log");
+    if (el) el.textContent = "(no events yet)";
   });
 
   // Enable step/run buttons now that the emulator is ready

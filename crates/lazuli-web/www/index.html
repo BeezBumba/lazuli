@@ -213,7 +213,7 @@
     .stat-val { color: var(--accent); font-family: monospace; }
 
     /* Execution log */
-    #exec-log {
+    #exec-log, #debug-log {
       background: var(--bg);
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -424,6 +424,18 @@
           <span>Pad buttons bitmask</span>
           <span class="stat-val" id="stat-pad">0x0000</span>
         </div>
+        <div class="stat-row">
+          <span>Current PC</span>
+          <span class="stat-val" id="stat-current-pc">—</span>
+        </div>
+        <div class="stat-row">
+          <span>Consecutive same-PC blocks (stuck?)</span>
+          <span class="stat-val" id="stat-stuck-runs">0</span>
+        </div>
+        <div class="stat-row">
+          <span>Last exception at PC (kind)</span>
+          <span class="stat-val" id="stat-exc-pc">—</span>
+        </div>
         <div class="stat-row" id="stat-block-row">
           <span>Compiled block PCs</span>
           <span class="stat-val" id="stat-block-list">—</span>
@@ -446,6 +458,21 @@
         </div>
         <label>Execution log:</label>
         <div id="exec-log">(no execution yet)</div>
+      </div>
+    </div>
+
+    <!-- Debug Event Log -->
+    <div class="card">
+      <div class="card-header">Debug Event Log</div>
+      <div class="card-body controls">
+        <label>
+          Latest emulation events — exceptions, stuck-PC warnings, compile
+          errors and loop stops (newest first, last 30 entries).
+        </label>
+        <div id="debug-log">(no events yet)</div>
+        <div class="btn-row">
+          <button class="btn-secondary" id="btn-clear-debug">Clear log</button>
+        </div>
       </div>
     </div>
 
