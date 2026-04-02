@@ -593,11 +593,38 @@ function clearModuleCache() {
   moduleCache.clear();
   pcHitMap.clear();
   raiseExceptionTotal = 0;
+  regsMemCache = null;
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
 
 const WASM_PAGE = 65536;
+
+/**
+ * Single `WebAssembly.Memory` used as the register-file backing store for
+ * every JIT block execution.  Allocated lazily on first use and reused
+ * across all subsequent calls to `executeOneBlockSync` to avoid creating a
+ * new 64 KB allocation (+ `get_cpu_bytes` externref copy) on every block.
+ *
+ * @type {{ mem: WebAssembly.Memory, view: Uint8Array } | null}
+ */
+let regsMemCache = null;
+
+/**
+ * Return (or lazily create) the shared register-file memory.
+ *
+ * @param {WasmEmulator} emu
+ * @returns {{ mem: WebAssembly.Memory, view: Uint8Array }}
+ */
+function getRegsMem(emu) {
+  if (!regsMemCache) {
+    const cpuSize    = emu.cpu_struct_size();
+    const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE);
+    const mem  = new WebAssembly.Memory({ initial: pagesNeeded });
+    regsMemCache = { mem, view: new Uint8Array(mem.buffer) };
+  }
+  return regsMemCache;
+}
 
 /**
  * Compile (or fetch from cache), instantiate, and execute one PPC basic block.
@@ -637,11 +664,9 @@ function executeOneBlockSync(emu, ram, log) {
     moduleCache.set(pc, module);
   }
 
-  // ── Step 2: allocate a WASM memory page to hold the CPU register file ────
-  const cpuSize    = emu.cpu_struct_size();
-  const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE);
-  const regsMem    = new WebAssembly.Memory({ initial: pagesNeeded });
-  const regsView   = new Uint8Array(regsMem.buffer);
+  // ── Step 2: write CPU register file into the shared (cached) WASM memory ──
+  const cpuSize        = emu.cpu_struct_size();
+  const { mem: regsMem, view: regsView } = getRegsMem(emu);
   regsView.set(emu.get_cpu_bytes(), 0);
 
   // ── Step 3: instantiate with hook closures that use the zero-copy RAM ────
