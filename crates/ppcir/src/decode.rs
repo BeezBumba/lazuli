@@ -593,8 +593,10 @@ impl Decoder {
             }
             Opcode::Mftb => {
                 let rd=ins.gpr_d() as u8;
-                let tbr=(ins.field_spr() as u32).rotate_right(5)&0x3FF;
-                b.push(if tbr==268||tbr==28 { IrInst::LoadTbLo } else { IrInst::LoadTbHi });
+                // field_tbr() returns the actual TBR number (268=TBL, 269=TBU)
+                // directly, matching how ppcjit decodes this instruction.
+                let tbr=ins.field_tbr();
+                b.push(if tbr==268 { IrInst::LoadTbLo } else { IrInst::LoadTbHi });
                 b.push(IrInst::StoreGpr(rd));
             }
             Opcode::Mfcr => { let rd=ins.gpr_d() as u8; b.push(IrInst::LoadCr); b.push(IrInst::StoreGpr(rd)); }
@@ -609,8 +611,22 @@ impl Decoder {
             Opcode::Mfmsr => { let rd=ins.gpr_d() as u8; b.push(IrInst::LoadMsr); b.push(IrInst::StoreGpr(rd)); }
             Opcode::Mtmsr => { let rs=ins.gpr_s() as u8; b.push(IrInst::LoadGpr(rs)); b.push(IrInst::StoreMsr); }
             Opcode::Rfi => {
-                b.push(IrInst::LoadSrr1); b.push(IrInst::StoreMsr);
-                b.push(IrInst::LoadSrr0); b.push(IrInst::ReturnDynamic);
+                // Match ppcjit: only copy SRR1_TO_MSR_MASK bits from SRR1 into MSR,
+                // clear MSR bit 18 (POW), and mask the low 2 bits of SRR0.
+                // SRR1_TO_MSR_MASK = 0x87C0FF73 (from gekko::Exception).
+                const SRR1_MSR_MASK: i32 = 0x87C0FF73u32 as i32;
+                const NOT_SRR1_MSR_MASK: i32 = !SRR1_MSR_MASK;
+                const NOT_BIT18: i32 = !(1i32 << 18);
+                const NOT_LOW2: i32 = !3i32;
+                // new_msr = (srr1 & mask) | (msr & ~mask), then clear bit 18
+                b.push(IrInst::LoadSrr1); b.push(IrInst::I32Const(SRR1_MSR_MASK)); b.push(IrInst::I32And);
+                b.push(IrInst::LoadMsr); b.push(IrInst::I32Const(NOT_SRR1_MSR_MASK)); b.push(IrInst::I32And);
+                b.push(IrInst::I32Or);
+                b.push(IrInst::I32Const(NOT_BIT18)); b.push(IrInst::I32And);
+                b.push(IrInst::StoreMsr);
+                // new_pc = srr0 & ~0b11
+                b.push(IrInst::LoadSrr0); b.push(IrInst::I32Const(NOT_LOW2)); b.push(IrInst::I32And);
+                b.push(IrInst::ReturnDynamic);
                 return true;
             }
 
