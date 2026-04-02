@@ -1174,6 +1174,8 @@ const TIMEBASE_TICKS_PER_FRAME = 675_000;
  * inside an OS spin-wait that briefly calls OSEnableInterrupts().  With the
  * old once-per-frame scheme the MSR check always happened when the loop had
  * already disabled interrupts again, so the exception never triggered.
+ *
+ * BLOCKS_PER_FRAME = 500, so TICKS_PER_BLOCK = ceil(675000 / 500) = 1350.
  */
 const TICKS_PER_BLOCK = Math.ceil(TIMEBASE_TICKS_PER_FRAME / BLOCKS_PER_FRAME);
 

@@ -595,6 +595,7 @@ impl Decoder {
                 let rd=ins.gpr_d() as u8;
                 // field_tbr() returns the actual TBR number (268=TBL, 269=TBU)
                 // directly, matching how ppcjit decodes this instruction.
+                // Any value other than 268 is treated as TBU (only 268/269 are valid).
                 let tbr=ins.field_tbr();
                 b.push(if tbr==268 { IrInst::LoadTbLo } else { IrInst::LoadTbHi });
                 b.push(IrInst::StoreGpr(rd));
