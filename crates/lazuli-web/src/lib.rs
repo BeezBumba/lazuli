@@ -536,6 +536,26 @@ impl WasmEmulator {
         self.cpu.supervisor.config.msr.to_bits()
     }
 
+    /// Overwrite the Machine State Register with a raw 32-bit value.
+    ///
+    /// Call this once after loading a DOL/ISO to establish the CPU state that
+    /// the IPL ROM would normally leave before handing off to the game.  The
+    /// most important bit to clear is **IP** (bit 6, `exception_prefix`):
+    ///
+    /// * `IP = 1` (default reset value): exception vectors at `0xFFF0xxxx` —
+    ///   physical `0x01F00900` for the decrementer, which is **beyond** the
+    ///   24 MiB GameCube RAM and therefore unexecutable.
+    /// * `IP = 0`: exception vectors at `0x000xxxxx` — physical `0x00000900`
+    ///   for the decrementer, which is within RAM and where the Dolphin OS
+    ///   (`OSInit`) installs its exception handlers.
+    ///
+    /// Passing `0` clears all MSR bits (EE=0, FP=0, IP=0 …), which matches
+    /// the state the IPL ROM leaves the CPU in before the game's `__start`
+    /// runs `OSInit`.
+    pub fn set_msr(&mut self, value: u32) {
+        self.cpu.supervisor.config.msr = gekko::MachineState::from_bits(value);
+    }
+
     /// Saved Restore Register 0 (SRR0) — the PC saved when the last exception fired.
     pub fn get_srr0(&self) -> u32 {
         self.cpu.supervisor.exception.srr[0]
@@ -614,20 +634,26 @@ impl WasmEmulator {
     }
 
     /// Tick the decrementer down by `delta` ticks and deliver a decrementer
-    /// exception if it wraps through zero.
+    /// exception if the result is negative and external interrupts are enabled.
     ///
     /// The GameCube decrementer counts down at the same 40.5 MHz rate as the
-    /// time base.  When it transitions from a non-negative value to a negative
-    /// value (i.e. bit 31 becomes set), the CPU fires the decrementer exception
-    /// at vector `0x00000900` — provided external interrupts are enabled in the
-    /// MSR (the `EE` / `interrupts` bit).
+    /// time base.  The interrupt request is **level-sensitive**: it is asserted
+    /// whenever DEC < 0 and de-asserted as soon as the guest writes a
+    /// non-negative value back to DEC via `mtspr DEC`.
     ///
-    /// If the transition occurs while `EE` is clear (interrupts disabled), the
-    /// exception is held pending in `decrementer_pending`.  It will be delivered
-    /// the next time this function is called with `EE` set, matching real
-    /// PowerPC hardware where the decrementer interrupt is level-sensitive once
-    /// the sign bit is set: enabling `EE` while `DEC < 0` triggers the exception
-    /// immediately.
+    /// Concretely, `decrementer_pending` is set to `true` on every call where
+    /// `new_dec < 0` and to `false` on every call where `new_dec >= 0`.  The
+    /// latter case arises when the guest resets DEC through `mtspr DEC` (the
+    /// JIT block writes to the DEC field in the CPU struct via `set_cpu_bytes`
+    /// before this function runs), which correctly clears any stale pending
+    /// state left over from an earlier negative transition.
+    ///
+    /// When `decrementer_pending` is true and MSR.EE is set, the Decrementer
+    /// exception is delivered immediately (at vector `0x00000900` if IP=0, or
+    /// `0xFFF00900` if IP=1).  The pending flag is cleared after delivery; it
+    /// will be re-asserted on the very next call if DEC is still negative,
+    /// matching real hardware where the exception fires on every `rfi` return
+    /// until the handler writes a new positive value to DEC.
     ///
     /// Call this once per JIT block (not just once per animation frame) so that
     /// the exception fires as soon as the guest enables `EE` inside a spin-wait
@@ -637,16 +663,18 @@ impl WasmEmulator {
         let new_dec = old_dec.wrapping_sub(delta);
         self.cpu.supervisor.misc.dec = new_dec;
 
-        // Latch the pending flag whenever DEC transitions non-negative → negative.
-        if (old_dec as i32) >= 0 && (new_dec as i32) < 0 {
-            self.decrementer_pending = true;
-        }
+        // Level-sensitive: the interrupt is asserted while DEC < 0 and
+        // de-asserted while DEC >= 0.  If the guest wrote a non-negative value
+        // to DEC via `mtspr DEC` (synced through set_cpu_bytes before this
+        // call), old_dec will be non-negative going in and we must clear any
+        // stale pending flag from a previous negative phase.
+        self.decrementer_pending = (new_dec as i32) < 0;
 
         // Deliver the exception as soon as external interrupts are enabled.
-        // This correctly handles the case where DEC went negative while EE=0
-        // (e.g. at emulator startup before the guest OS has initialised): the
-        // exception is held until the guest runs `mtmsr` to enable EE, after
-        // which the very next `advance_decrementer` call fires it.
+        // Clearing the flag here and then unconditionally recomputing it at the
+        // top of the next call is intentional: if DEC is still negative after
+        // the handler runs `rfi` without resetting DEC, the flag is re-latched
+        // and the exception fires again — exactly as on real hardware.
         if self.decrementer_pending && self.cpu.supervisor.config.msr.interrupts() {
             self.decrementer_pending = false;
             self.cpu.raise_exception(gekko::Exception::Decrementer);
