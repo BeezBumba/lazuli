@@ -521,6 +521,15 @@ let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
 
 /**
+ * Format a 32-bit unsigned integer as an 8-digit upper-case hex string with
+ * the "0x" prefix.  Used throughout the debug/stuck-PC logging paths.
+ *
+ * @param {number} v
+ * @returns {string}
+ */
+const hexU32 = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
+
+/**
  * Append a human-readable event to the debug event ring buffer and refresh
  * the on-screen debug log panel.
  *
@@ -806,11 +815,9 @@ function executeOneBlockSync(emu, ram, log) {
   // block's own start address means a register branch (Bclr / Bcctr) jumped
   // back to the same block — almost certainly LR or CTR contains this PC.
   if (lastNextPc !== 0 && lastNextPc === pc) {
-    const lrHex  = "0x" + emu.get_lr().toString(16).toUpperCase().padStart(8, "0");
-    const ctrHex = "0x" + emu.get_ctr().toString(16).toUpperCase().padStart(8, "0");
     console.warn(
       `[lazuli] ${pcHex}: branch-to-self via ReturnDynamic — ` +
-      `LR=${lrHex} CTR=${ctrHex} (block returned own PC as nextPc)`,
+      `LR=${hexU32(emu.get_lr())} CTR=${hexU32(emu.get_ctr())} (block returned own PC as nextPc)`,
     );
   }
 
@@ -818,7 +825,7 @@ function executeOneBlockSync(emu, ram, log) {
 
   if (log) {
     const newHex = "0x" + newPc.toString(16).toUpperCase().padStart(8, "0");
-    log.push(`[${pcHex}] executed → next PC ${newHex} (rawNextPc=0x${lastNextPc.toString(16).toUpperCase().padStart(8,"0")})`);
+    log.push(`[${pcHex}] executed → next PC ${newHex} (rawNextPc=${hexU32(lastNextPc)})`);
   }
   return true;
 }
@@ -1275,7 +1282,6 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         setStatus(`⚠ PC stuck at ${stuckHex} — ${excInfo}`, "status-info");
 
         // ── Full CPU state dump on first stuck detection ──────────────────
-        const h = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
         const lrVal   = emu.get_lr();
         const ctrVal  = emu.get_ctr();
         const msrVal  = emu.get_msr();
@@ -1287,24 +1293,24 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         // nextPc=stuckHex → ReturnDynamic path: LR/CTR returned own PC → branch-to-self
         const nextPcNote = lastNextPc === 0
           ? `nextPc=0 (BranchRegIf/exception path — CPU::pc was written; emu.get_pc()=${stuckHex})`
-          : `nextPc=${h(lastNextPc)} (ReturnDynamic — LR/CTR returned this value)`;
+          : `nextPc=${hexU32(lastNextPc)} (ReturnDynamic — LR/CTR returned this value)`;
         const eeEnabled = (msrVal >> 15) & 1;
         console.warn(
           `[lazuli] STUCK CPU dump @ ${stuckHex}:\n` +
           `  ${nextPcNote}\n` +
-          `  LR   = ${h(lrVal)}   ← if equal to stuck PC, blr loops to itself\n` +
-          `  CTR  = ${h(ctrVal)}\n` +
-          `  R1   = ${h(r1Val)}  (stack pointer)\n` +
-          `  MSR  = ${h(msrVal)}  (EE/interrupts bit15=${eeEnabled})\n` +
-          `  SRR0 = ${h(srr0Val)}  (PC saved at last exception)\n` +
-          `  SRR1 = ${h(srr1Val)}  (MSR saved at last exception)\n` +
-          `  DEC  = ${h(decVal)} / ${(decVal | 0)}  (decrementer — negative means expired)\n` +
+          `  LR   = ${hexU32(lrVal)}   ← if equal to stuck PC, blr loops to itself\n` +
+          `  CTR  = ${hexU32(ctrVal)}\n` +
+          `  R1   = ${hexU32(r1Val)}  (stack pointer)\n` +
+          `  MSR  = ${hexU32(msrVal)}  (EE/interrupts bit15=${eeEnabled})\n` +
+          `  SRR0 = ${hexU32(srr0Val)}  (PC saved at last exception)\n` +
+          `  SRR1 = ${hexU32(srr1Val)}  (MSR saved at last exception)\n` +
+          `  DEC  = ${hexU32(decVal)} / ${(decVal | 0)}  (decrementer — negative means expired)\n` +
           `  exceptions raised so far: ${emu.raise_exception_count()}\n` +
           `  blocks compiled: ${emu.blocks_compiled()}, executed: ${emu.blocks_executed()}`,
         );
         pushDebugEvent(
-          `⚠ CPU dump: LR=${h(lrVal)} CTR=${h(ctrVal)} MSR=${h(msrVal)} ` +
-          `SRR0=${h(srr0Val)} DEC=${decVal | 0} EE=${eeEnabled}`,
+          `⚠ CPU dump: LR=${hexU32(lrVal)} CTR=${hexU32(ctrVal)} MSR=${hexU32(msrVal)} ` +
+          `SRR0=${hexU32(srr0Val)} DEC=${decVal | 0} EE=${eeEnabled}`,
         );
       }
 
@@ -1313,14 +1319,13 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       if (stuckConsecutiveRuns > STUCK_PC_THRESHOLD &&
           (stuckConsecutiveRuns % STUCK_PC_THRESHOLD) === 0) {
         const stuckHex = "0x" + blockPc.toString(16).toUpperCase().padStart(8, "0");
-        const h = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
         const lrVal  = emu.get_lr();
         const msrVal = emu.get_msr();
         const decVal = emu.get_dec();
         const eeEnabled = (msrVal >> 15) & 1;
         console.info(
           `[lazuli] STILL STUCK @ ${stuckHex} (run #${stuckConsecutiveRuns}): ` +
-          `nextPc=${h(lastNextPc)} LR=${h(lrVal)} MSR=${h(msrVal)} (EE=${eeEnabled}) ` +
+          `nextPc=${hexU32(lastNextPc)} LR=${hexU32(lrVal)} MSR=${hexU32(msrVal)} (EE=${eeEnabled}) ` +
           `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
         );
       }
