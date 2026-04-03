@@ -131,6 +131,18 @@ mod tests {
     }
 
     #[test]
+    fn mtmsr_terminates_block() {
+        // mtmsr r3  (opcode 31, xo 146): 0x7C60_0124
+        // Followed by addi r3, r0, 1 (0x3860_0001) which must NOT be compiled.
+        let b = WasmJit::new()
+            .build([(0x8000_0000u32, ins(0x7C60_0124)), (0x8000_0004u32, ins(0x3860_0001))].into_iter())
+            .unwrap();
+        assert_eq!(b.instruction_count, 1);
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty());
+    }
+
+    #[test]
     fn fadd_no_unimpl() {
         // fadd f1, f1, f2  0xFC22_082A
         let b = WasmJit::new().build([(0x8000_0000u32, ins(0xFC22_082A))].into_iter()).unwrap();
