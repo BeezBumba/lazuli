@@ -773,7 +773,19 @@ impl Decoder {
                 b.push(IrInst::I32Or); b.push(IrInst::StoreCr);
             }
             Opcode::Mfmsr => { let rd=ins.gpr_d() as u8; b.push(IrInst::LoadMsr); b.push(IrInst::StoreGpr(rd)); }
-            Opcode::Mtmsr => { let rs=ins.gpr_s() as u8; b.push(IrInst::LoadGpr(rs)); b.push(IrInst::StoreMsr); }
+            Opcode::Mtmsr => {
+                // Store the new MSR, then terminate the block so the host
+                // interrupt-check loop (advance_decrementer) sees the updated MSR
+                // before any further guest instructions execute.  On real PowerPC,
+                // the processor samples pending exceptions immediately after mtmsr
+                // enables EE; without block termination here the host check runs too
+                // late (EE may be 0 again by the time the block returns).
+                let rs = ins.gpr_s() as u8;
+                b.push(IrInst::LoadGpr(rs));
+                b.push(IrInst::StoreMsr);
+                b.push(IrInst::ReturnStatic(pc + 4));
+                return true;
+            }
             Opcode::Rfi => {
                 // Match ppcjit: only copy SRR1_TO_MSR_MASK bits from SRR1 into MSR,
                 // clear MSR bit 18 (POW), and mask the low 2 bits of SRR0.
@@ -824,6 +836,13 @@ mod tests {
     #[test] fn decode_branch_terminal() {
         let b = Decoder::new().decode([(0x8000_0000u32, ins(0x4800_0010)), (0x8000_0004u32, ins(0x3860_0001))].into_iter()).unwrap();
         assert_eq!(b.instruction_count, 1);
+    }
+    #[test] fn decode_mtmsr_terminal() {
+        // mtmsr r3 (0x7C60_0124) followed by addi r3, r0, 1 (0x3860_0001):
+        // only the mtmsr should be compiled; the addi must be excluded.
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C60_0124)), (0x8000_0004u32, ins(0x3860_0001))].into_iter()).unwrap();
+        assert_eq!(b.instruction_count, 1);
+        assert!(b.unimplemented_ops.is_empty());
     }
     #[test] fn decode_fadd_ok() {
         let b = Decoder::new().decode([(0x8000_0000u32, ins(0xFC22_082A))].into_iter()).unwrap();
