@@ -1175,6 +1175,13 @@ const TIMEBASE_TICKS_PER_FRAME = 675_000;
  * old once-per-frame scheme the MSR check always happened when the loop had
  * already disabled interrupts again, so the exception never triggered.
  *
+ * Additionally, the Rust `advance_decrementer` now latches a
+ * `decrementer_pending` flag whenever DEC transitions from non-negative to
+ * negative, regardless of whether EE is set at that moment.  The exception is
+ * held pending and delivered on the next call that finds EE=1.  This fixes the
+ * case where DEC wraps at emulator startup (before the guest OS has enabled
+ * interrupts) and would otherwise be permanently lost.
+ *
  * BLOCKS_PER_FRAME = 500, so TICKS_PER_BLOCK = ceil(675000 / 500) = 1350.
  */
 const TICKS_PER_BLOCK = Math.ceil(TIMEBASE_TICKS_PER_FRAME / BLOCKS_PER_FRAME);
