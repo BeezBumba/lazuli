@@ -301,7 +301,7 @@ function parseAndLoadIso(arrayBuffer, emu) {
   //   physical 0x01F00900 which is beyond RAM — executing there would cause
   //   a compile error and stop the emulator.
   //
-  //   IP = 0 (set here): exception vectors at 0x000xxxxx.  The decrementer
+  //   IP = 0 (set here): exception vectors at 0x0000xxxx.  The decrementer
   //   vector is 0x00000900 (physical), which is within RAM and is exactly
   //   where OSInit() installs the Dolphin OS exception handlers.
   //
