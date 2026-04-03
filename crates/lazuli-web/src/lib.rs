@@ -303,6 +303,11 @@ pub struct WasmEmulator {
     disc: Option<Vec<u8>>,
     /// DVD Interface (DI) hardware register state.
     di: DiState,
+    /// True when the decrementer has transitioned from non-negative to negative
+    /// but the exception has not yet been delivered because MSR.EE was clear at
+    /// the time of the transition.  The exception is held pending and will be
+    /// raised on the next `advance_decrementer` call that finds MSR.EE set.
+    decrementer_pending: bool,
 }
 
 #[wasm_bindgen]
@@ -329,6 +334,7 @@ impl WasmEmulator {
             raise_exception_count: 0,
             disc: None,
             di: DiState::default(),
+            decrementer_pending: false,
         }
     }
 
@@ -588,22 +594,33 @@ impl WasmEmulator {
     /// at vector `0x00000900` — provided external interrupts are enabled in the
     /// MSR (the `EE` / `interrupts` bit).
     ///
-    /// Call this once per animation frame with the same `delta` as
-    /// `advance_timebase` so that decrementer-driven timing loops and OS timer
-    /// callbacks (`OSWaitVBlank`, alarms, etc.) see a ticking counter and do not
-    /// spin forever.
+    /// If the transition occurs while `EE` is clear (interrupts disabled), the
+    /// exception is held pending in `decrementer_pending`.  It will be delivered
+    /// the next time this function is called with `EE` set, matching real
+    /// PowerPC hardware where the decrementer interrupt is level-sensitive once
+    /// the sign bit is set: enabling `EE` while `DEC < 0` triggers the exception
+    /// immediately.
     ///
-    /// Suggested value: `675_000` ticks per frame (= 40.5 MHz / 60 fps).
+    /// Call this once per JIT block (not just once per animation frame) so that
+    /// the exception fires as soon as the guest enables `EE` inside a spin-wait
+    /// loop.
     pub fn advance_decrementer(&mut self, delta: u32) {
         let old_dec = self.cpu.supervisor.misc.dec;
         let new_dec = old_dec.wrapping_sub(delta);
         self.cpu.supervisor.misc.dec = new_dec;
 
-        // The decrementer exception fires on the transition from non-negative
-        // (bit 31 clear) to negative (bit 31 set), but only when external
-        // interrupts are enabled in the MSR.
-        let fired = (old_dec as i32) >= 0 && (new_dec as i32) < 0;
-        if fired && self.cpu.supervisor.config.msr.interrupts() {
+        // Latch the pending flag whenever DEC transitions non-negative → negative.
+        if (old_dec as i32) >= 0 && (new_dec as i32) < 0 {
+            self.decrementer_pending = true;
+        }
+
+        // Deliver the exception as soon as external interrupts are enabled.
+        // This correctly handles the case where DEC went negative while EE=0
+        // (e.g. at emulator startup before the guest OS has initialised): the
+        // exception is held until the guest runs `mtmsr` to enable EE, after
+        // which the very next `advance_decrementer` call fires it.
+        if self.decrementer_pending && self.cpu.supervisor.config.msr.interrupts() {
+            self.decrementer_pending = false;
             self.cpu.raise_exception(gekko::Exception::Decrementer);
         }
     }
