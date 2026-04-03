@@ -523,6 +523,34 @@ impl WasmEmulator {
         self.cpu.user.lr
     }
 
+    /// Current Counter Register (CTR) value.
+    pub fn get_ctr(&self) -> u32 {
+        self.cpu.user.ctr
+    }
+
+    /// Current Machine State Register (MSR) as a raw 32-bit word.
+    ///
+    /// Bit 15 (`interrupts` / `EE`) is the external-interrupt enable flag.
+    /// Check `(msr >> 15) & 1` to see if external interrupts are enabled.
+    pub fn get_msr(&self) -> u32 {
+        self.cpu.supervisor.config.msr.to_bits()
+    }
+
+    /// Saved Restore Register 0 (SRR0) — the PC saved when the last exception fired.
+    pub fn get_srr0(&self) -> u32 {
+        self.cpu.supervisor.exception.srr[0]
+    }
+
+    /// Saved Restore Register 1 (SRR1) — the MSR saved when the last exception fired.
+    pub fn get_srr1(&self) -> u32 {
+        self.cpu.supervisor.exception.srr[1]
+    }
+
+    /// Current Decrementer (DEC) value (signed; goes negative when it expires).
+    pub fn get_dec(&self) -> u32 {
+        self.cpu.supervisor.misc.dec
+    }
+
     /// Return a [`js_sys::Array`] containing the guest PC of every block
     /// currently held in the compiled-block cache (module cache).
     ///

@@ -500,6 +500,13 @@ let lastRaisedExceptionPc   = 0;
 /** Exception kind of the most recent raise_exception call (-1 = none yet). */
 let lastRaisedExceptionKind = -1;
 /**
+ * Raw (unsigned) nextPc value returned by the most recently executed WASM
+ * block.  0 means the block wrote CPU::pc itself (BranchRegIf / RaiseException
+ * path); any other value is the static or dynamic branch target.
+ * Updated by executeOneBlockSync; reset to 0 on ISO load / Reset.
+ */
+let lastNextPc = 0;
+/**
  * Number of consecutive block executions where the PC did not change.
  * Resets to 0 whenever the PC advances to a new address.
  */
@@ -665,6 +672,7 @@ function clearModuleCache() {
   // Reset debug state so stale info from a previous ISO does not carry over.
   lastRaisedExceptionPc   = 0;
   lastRaisedExceptionKind = -1;
+  lastNextPc              = 0;
   stuckConsecutiveRuns    = 0;
   debugEvents             = [];
   const el = $("debug-log");
@@ -780,21 +788,37 @@ function executeOneBlockSync(emu, ram, log) {
   emu.record_block_executed();
   pcHitMap.set(pc, (pcHitMap.get(pc) ?? 0) + 1);
 
+  // Record the raw nextPc for stuck-PC diagnostics in the game loop.
+  lastNextPc = nextPc >>> 0;
+
   // nextPc == 0 means the block updated Cpu::pc itself (branch taken or
   // raise_exception was emitted and returned 0).
-  const newPc = (nextPc >>> 0) !== 0 ? (nextPc >>> 0) : emu.get_pc();
-  if ((nextPc >>> 0) === 0 && lastRaisedExceptionPc === pc) {
+  const newPc = lastNextPc !== 0 ? lastNextPc : emu.get_pc();
+  if (lastNextPc === 0 && lastRaisedExceptionPc === pc) {
     // Exception was raised; PC was not updated — log so it is visible.
     console.debug(
       `[lazuli] ${pcHex}: exception(${lastRaisedExceptionKind}) raised, nextPc=0, ` +
       `PC stays at ${pcHex} (raised_exception_total=${raiseExceptionTotal})`,
     );
   }
+
+  // Detect branch-to-self via ReturnDynamic: non-zero nextPc that equals the
+  // block's own start address means a register branch (Bclr / Bcctr) jumped
+  // back to the same block — almost certainly LR or CTR contains this PC.
+  if (lastNextPc !== 0 && lastNextPc === pc) {
+    const lrHex  = "0x" + emu.get_lr().toString(16).toUpperCase().padStart(8, "0");
+    const ctrHex = "0x" + emu.get_ctr().toString(16).toUpperCase().padStart(8, "0");
+    console.warn(
+      `[lazuli] ${pcHex}: branch-to-self via ReturnDynamic — ` +
+      `LR=${lrHex} CTR=${ctrHex} (block returned own PC as nextPc)`,
+    );
+  }
+
   emu.set_pc(newPc);
 
   if (log) {
     const newHex = "0x" + newPc.toString(16).toUpperCase().padStart(8, "0");
-    log.push(`[${pcHex}] executed → next PC ${newHex}`);
+    log.push(`[${pcHex}] executed → next PC ${newHex} (rawNextPc=0x${lastNextPc.toString(16).toUpperCase().padStart(8,"0")})`);
   }
   return true;
 }
@@ -1249,6 +1273,56 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         console.warn(`[lazuli] ${msg}`);
         pushDebugEvent(`⚠ STUCK ${stuckHex} — ${excInfo}`);
         setStatus(`⚠ PC stuck at ${stuckHex} — ${excInfo}`, "status-info");
+
+        // ── Full CPU state dump on first stuck detection ──────────────────
+        const h = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
+        const lrVal   = emu.get_lr();
+        const ctrVal  = emu.get_ctr();
+        const msrVal  = emu.get_msr();
+        const srr0Val = emu.get_srr0();
+        const srr1Val = emu.get_srr1();
+        const decVal  = emu.get_dec();
+        const r1Val   = emu.get_gpr(1);
+        // nextPc=0 → BranchRegIf path: PC was written into CPU struct (check LR == stuckHex)
+        // nextPc=stuckHex → ReturnDynamic path: LR/CTR returned own PC → branch-to-self
+        const nextPcNote = lastNextPc === 0
+          ? `nextPc=0 (BranchRegIf/exception path — CPU::pc was written; emu.get_pc()=${stuckHex})`
+          : `nextPc=${h(lastNextPc)} (ReturnDynamic — LR/CTR returned this value)`;
+        const eeEnabled = (msrVal >> 15) & 1;
+        console.warn(
+          `[lazuli] STUCK CPU dump @ ${stuckHex}:\n` +
+          `  ${nextPcNote}\n` +
+          `  LR   = ${h(lrVal)}   ← if equal to stuck PC, blr loops to itself\n` +
+          `  CTR  = ${h(ctrVal)}\n` +
+          `  R1   = ${h(r1Val)}  (stack pointer)\n` +
+          `  MSR  = ${h(msrVal)}  (EE/interrupts bit15=${eeEnabled})\n` +
+          `  SRR0 = ${h(srr0Val)}  (PC saved at last exception)\n` +
+          `  SRR1 = ${h(srr1Val)}  (MSR saved at last exception)\n` +
+          `  DEC  = ${h(decVal)} / ${(decVal | 0)}  (decrementer — negative means expired)\n` +
+          `  exceptions raised so far: ${emu.raise_exception_count()}\n` +
+          `  blocks compiled: ${emu.blocks_compiled()}, executed: ${emu.blocks_executed()}`,
+        );
+        pushDebugEvent(
+          `⚠ CPU dump: LR=${h(lrVal)} CTR=${h(ctrVal)} MSR=${h(msrVal)} ` +
+          `SRR0=${h(srr0Val)} DEC=${decVal | 0} EE=${eeEnabled}`,
+        );
+      }
+
+      // Periodic re-dump every additional STUCK_PC_THRESHOLD runs while stuck,
+      // so we can tell whether any state is changing as execution continues.
+      if (stuckConsecutiveRuns > STUCK_PC_THRESHOLD &&
+          (stuckConsecutiveRuns % STUCK_PC_THRESHOLD) === 0) {
+        const stuckHex = "0x" + blockPc.toString(16).toUpperCase().padStart(8, "0");
+        const h = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
+        const lrVal  = emu.get_lr();
+        const msrVal = emu.get_msr();
+        const decVal = emu.get_dec();
+        const eeEnabled = (msrVal >> 15) & 1;
+        console.info(
+          `[lazuli] STILL STUCK @ ${stuckHex} (run #${stuckConsecutiveRuns}): ` +
+          `nextPc=${h(lastNextPc)} LR=${h(lrVal)} MSR=${h(msrVal)} (EE=${eeEnabled}) ` +
+          `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
+        );
       }
     } else {
       if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD) {
