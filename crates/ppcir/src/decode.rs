@@ -105,8 +105,78 @@ impl Decoder {
         b.push(IrInst::StoreCr);
     }
 
-    // ── Branch condition ──────────────────────────────────────────────────────
+    // ── Float CR helper ───────────────────────────────────────────────────────
 
+    /// Update a CR field from the result of an `fcmpu`/`fcmpo` comparison.
+    ///
+    /// `la` and `lb` are locals holding the two f64 operands.  The CR field
+    /// `cr_fd` (0–7) is updated: LT/GT/EQ are set from the comparison result;
+    /// SO (the unordered / NaN flag) is 1 if at least one operand is NaN.
+    ///
+    /// WASM f64 comparison instructions (`f64.lt`, `f64.gt`, `f64.eq`) already
+    /// return 0 for any NaN input, so the unordered flag is simply the logical
+    /// NOT of `lt | gt | eq`.
+    fn update_cr_float(&self, b: &mut IrBlock, cr_fd: u8, la: IrLocal, lb: IrLocal) {
+        /// Number of bits occupied by each CR field (LT, GT, EQ, SO).
+        const CR_BITS: u32 = 4;
+
+        let lt_bit = 31u32.wrapping_sub((cr_fd as u32) * CR_BITS);
+        let gt_bit = lt_bit.wrapping_sub(1);
+        let eq_bit = lt_bit.wrapping_sub(2);
+        let so_bit = lt_bit.wrapping_sub(3);
+        let mask   = 0xFu32.wrapping_shl(so_bit);
+
+        // Allocate locals for the three comparison results (each is 0 or 1).
+        let l_lt = b.alloc_local(IrTy::I32);
+        let l_gt = b.alloc_local(IrTy::I32);
+        let l_eq = b.alloc_local(IrTy::I32);
+
+        // lt = (la < lb)
+        b.push(IrInst::LocalGet(la)); b.push(IrInst::LocalGet(lb)); b.push(IrInst::F64Lt);
+        b.push(IrInst::LocalSet(l_lt));
+
+        // gt = (la > lb)
+        b.push(IrInst::LocalGet(la)); b.push(IrInst::LocalGet(lb)); b.push(IrInst::F64Gt);
+        b.push(IrInst::LocalSet(l_gt));
+
+        // eq = (la == lb)
+        b.push(IrInst::LocalGet(la)); b.push(IrInst::LocalGet(lb)); b.push(IrInst::F64Eq);
+        b.push(IrInst::LocalSet(l_eq));
+
+        // so = !(lt | gt | eq) — 1 when all three are 0 (NaN input)
+        // so  = (lt | gt | eq) XOR 1
+        let l_so = b.alloc_local(IrTy::I32);
+        b.push(IrInst::LocalGet(l_lt)); b.push(IrInst::LocalGet(l_gt)); b.push(IrInst::I32Or);
+        b.push(IrInst::LocalGet(l_eq)); b.push(IrInst::I32Or);
+        b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor);
+        b.push(IrInst::LocalSet(l_so));
+
+        // Build the new CR: clear the 4 bits of cr_fd, then OR in the new values.
+        // Each bit is shifted into position and OR-ed into the accumulator via
+        // push_shifted_or (avoids inline repetition of the 4-instruction pattern).
+        b.push(IrInst::LoadCr);
+        b.push(IrInst::I32Const(!mask as i32)); b.push(IrInst::I32And);
+
+        Self::push_shifted_or(b, l_lt, lt_bit);
+        Self::push_shifted_or(b, l_gt, gt_bit);
+        Self::push_shifted_or(b, l_eq, eq_bit);
+        Self::push_shifted_or(b, l_so, so_bit);
+
+        b.push(IrInst::StoreCr);
+    }
+
+    /// Emit `LocalGet(loc)`, `I32Const(shift)`, `I32Shl`, `I32Or` — the
+    /// four-instruction sequence for ORing a 0/1 value into an i32 accumulator
+    /// at the given bit position.
+    #[inline]
+    fn push_shifted_or(b: &mut IrBlock, loc: IrLocal, shift: u32) {
+        b.push(IrInst::LocalGet(loc));
+        b.push(IrInst::I32Const(shift as i32));
+        b.push(IrInst::I32Shl);
+        b.push(IrInst::I32Or);
+    }
+
+    // ── Branch condition ──────────────────────────────────────────────────────
     fn emit_branch_cond(&self, b: &mut IrBlock, bo: u8, bi: u8) {
         let ignore_cr  = (bo >> 4) & 1 != 0;
         let desired_cr = (bo >> 3) & 1 != 0;
@@ -371,13 +441,62 @@ impl Decoder {
                 b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
                 b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU32); b.push(IrInst::StoreGpr(rd));
             }
-            Opcode::Lwzx => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU32); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lwzx  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU32); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lwzux => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU32); b.push(IrInst::StoreGpr(rd));
+            }
             Opcode::Lhz  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::ReadU16); b.push(IrInst::StoreGpr(rd)); }
-            Opcode::Lhzx => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU16); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lhzu => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU16); b.push(IrInst::StoreGpr(rd));
+            }
+            Opcode::Lhzx  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU16); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lhzux => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU16); b.push(IrInst::StoreGpr(rd));
+            }
             Opcode::Lha  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::ReadU16); b.push(IrInst::I32Extend16S); b.push(IrInst::StoreGpr(rd)); }
-            Opcode::Lhax => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU16); b.push(IrInst::I32Extend16S); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lhau => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU16); b.push(IrInst::I32Extend16S); b.push(IrInst::StoreGpr(rd));
+            }
+            Opcode::Lhax  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU16); b.push(IrInst::I32Extend16S); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lhaux => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU16); b.push(IrInst::I32Extend16S); b.push(IrInst::StoreGpr(rd));
+            }
             Opcode::Lbz  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::ReadU8); b.push(IrInst::StoreGpr(rd)); }
-            Opcode::Lbzx => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU8); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lbzu => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU8); b.push(IrInst::StoreGpr(rd));
+            }
+            Opcode::Lbzx  => { let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU8); b.push(IrInst::StoreGpr(rd)); }
+            Opcode::Lbzux => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU8); b.push(IrInst::StoreGpr(rd));
+            }
 
             // ── Integer stores ────────────────────────────────────────────────
             Opcode::Stw  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32); }
@@ -388,11 +507,46 @@ impl Decoder {
                 b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32);
                 b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
             }
-            Opcode::Stwx => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32); }
+            Opcode::Stwx  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32); }
+            Opcode::Stwux => {
+                let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add); b.push(IrInst::LocalSet(ea));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32);
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
             Opcode::Sth  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU16); }
-            Opcode::Sthx => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU16); }
+            Opcode::Sthu => {
+                let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add); b.push(IrInst::LocalSet(ea));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU16);
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
+            Opcode::Sthx  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU16); }
+            Opcode::Sthux => {
+                let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add); b.push(IrInst::LocalSet(ea));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU16);
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
             Opcode::Stb  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU8); }
-            Opcode::Stbx => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU8); }
+            Opcode::Stbu => {
+                let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add); b.push(IrInst::LocalSet(ea));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU8);
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
+            Opcode::Stbx  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU8); }
+            Opcode::Stbux => {
+                let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8;
+                let ea=b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add); b.push(IrInst::LocalSet(ea));
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU8);
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
 
             // ── Float loads ───────────────────────────────────────────────────
             Opcode::Lfs | Opcode::Lfsu => {
@@ -471,7 +625,16 @@ impl Decoder {
             Opcode::Frsqrte => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; self.emit_recip(b,fd,fb,true,false); }
             Opcode::Mffs    => { let fd=ins.fpr_d() as u8; b.push(IrInst::F64Const(0.0)); b.push(IrInst::StoreFprPs0(fd)); }
             Opcode::Mtfsf | Opcode::Mtfsb0 | Opcode::Mtfsb1 | Opcode::Mtfsfi => { /* no-op */ }
-            Opcode::Fcmpu | Opcode::Fcmpo => { /* float compare to CR field — stub */ }
+            Opcode::Fcmpu | Opcode::Fcmpo => {
+                let cr = ins.field_crfd() as u8;
+                let fa = ins.fpr_a() as u8;
+                let fb = ins.fpr_b() as u8;
+                let la = b.alloc_local(IrTy::F64);
+                let lb = b.alloc_local(IrTy::F64);
+                b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LocalSet(la));
+                b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::LocalSet(lb));
+                self.update_cr_float(b, cr, la, lb);
+            }
 
             // ── Paired-single (Gekko) ─────────────────────────────────────────
             Opcode::PsAdd  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Add); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); b.push(IrInst::LoadFprPs1(fa)); b.push(IrInst::LoadFprPs1(fb)); b.push(IrInst::F64Add); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs1(fd)); }

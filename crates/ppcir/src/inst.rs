@@ -87,6 +87,14 @@ pub enum IrInst {
     // ─── Float arithmetic ─────────────────────────────────────────────────────
     F64Add, F64Sub, F64Mul, F64Div, F64Neg, F64Abs, F64Sqrt,
 
+    // ─── Float comparisons → i32 0/1 ─────────────────────────────────────────
+    /// `(f64, f64) → (i32)` — 1 if lhs < rhs, 0 otherwise (0 for NaN inputs).
+    F64Lt,
+    /// `(f64, f64) → (i32)` — 1 if lhs > rhs, 0 otherwise (0 for NaN inputs).
+    F64Gt,
+    /// `(f64, f64) → (i32)` — 1 if lhs == rhs, 0 otherwise (0 for NaN inputs).
+    F64Eq,
+
     // ─── Float conversions ────────────────────────────────────────────────────
     /// `(i32) → (f64)` — signed i32 to f64.
     F64FromI32S,
