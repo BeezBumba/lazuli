@@ -292,6 +292,23 @@ function parseAndLoadIso(arrayBuffer, emu) {
   // Point the CPU at the entry point
   emu.set_pc(dol.entry);
 
+  // Initialise the MSR to the state the IPL ROM leaves the CPU in before
+  // handing control to the game DOL.  The critical bit to clear is IP
+  // (exception_prefix, bit 6):
+  //
+  //   IP = 1 (Cpu::default reset value): exception vectors at 0xFFF0xxxx.
+  //   For a 24 MiB GameCube RAM, the decrementer vector 0xFFF00900 maps to
+  //   physical 0x01F00900 which is beyond RAM — executing there would cause
+  //   a compile error and stop the emulator.
+  //
+  //   IP = 0 (set here): exception vectors at 0x0000xxxx.  The decrementer
+  //   vector is 0x00000900 (physical), which is within RAM and is exactly
+  //   where OSInit() installs the Dolphin OS exception handlers.
+  //
+  // All other bits are cleared (EE=0, FP=0, …); the game's own __start /
+  // OSInit will configure them before enabling external interrupts.
+  emu.set_msr(0);
+
   return { gameId, gameName, entry: dol.entry };
 }
 
@@ -1206,12 +1223,17 @@ const TIMEBASE_TICKS_PER_FRAME = 675_000;
  * old once-per-frame scheme the MSR check always happened when the loop had
  * already disabled interrupts again, so the exception never triggered.
  *
- * Additionally, the Rust `advance_decrementer` now latches a
- * `decrementer_pending` flag whenever DEC transitions from non-negative to
- * negative, regardless of whether EE is set at that moment.  The exception is
- * held pending and delivered on the next call that finds EE=1.  This fixes the
- * case where DEC wraps at emulator startup (before the guest OS has enabled
- * interrupts) and would otherwise be permanently lost.
+ * The Rust `advance_decrementer` treats the decrementer interrupt as
+ * **level-sensitive** (matching real PowerPC hardware): `decrementer_pending`
+ * is `true` whenever `DEC < 0` and `false` whenever `DEC >= 0`.  This means:
+ *
+ *  - The exception fires on the very first `advance_decrementer` call after a
+ *    block enables EE, even if the exception was previously delivered and DEC
+ *    was never reset (the handler must write a new positive value to DEC via
+ *    `mtspr DEC` to stop continuous re-firing, as on real hardware).
+ *  - Writing a non-negative value to DEC via `mtspr DEC` (synced through
+ *    `set_cpu_bytes` before `advance_decrementer` runs) de-asserts the
+ *    interrupt immediately, clearing any stale pending state.
  *
  * BLOCKS_PER_FRAME = 500, so TICKS_PER_BLOCK = ceil(675000 / 500) = 1350.
  */
