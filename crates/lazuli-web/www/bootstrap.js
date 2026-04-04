@@ -634,7 +634,13 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // Writing 0xCC006000-0xCC006027 drives the DVD Interface; bit 0 of
       // DICR (0x1C) triggers a DMA from the stored disc image into guest RAM.
       if ((addr >>> 24) === 0xCC) {
-        if (emu) emu.hw_write_u32(addr, val);
+        if (emu) {
+          emu.hw_write_u32(addr, val);
+          // A DVD Read DMA may have just overwritten guest code in RAM.
+          // Flush the JIT cache so stale WASM modules for those addresses
+          // are not reused; they will be recompiled from the new RAM bytes.
+          if (emu.take_dma_dirty()) moduleCache.clear();
+        }
         return;
       }
       addr &= PHYS_MASK;

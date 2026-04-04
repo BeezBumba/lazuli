@@ -308,6 +308,12 @@ pub struct WasmEmulator {
     /// the time of the transition.  The exception is held pending and will be
     /// raised on the next `advance_decrementer` call that finds MSR.EE set.
     decrementer_pending: bool,
+    /// Set to `true` by [`process_di_command`] whenever a DVD Read (0xA8)
+    /// successfully copies disc bytes into guest RAM.  JavaScript reads and
+    /// clears this flag via [`take_dma_dirty`] after every `hw_write_u32` call
+    /// so it can flush the JIT module cache for addresses whose code was just
+    /// overwritten by the DMA.
+    dma_dirty: bool,
 }
 
 #[wasm_bindgen]
@@ -335,6 +341,7 @@ impl WasmEmulator {
             disc: None,
             di: DiState::default(),
             decrementer_pending: false,
+            dma_dirty: false,
         }
     }
 
@@ -679,6 +686,19 @@ impl WasmEmulator {
             self.decrementer_pending = false;
             self.cpu.raise_exception(gekko::Exception::Decrementer);
         }
+    }
+
+    /// Return `true` if a DVD DMA has written new data into guest RAM since the
+    /// last call, and reset the flag to `false`.
+    ///
+    /// JavaScript must call this after every `hw_write_u32` and, when it returns
+    /// `true`, flush the JIT module cache so that any blocks whose code was
+    /// overwritten by the DMA are recompiled from the updated RAM contents on
+    /// the next execution.
+    pub fn take_dma_dirty(&mut self) -> bool {
+        let dirty = self.dma_dirty;
+        self.dma_dirty = false;
+        dirty
     }
 
     // ── Block compilation ─────────────────────────────────────────────────────
@@ -1029,6 +1049,10 @@ impl WasmEmulator {
                     if src_end <= disc.len() && dma_dest + dma_len <= self.ram.len() {
                         self.ram[dma_dest..dma_dest + dma_len]
                             .copy_from_slice(&disc[disc_offset..src_end]);
+                        // New code may have been written into guest RAM; signal JS
+                        // to flush the JIT module cache so stale compiled blocks
+                        // are not re-used for addresses overwritten by this DMA.
+                        self.dma_dirty = true;
                     } else {
                         console_log!(
                             "[lazuli] DI: DVD Read out of bounds \
