@@ -1394,7 +1394,12 @@ impl Decoder {
                 return true;
             }
             Opcode::Illegal => {
-                b.push(IrInst::RaiseException(0x0700));
+                // Treat illegal/reserved encodings as a graceful skip, matching
+                // the catch-all below.  Raising a Program Exception here causes
+                // an infinite loop when the PC is forced into uninitialized
+                // memory (e.g. zeroed exception vectors) because the handler
+                // vector itself would also decode as Illegal and re-raise 0x0700.
+                b.push(IrInst::ReturnStatic(pc + 4));
                 return true;
             }
 
