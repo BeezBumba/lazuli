@@ -1355,18 +1355,6 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `⚠ CPU dump: LR=${hexU32(lrVal)} CTR=${hexU32(ctrVal)} MSR=${hexU32(msrVal)} ` +
           `SRR0=${hexU32(srr0Val)} DEC=${decVal | 0} EE=${eeEnabled}`,
         );
-
-        // Break the EE=0 / DEC<0 deadlock: on real hardware the decrementer
-        // exception is masked while EE=0, but if the guest is permanently stuck
-        // with EE=0 and DEC already expired, normal interrupt delivery can never
-        // fire.  Force-deliver the exception now so the OS decrementer handler
-        // gets a chance to run and reset DEC to a positive value.
-        if (!eeEnabled && (decVal | 0) < 0) {
-          console.info(
-            `[lazuli] EE=0 and DEC<0 deadlock detected — force-delivering decrementer exception`,
-          );
-          emu.force_decrementer_exception();
-        }
       }
 
       // Periodic re-dump every additional STUCK_PC_THRESHOLD runs while stuck,
@@ -1383,14 +1371,6 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `nextPc=${hexU32(lastNextPc)} LR=${hexU32(lrVal)} MSR=${hexU32(msrVal)} (EE=${eeEnabled}) ` +
           `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
         );
-
-        // Re-attempt the force if the exception handler re-entered the deadlock.
-        if (!eeEnabled && (decVal | 0) < 0) {
-          console.info(
-            `[lazuli] EE=0 and DEC<0 still — force-delivering decrementer exception again`,
-          );
-          emu.force_decrementer_exception();
-        }
       }
     } else {
       if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD) {
