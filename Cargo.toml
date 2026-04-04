@@ -10,7 +10,6 @@ members = [
     "crates/jitclif",
     "crates/lazuli",
     "crates/ppcjit",
-    "crates/ppcint",
     "crates/ppcwasm",
     "crates/ppcir",
     "crates/dspint",
@@ -23,7 +22,6 @@ members = [
     "crates/cubetool",
     "crates/ipl-hle",
     "crates/app",
-    "crates/ppcint",
     "crates/lazuli-web",
 ]
 default-members = [
@@ -37,7 +35,6 @@ default-members = [
     "crates/jitclif",
     "crates/lazuli",
     "crates/ppcjit",
-    "crates/ppcint",
     "crates/ppcwasm",
     "crates/ppcir",
     "crates/dspint",
@@ -141,7 +138,6 @@ jitalloc = { path = "./crates/jitalloc" }
 jitclif = { path = "./crates/jitclif" }
 lazuli = { path = "./crates/lazuli" }
 ppcjit = { path = "./crates/ppcjit" }
-ppcint = { path = "./crates/ppcint" }
 dspint = { path = "./crates/dspint" }
 vtxjit = { path = "./crates/vtxjit" }
 cores = { path = "./crates/cores" }
