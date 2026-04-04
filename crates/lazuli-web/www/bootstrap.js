@@ -258,6 +258,14 @@ function parseAndLoadIso(arrayBuffer, emu) {
     throw new Error(`Invalid DOL offset 0x${dolOffset.toString(16)} in ISO header`);
   }
 
+  // ── Step 1: copy the ISO disk header (first 0x440 bytes) into guest RAM
+  // at 0x80000000.  This replicates what load_ipl_hle does for the fields
+  // that come straight from the disc: game code, maker code, disk ID,
+  // version, audio_streaming, stream_buffer_size, and the DVD magic word
+  // (0xC2339F3D at 0x1C).  load_bytes() masks the address with 0x01FFFFFF
+  // so 0x80000000 maps to physical offset 0.
+  emu.load_bytes(0x80000000, bytes.slice(0, 0x440));
+
   // Parse the DOL and load sections into emulator RAM.
   // load_bytes() on the Rust side masks the target address with 0x01FFFFFF
   // to convert GameCube virtual addresses (0x8xxxxxxx) to physical offsets.
@@ -269,6 +277,32 @@ function parseAndLoadIso(arrayBuffer, emu) {
   // Zero the BSS region
   if (dol.bssSize > 0) {
     emu.load_bytes(dol.bssTarget, new Uint8Array(dol.bssSize));
+  }
+
+  // ── Step 2: write synthetic Dolphin OS globals, mirroring load_ipl_hle().
+  // The disc-header copy above already covers 0x00–0x1F (game code, magic,
+  // etc.).  Here we fill in the fields the real IPL ROM synthesises itself.
+  {
+    const osGlobBuf = new ArrayBuffer(0x100);
+    const osGlobView = new DataView(osGlobBuf);
+    // Offsets are relative to 0x80000000 (physical 0x00000000).
+    osGlobView.setUint32(0x20, 0x0D15EA5E, false); // Boot kind (normal)
+    osGlobView.setUint32(0x24, 0x00000001, false); // IPL version
+    osGlobView.setUint32(0x28, 0x01800000, false); // Physical RAM size (24 MiB)
+    osGlobView.setUint32(0x2C, 0x10000005, false); // Console type (GC retail)
+    osGlobView.setUint32(0x30, 0x8042E260, false); // Arena Low
+    osGlobView.setUint32(0x34, 0x817FE8C0, false); // Arena High
+    osGlobView.setUint32(0x38, 0x817FE8C0, false); // FST location
+    osGlobView.setUint32(0x3C, 0x00000024, false); // FST max size
+    osGlobView.setUint32(0xCC, 0x00000000, false); // TV mode (NTSC)
+    osGlobView.setUint32(0xD0, 0x01000000, false); // ARAM size
+    osGlobView.setUint32(0xF8, 0x09A7EC80, false); // Bus clock speed
+    osGlobView.setUint32(0xFC, 0x1CF7C580, false); // CPU clock speed
+    // Load as a single contiguous write; individual fields that were already
+    // populated by the disc-header copy (0x00–0x1F) are overwritten only for
+    // the synthetic offsets listed above, so the game code / magic / etc. set
+    // in Step 1 are preserved (they live before 0x20).
+    emu.load_bytes(0x80000020, new Uint8Array(osGlobBuf, 0x20, 0xE0));
   }
 
   // Point the CPU at the entry point
