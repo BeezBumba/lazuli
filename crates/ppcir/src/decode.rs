@@ -1216,8 +1216,7 @@ impl Decoder {
                 let lb = self.cr_get_bit(b, bb);
                 let lv = b.alloc_local(IrTy::I32);
                 b.push(IrInst::LocalGet(la)); b.push(IrInst::LocalGet(lb)); b.push(IrInst::I32Xor);
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // NOT
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); // mask to bit
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // XNOR: NOT(a XOR b)
                 b.push(IrInst::LocalSet(lv));
                 self.cr_set_bit(b, bd, lv);
             }
@@ -1238,7 +1237,6 @@ impl Decoder {
                 let lv = b.alloc_local(IrTy::I32);
                 b.push(IrInst::LocalGet(lb)); b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // ~bb (as 0/1)
                 b.push(IrInst::LocalGet(la)); b.push(IrInst::I32Or);
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); // mask to bit
                 b.push(IrInst::LocalSet(lv));
                 self.cr_set_bit(b, bd, lv);
             }
@@ -1249,8 +1247,7 @@ impl Decoder {
                 let lb = self.cr_get_bit(b, bb);
                 let lv = b.alloc_local(IrTy::I32);
                 b.push(IrInst::LocalGet(la)); b.push(IrInst::LocalGet(lb)); b.push(IrInst::I32Or);
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // NOT
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); // mask to bit
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // NOR: NOT(a OR b)
                 b.push(IrInst::LocalSet(lv));
                 self.cr_set_bit(b, bd, lv);
             }
@@ -1281,8 +1278,7 @@ impl Decoder {
                 let lb = self.cr_get_bit(b, bb);
                 let lv = b.alloc_local(IrTy::I32);
                 b.push(IrInst::LocalGet(la)); b.push(IrInst::LocalGet(lb)); b.push(IrInst::I32And);
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // NOT
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); // mask to bit
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // NAND: NOT(a AND b)
                 b.push(IrInst::LocalSet(lv));
                 self.cr_set_bit(b, bd, lv);
             }
