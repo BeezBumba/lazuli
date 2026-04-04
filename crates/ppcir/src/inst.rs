@@ -76,10 +76,10 @@ pub enum IrInst {
     // ─── Integer bitwise / shift ──────────────────────────────────────────────
     I32And, I32Or, I32Xor,
     I32Not,              // (i32) → (i32) — bitwise NOT
-    I32Shl, I32ShrU, I32ShrS, I32Rotl, I32Clz,
+    I32Shl, I32ShrU, I32ShrS, I32Rotl, I32Clz, I32Ctz,
 
     // ─── Integer comparisons → i32 0/1 ───────────────────────────────────────
-    I32Eq, I32LtS, I32LtU, I32GtS, I32GtU, I32Eqz,
+    I32Eq, I32Ne, I32LtS, I32LtU, I32GtS, I32GtU, I32Eqz,
 
     // ─── Integer sign-extension ───────────────────────────────────────────────
     I32Extend8S, I32Extend16S,
@@ -106,6 +106,18 @@ pub enum IrInst {
     F64PromoteSingleBits,
     /// `(f64) → (i32)` — demote f64 to f32, reinterpret as u32 (`stfs`).
     I32DemoteToSingleBits,
+
+    // ─── 64-bit helpers (for high-word multiply, no i64 locals needed) ───────
+    /// `(i32) → (i64)` — sign-extend i32 to i64.
+    I64ExtendI32S,
+    /// `(i32) → (i64)` — zero-extend i32 to i64.
+    I64ExtendI32U,
+    /// `(i64, i64) → (i64)` — 64-bit multiply.
+    I64Mul,
+    /// `(i64) → (i32)` — arithmetic shift right by 32, then wrap to i32.
+    I64ShrS32,
+    /// `(i64) → (i32)` — logical shift right by 32, then wrap to i32.
+    I64ShrU32,
 
     // ─── Memory (via hook calls) ──────────────────────────────────────────────
     ReadU8, ReadU16, ReadU32, ReadF64,
