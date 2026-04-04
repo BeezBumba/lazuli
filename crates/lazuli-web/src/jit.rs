@@ -225,6 +225,13 @@ impl WasmEmulator {
                     | gekko::disasm::Opcode::Bclr
                     | gekko::disasm::Opcode::Bcctr
                     | gekko::disasm::Opcode::Rfi
+                    // Sc raises an exception and terminates the block in the
+                    // IR decoder; stop fetching here to avoid over-fetching.
+                    | gekko::disasm::Opcode::Sc
+                    // Mtmsr writes the MSR and terminates the block in the IR
+                    // decoder so the host interrupt-check loop sees the new
+                    // MSR value before any further instructions execute.
+                    | gekko::disasm::Opcode::Mtmsr
             );
             out.push((pc, ins));
             if is_terminal {

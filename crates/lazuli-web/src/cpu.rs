@@ -231,6 +231,39 @@ impl WasmEmulator {
         self.raise_exception_count as u32
     }
 
+    /// Deliver a PowerPC exception by raw exception-vector offset.
+    ///
+    /// Called by JavaScript after a compiled WASM block's `raise_exception(kind)`
+    /// hook fires and the block's CPU state has been synced back via
+    /// [`set_cpu_bytes`].  Maps the numeric `kind` (which matches the
+    /// [`gekko::Exception`] discriminant, e.g. `0x0C00` for Syscall) to the
+    /// corresponding exception and calls [`gekko::Cpu::raise_exception`] to
+    /// update `SRR0`, `SRR1`, `MSR`, and `PC` exactly as real hardware would.
+    ///
+    /// Returns `true` if the kind was recognised and the exception was
+    /// delivered; `false` if the kind is unknown (no CPU state change).
+    pub fn deliver_exception(&mut self, kind: i32) -> bool {
+        use gekko::Exception;
+        let exc = match kind as u32 {
+            0x0100 => Exception::Reset,
+            0x0200 => Exception::MachineCheck,
+            0x0300 => Exception::DSI,
+            0x0400 => Exception::ISI,
+            0x0500 => Exception::Interrupt,
+            0x0600 => Exception::Alignment,
+            0x0700 => Exception::Program,
+            0x0800 => Exception::FloatUnavailable,
+            0x0900 => Exception::Decrementer,
+            0x0C00 => Exception::Syscall,
+            0x0D00 => Exception::Trace,
+            0x0F00 => Exception::PerformanceMonitor,
+            0x1300 => Exception::Breakpoint,
+            _ => return false,
+        };
+        self.cpu.raise_exception(exc);
+        true
+    }
+
     /// Return a [`js_sys::Array`] containing the guest PC of every block
     /// currently held in the compiled-block cache (module cache).
     pub fn get_compiled_block_pcs(&self) -> js_sys::Array {

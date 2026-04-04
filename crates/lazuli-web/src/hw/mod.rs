@@ -4,7 +4,7 @@
 //! This module exposes `hw_read_u32`, `hw_write_u32`, `hw_read_u16`,
 //! `hw_write_u16`, and `assert_vi_interrupt` on [`WasmEmulator`].  These are
 //! called from JavaScript when the guest accesses an MMIO address (prefix
-//! `0xCC`), before the `PHYS_MASK` is applied.
+//! `0xCC` cached or `0xCD` uncached), before the `PHYS_MASK` is applied.
 
 pub(crate) mod di;
 pub(crate) mod dsp;
@@ -20,6 +20,12 @@ use wasm_bindgen::prelude::*;
 
 use crate::WasmEmulator;
 
+/// Bit that distinguishes the uncached (`0xCDxxxxxx`) MMIO mirror from the
+/// cached (`0xCCxxxxxx`) mirror.  Both aliases map to the same physical
+/// registers; clearing this bit normalises uncached addresses to the cached
+/// base so a single set of `*_BASE` constants covers both variants.
+const UNCACHED_MIRROR_BIT: u32 = 0x0100_0000;
+
 macro_rules! console_log {
     ($($t:tt)*) => {
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!($($t)*)))
@@ -31,10 +37,16 @@ impl WasmEmulator {
     /// Read a 32-bit value from a GameCube hardware register.
     ///
     /// Called by the JavaScript `read_u32` hook when the guest address has
-    /// the prefix `0xCC` (GameCube memory-mapped I/O space), **before** the
-    /// `PHYS_MASK` is applied.  This is necessary because applying
-    /// `addr & 0x01FFFFFF` to `0xCC006008` yields `0x00006008`, which would
-    /// silently alias into guest RAM instead of the DVD Interface registers.
+    /// the prefix `0xCC` or `0xCD` (GameCube memory-mapped I/O space),
+    /// **before** the `PHYS_MASK` is applied.  This is necessary because
+    /// applying `addr & 0x01FFFFFF` to `0xCC006008` yields `0x00006008`,
+    /// which would silently alias into guest RAM instead of the DVD Interface
+    /// registers.
+    ///
+    /// The GameCube exposes the same hardware registers at both:
+    ///   - `0xCCxxxxxx` — cached I/O mirror (used by most SDK code)
+    ///   - `0xCDxxxxxx` — uncached I/O mirror (used by DMA paths)
+    /// Both aliases are normalised to the `0xCC` base before dispatching.
     ///
     /// Currently handles:
     /// - **Processor Interface** (`0xCC003000–0xCC00303F`): INTSR, INTMSK,
@@ -42,6 +54,9 @@ impl WasmEmulator {
     /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register read
     /// - All other hardware registers: returns `0`
     pub fn hw_read_u32(&self, addr: u32) -> u32 {
+        // Normalise uncached (0xCDxxxxxx) addresses to the cached (0xCCxxxxxx)
+        // mirror so a single set of base-address constants covers both aliases.
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
             let offset = addr - PI_BASE;
             return match offset {
@@ -62,7 +77,8 @@ impl WasmEmulator {
     /// Write a 32-bit value to a GameCube hardware register.
     ///
     /// Called by the JavaScript `write_u32` hook when the guest address has
-    /// the prefix `0xCC`, before `PHYS_MASK` is applied.
+    /// the prefix `0xCC` or `0xCD`, before `PHYS_MASK` is applied.
+    /// Both cached (`0xCC`) and uncached (`0xCD`) mirrors are accepted.
     ///
     /// Writing `DICR` (offset `0x1C`) with bit 0 set triggers an immediate
     /// disc DMA: the stored [`DiState`] command registers are decoded and the
@@ -74,6 +90,7 @@ impl WasmEmulator {
     /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register write + DMA
     /// - All other hardware registers: silently ignored
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
             let offset = addr - PI_BASE;
             match offset {
@@ -97,7 +114,7 @@ impl WasmEmulator {
     /// Read a 16-bit value from a GameCube hardware register.
     ///
     /// Called by the JavaScript `read_u16` hook when the guest address has the
-    /// prefix `0xCC`.  Currently handles:
+    /// prefix `0xCC` or `0xCD`.  Currently handles:
     ///
     /// - **DSP Interface** (`0xCC005000–0xCC00500F`): DSP→CPU mailbox and
     ///   control register.
@@ -107,6 +124,7 @@ impl WasmEmulator {
     ///   big-endian half of the underlying 32-bit register value.
     /// - All other hardware addresses: returns `0`
     pub fn hw_read_u16(&self, addr: u32) -> u16 {
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             return self.dsp.read_u16(addr - DSP_BASE);
         }
@@ -128,13 +146,14 @@ impl WasmEmulator {
     /// Write a 16-bit value to a GameCube hardware register.
     ///
     /// Called by the JavaScript `write_u16` hook when the guest address has the
-    /// prefix `0xCC`.  Currently handles:
+    /// prefix `0xCC` or `0xCD`.  Currently handles:
     ///
     /// - **DSP Interface** (`0xCC005000–0xCC00500F`): CPU→DSP mailbox.  Values
     ///   written to `0xCC005004`/`0xCC005006` are echoed to the DSP→CPU
     ///   mailbox so the OS's boot-ACK polling loop exits immediately.
     /// - All other hardware addresses: silently ignored
     pub fn hw_write_u16(&mut self, addr: u32, val: u16) {
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             self.dsp.write_u16(addr - DSP_BASE, val);
         }
