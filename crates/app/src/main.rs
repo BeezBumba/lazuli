@@ -136,7 +136,6 @@ impl App {
                     cache_path: Some(jit_cache_path),
                 },
             })), 
-           // cpu: Box::new(ppcint::Core::new()),
         };
 
         let input = GilrsModule::new();
