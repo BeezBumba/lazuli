@@ -1,6 +1,6 @@
 //! Buffer allocator.
 
-use std::{cell::RefCell, rc::Rc};
+use flume::{Receiver, Sender};
 
 #[derive(Clone)]
 struct BufferPair {
@@ -9,7 +9,7 @@ struct BufferPair {
 }
 
 impl BufferPair {
-    fn map(self, f: impl FnOnce(BufferPair) + 'static) {
+    fn map(self, f: impl FnOnce(BufferPair) + Send + 'static) {
         let buffer = match &self.secondary {
             Some(secondary) => secondary.clone(),
             None => self.primary.clone(),
@@ -47,11 +47,8 @@ pub struct Allocator {
     usages: wgpu::BufferUsages,
     available: Vec<Vec<BufferPair>>,
     allocated: Vec<BufferPair>,
-    // Buffers returned by map_async callbacks (fired during device.poll() on this
-    // thread).  `Rc<RefCell<...>>` is safe here because all borrows are
-    // non-overlapping: `recall` drains the vec inside a single synchronous scope,
-    // and the map callbacks only push into it when invoked by device.poll().
-    pending: Rc<RefCell<Vec<BufferPair>>>,
+    sender: Sender<BufferPair>,
+    receiver: Receiver<BufferPair>,
 }
 
 fn bucket_for(size: u64) -> usize {
@@ -60,6 +57,7 @@ fn bucket_for(size: u64) -> usize {
 
 impl Allocator {
     pub fn new(device: &wgpu::Device, usages: wgpu::BufferUsages) -> Self {
+        let (sender, receiver) = flume::unbounded();
         Self {
             mappable_primary: device
                 .features()
@@ -67,17 +65,17 @@ impl Allocator {
             usages,
             available: Default::default(),
             allocated: Default::default(),
-            pending: Rc::new(RefCell::new(Vec::new())),
+            sender,
+            receiver,
         }
     }
 
     fn recall(&mut self) {
-        let mut pending = self.pending.borrow_mut();
-        if pending.is_empty() {
+        if self.receiver.is_empty() {
             return;
         }
 
-        for pair in pending.drain(..) {
+        while let Ok(pair) = self.receiver.try_recv() {
             let size = pair.primary.size();
             let bucket = bucket_for(size);
 
@@ -159,8 +157,8 @@ impl Allocator {
 
     pub fn free(&mut self) {
         for pair in self.allocated.drain(..) {
-            let pending = self.pending.clone();
-            pair.map(move |pair| pending.borrow_mut().push(pair));
+            let sender = self.sender.clone();
+            pair.map(move |pair| sender.send(pair).unwrap());
         }
     }
 }
