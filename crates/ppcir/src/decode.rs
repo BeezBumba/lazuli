@@ -925,6 +925,14 @@ impl Decoder {
                 b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
                 b.push(IrInst::LocalGet(ea)); b.push(IrInst::ReadU8); b.push(IrInst::StoreGpr(rd));
             }
+            Opcode::Lmw => {
+                let rd=ins.gpr_d() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                for i in rd..32 {
+                    let offset = d + 4 * (i - rd) as i32;
+                    self.push_ea_d(b, ra, offset);
+                    b.push(IrInst::ReadU32); b.push(IrInst::StoreGpr(i));
+                }
+            }
 
             // ── Integer stores ────────────────────────────────────────────────
             Opcode::Stw  => { let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; self.push_ea_d(b,ra,ins.field_offset() as i32); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32); }
@@ -974,6 +982,14 @@ impl Decoder {
                 b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add); b.push(IrInst::LocalSet(ea));
                 b.push(IrInst::LocalGet(ea)); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU8);
                 b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
+            Opcode::Stmw => {
+                let rs=ins.gpr_s() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32;
+                for i in rs..32 {
+                    let offset = d + 4 * (i - rs) as i32;
+                    self.push_ea_d(b, ra, offset);
+                    b.push(IrInst::LoadGpr(i)); b.push(IrInst::WriteU32);
+                }
             }
 
             // ── Float loads ───────────────────────────────────────────────────
