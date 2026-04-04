@@ -1646,8 +1646,14 @@ impl Decoder {
 
             // ── Unimplemented ─────────────────────────────────────────────────
             _ => {
+                // Record the unimplemented opcode name for diagnostics.
                 b.unimplemented_ops.push(format!("{:?}", ins.op));
-                b.push(IrInst::RaiseException(0));
+                // Skip the instruction: return PC+4 as the next PC and terminate
+                // the block here.  This avoids an infinite loop (the previous
+                // RaiseException(0) path returned 0 and left the guest PC
+                // unchanged, causing the same block to re-execute forever).
+                b.push(IrInst::ReturnStatic(pc + 4));
+                return true;
             }
         }
         false

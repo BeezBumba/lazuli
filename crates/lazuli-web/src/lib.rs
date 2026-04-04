@@ -179,6 +179,10 @@ pub(crate) fn phys_addr(vaddr: u32) -> usize {
 // ─── Panic hook ───────────────────────────────────────────────────────────────
 
 fn console_error_panic_hook_set() {
-    // Forward Rust panics to the browser console for easier debugging.
-    // Enabled when the `console_error_panic_hook` crate is available.
+    // Forward Rust panics to the browser console via `console.error(...)` so
+    // that panic messages are visible in DevTools instead of silently aborting.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("[lazuli] Rust panic: {info}");
+        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&msg));
+    }));
 }

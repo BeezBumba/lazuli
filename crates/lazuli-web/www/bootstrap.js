@@ -461,15 +461,21 @@ function getRamView(emu) {
  *
  * ## Address routing — hardware registers vs. guest RAM
  *
- * GameCube hardware-register addresses have the prefix `0xCC` (e.g. the DVD
- * Interface lives at `0xCC006000`).  These addresses must be intercepted
+ * GameCube hardware-register addresses have the prefix `0xCC` (cached I/O)
+ * or `0xCD` (uncached I/O).  For example the DVD Interface lives at
+ * `0xCC006000` / `0xCD006000`.  These addresses must be intercepted
  * **before** `PHYS_MASK` is applied, because `0xCC006000 & 0x01FFFFFF` equals
  * `0x00006000` — an address inside guest RAM — causing silent corruption.
  *
+ * Both cached (`0xCC`) and uncached (`0xCD`) mirrors are detected by checking
+ * `(addr >>> 24 & 0xFE) === 0xCC` (clears the cached/uncached bit).  The
+ * Rust hw dispatch functions perform the same normalisation internally.
+ *
  * For 32-bit reads/writes the Rust `hw_read_u32` / `hw_write_u32` exports are
  * called instead; they dispatch to the appropriate hardware module (currently
- * the DVD Interface).  Sub-32-bit accesses to hardware space return 0 / are
- * ignored since all GameCube MMIO registers are 32-bit wide.
+ * PI, DI, and DSP).  Sub-32-bit accesses to hardware space return 0 / are
+ * ignored for 8-bit widths since all GameCube MMIO registers are 16- or
+ * 32-bit wide.
  *
  * For all non-hardware addresses `PHYS_MASK` is applied as before, converting
  * `0x80xxxxxx` guest virtual addresses to 25-bit physical RAM offsets.
@@ -574,13 +580,13 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       addr = addr >>> 0;
       // Hardware-register space (0xCCxxxxxx): all GC MMIO is 32-bit wide;
       // sub-word reads to HW space are not meaningful, return 0.
-      if ((addr >>> 24) === 0xCC) return 0;
+      if ((addr >>> 24 & 0xFE) === 0xCC) return 0;
       addr &= PHYS_MASK;
       return addr < ram.length ? ram[addr] : 0;
     },
     read_u16(addr) {
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) {
+      if ((addr >>> 24 & 0xFE) === 0xCC) {
         // Route to Rust hw_read_u16 for hardware registers (e.g. DSP mailbox).
         if (emu) return emu.hw_read_u16(addr) & 0xFFFF;
         return 0;
@@ -594,7 +600,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // Route hardware-register reads to hw_read_u32 before masking so that
       // 0xCC006000 (DVD Interface) reaches the correct handler instead of
       // aliasing to RAM offset 0x00006000.
-      if ((addr >>> 24) === 0xCC) {
+      if ((addr >>> 24 & 0xFE) === 0xCC) {
         if (emu) return emu.hw_read_u32(addr) >>> 0;
         return 0;
       }
@@ -607,7 +613,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // Read a big-endian IEEE-754 double from guest address.
       // GC hardware registers do not hold IEEE doubles — return 0.0.
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) return 0.0;
+      if ((addr >>> 24 & 0xFE) === 0xCC) return 0.0;
       addr &= PHYS_MASK;
       if (addr + 7 >= ram.length) return 0.0;
       const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
@@ -615,13 +621,13 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     write_u8(addr, val) {
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) return; // HW registers are 32-bit only
+      if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are 32-bit only
       addr &= PHYS_MASK;
       if (addr < ram.length) ram[addr] = val & 0xff;
     },
     write_u16(addr, val) {
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) {
+      if ((addr >>> 24 & 0xFE) === 0xCC) {
         // Route to Rust hw_write_u16 for hardware registers (e.g. DSP mailbox).
         if (emu) emu.hw_write_u16(addr, val & 0xFFFF);
         return;
@@ -638,7 +644,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // Route hardware-register writes to hw_write_u32 before masking.
       // Writing 0xCC006000-0xCC006027 drives the DVD Interface; bit 0 of
       // DICR (0x1C) triggers a DMA from the stored disc image into guest RAM.
-      if ((addr >>> 24) === 0xCC) {
+      if ((addr >>> 24 & 0xFE) === 0xCC) {
         if (emu) {
           emu.hw_write_u32(addr, val);
           // A DVD Read DMA may have just overwritten guest code in RAM.
@@ -659,7 +665,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     write_f64(addr, val) {
       // Write a big-endian IEEE-754 double to guest address.
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) return; // HW registers are not doubles
+      if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are not doubles
       addr &= PHYS_MASK;
       if (addr + 7 >= ram.length) return;
       const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
@@ -793,6 +799,10 @@ function executeOneBlockSync(emu, ram, log) {
   const { mem: regsMem, view: regsView } = getRegsMem(emu);
   regsView.set(emu.get_cpu_bytes(), 0);
 
+  // Reset exception tracking so we can detect whether THIS block raises an
+  // exception (vs. a stale value left by a previous block).
+  lastRaisedExceptionKind = -1;
+
   // ── Step 3: instantiate with hook closures that use the zero-copy RAM ────
   let instance;
   try {
@@ -828,31 +838,36 @@ function executeOneBlockSync(emu, ram, log) {
   // Record the raw nextPc for stuck-PC diagnostics in the game loop.
   lastNextPc = nextPc >>> 0;
 
-  // nextPc == 0 means the block updated Cpu::pc itself (branch taken or
-  // raise_exception was emitted and returned 0).
-  const newPc = lastNextPc !== 0 ? lastNextPc : emu.get_pc();
-  if (lastNextPc === 0 && lastRaisedExceptionPc === pc) {
-    // Exception was raised; PC was not updated — log so it is visible.
-    console.debug(
-      `[lazuli] ${pcHex}: exception(${lastRaisedExceptionKind}) raised, nextPc=0, ` +
-      `PC stays at ${pcHex} (raised_exception_total=${raiseExceptionTotal})`,
-    );
-  }
+  // ── Step 6: advance the program counter ──────────────────────────────────
+  if (lastNextPc === 0 && lastRaisedExceptionKind >= 0) {
+    // An exception was raised by the WASM block (Sc, Illegal, etc.).
+    // The CPU state has been synced from WASM memory, including any StorePC
+    // writes that save the return address before the exception (e.g. `sc`
+    // saves pc+4 into CPU::pc before calling raise_exception).
+    // Deliver the exception: update SRR0, SRR1, MSR, and CPU::pc to the
+    // correct exception vector, exactly as real hardware does.
+    emu.deliver_exception(lastRaisedExceptionKind);
+    // CPU::pc is now the exception vector — no manual set_pc call needed.
+  } else {
+    // Normal branch path: either a static/dynamic target was returned, or
+    // BranchRegIf wrote CPU::pc directly into WASM memory (synced above).
+    const newPc = lastNextPc !== 0 ? lastNextPc : emu.get_pc();
 
-  // Detect branch-to-self via ReturnDynamic: non-zero nextPc that equals the
-  // block's own start address means a register branch (Bclr / Bcctr) jumped
-  // back to the same block — almost certainly LR or CTR contains this PC.
-  if (lastNextPc !== 0 && lastNextPc === pc) {
-    console.warn(
-      `[lazuli] ${pcHex}: branch-to-self via ReturnDynamic — ` +
-      `LR=${hexU32(emu.get_lr())} CTR=${hexU32(emu.get_ctr())} (block returned own PC as nextPc)`,
-    );
-  }
+    // Detect branch-to-self via ReturnDynamic: a non-zero nextPc equal to the
+    // block's own start address means LR or CTR was set to this PC.
+    if (lastNextPc !== 0 && lastNextPc === pc) {
+      console.warn(
+        `[lazuli] ${pcHex}: branch-to-self via ReturnDynamic — ` +
+        `LR=${hexU32(emu.get_lr())} CTR=${hexU32(emu.get_ctr())} (block returned own PC as nextPc)`,
+      );
+    }
 
-  emu.set_pc(newPc);
+    emu.set_pc(newPc);
+  }
 
   if (log) {
-    const newHex = "0x" + newPc.toString(16).toUpperCase().padStart(8, "0");
+    const curPc = emu.get_pc();
+    const newHex = "0x" + (curPc >>> 0).toString(16).toUpperCase().padStart(8, "0");
     log.push(`[${pcHex}] executed → next PC ${newHex} (rawNextPc=${hexU32(lastNextPc)})`);
   }
   return true;
