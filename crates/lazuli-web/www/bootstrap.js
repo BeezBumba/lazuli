@@ -1335,12 +1335,10 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     // The Rust `advance_decrementer` is level-sensitive: the exception fires
     // on the first call after a block enables EE if DEC < 0, and is
     // de-asserted immediately when the handler writes a non-negative DEC.
-    const blockMeta = blockMetaMap.get(blockPc);
-    const decTicks  = blockMeta
-      ? Math.max(1, Math.floor(blockMeta.cycles / 12))
-      : TICKS_PER_BLOCK_FALLBACK;
-    emu.add_cpu_cycles(blockMeta ? blockMeta.cycles : TICKS_PER_BLOCK_FALLBACK * 12);
-    emu.advance_decrementer(decTicks);
+    const blockMeta   = blockMetaMap.get(blockPc);
+    const blockCycles = blockMeta ? blockMeta.cycles : TICKS_PER_BLOCK_FALLBACK * 12;
+    emu.add_cpu_cycles(blockCycles);
+    emu.advance_decrementer(Math.max(1, Math.floor(blockCycles / 12)));
 
     // Stuck-PC detection: track how many consecutive blocks leave the PC
     // unchanged.  This catches both "branch to self" tight loops and the
