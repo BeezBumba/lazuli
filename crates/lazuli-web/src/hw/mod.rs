@@ -2,19 +2,41 @@
 //! register state structs.
 //!
 //! This module exposes `hw_read_u32`, `hw_write_u32`, `hw_read_u16`,
-//! `hw_write_u16`, and `assert_vi_interrupt` on [`WasmEmulator`].  These are
-//! called from JavaScript when the guest accesses an MMIO address (prefix
-//! `0xCC` cached or `0xCD` uncached), before the `PHYS_MASK` is applied.
+//! `hw_write_u16`, `hw_read_u8`, `hw_write_u8`, and `assert_vi_interrupt`
+//! on [`WasmEmulator`].  These are called from JavaScript when the guest
+//! accesses an MMIO address (prefix `0xCC` cached or `0xCD` uncached),
+//! before the `PHYS_MASK` is applied.
+//!
+//! ## Dispatch table
+//!
+//! | Base address  | Module | Description                    |
+//! |---------------|--------|--------------------------------|
+//! | `0xCC002000`  | `vi`   | Video Interface                |
+//! | `0xCC003000`  | `pi`   | Processor Interface            |
+//! | `0xCC005000`  | `dsp`  | DSP Interface / ARAM           |
+//! | `0xCC006000`  | `di`   | DVD Interface                  |
+//! | `0xCC006400`  | `si`   | Serial Interface (controllers) |
+//! | `0xCC006800`  | `exi`  | External Interface             |
+//! | `0xCC006C00`  | `ai`   | Audio Interface                |
 
+pub(crate) mod ai;
 pub(crate) mod di;
 pub(crate) mod dsp;
+pub(crate) mod exi;
 pub(crate) mod pi;
+pub(crate) mod si;
+pub(crate) mod vi;
 
+pub(crate) use ai::{AiState, AI_BASE, AI_SIZE};
 pub(crate) use di::{DiState, DI_BASE, DI_SIZE};
 pub(crate) use dsp::{DspState, DSP_BASE, DSP_SIZE};
+pub(crate) use exi::{ExiState, EXI_BASE, EXI_SIZE};
 pub(crate) use pi::{
-    PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_VI, PI_MEMSIZE_VAL, PI_SIZE,
+    PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_SI as PI_SI, PI_INT_VI, PI_MEMSIZE_VAL,
+    PI_SIZE,
 };
+pub(crate) use si::{SiState, SI_BASE, SI_SIZE};
+pub(crate) use vi::{ViState, VI_BASE, VI_SIZE};
 
 use wasm_bindgen::prelude::*;
 
@@ -43,34 +65,52 @@ impl WasmEmulator {
     /// which would silently alias into guest RAM instead of the DVD Interface
     /// registers.
     ///
-    /// The GameCube exposes the same hardware registers at both:
-    ///   - `0xCCxxxxxx` — cached I/O mirror (used by most SDK code)
-    ///   - `0xCDxxxxxx` — uncached I/O mirror (used by DMA paths)
-    /// Both aliases are normalised to the `0xCC` base before dispatching.
-    ///
-    /// Currently handles:
-    /// - **Processor Interface** (`0xCC003000–0xCC00303F`): INTSR, INTMSK,
-    ///   MEMSIZE, BUSCLK, CPUCLK
-    /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register read
-    /// - All other hardware registers: returns `0`
+    /// Both `0xCCxxxxxx` (cached) and `0xCDxxxxxx` (uncached) aliases are
+    /// normalised to the `0xCC` base before dispatching.
     pub fn hw_read_u32(&self, addr: u32) -> u32 {
         // Normalise uncached (0xCDxxxxxx) addresses to the cached (0xCCxxxxxx)
         // mirror so a single set of base-address constants covers both aliases.
         let addr = addr & !UNCACHED_MIRROR_BIT;
+
+        // ── Video Interface ────────────────────────────────────────────────
+        if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
+            return self.vi.read_u32(addr - VI_BASE);
+        }
+
+        // ── Processor Interface ────────────────────────────────────────────
         if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
             let offset = addr - PI_BASE;
             return match offset {
                 0x00 => self.pi_intsr,
                 0x04 => self.pi_intmsk,
+                // PI_FIFO_BASE / PI_FIFO_END / PI_FIFO_WPTR (0x0C/0x10/0x14): return 0
                 0x28 => PI_MEMSIZE_VAL,
                 0x2C => PI_BUSCLK_VAL,
                 0x30 => PI_CPUCLK_VAL,
                 _ => 0,
             };
         }
+
+        // ── DVD Interface ──────────────────────────────────────────────────
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             return self.di.read_reg(addr - DI_BASE);
         }
+
+        // ── Serial Interface ───────────────────────────────────────────────
+        if addr >= SI_BASE && addr < SI_BASE + SI_SIZE {
+            return self.si.read_u32(addr - SI_BASE);
+        }
+
+        // ── External Interface ─────────────────────────────────────────────
+        if addr >= EXI_BASE && addr < EXI_BASE + EXI_SIZE {
+            return self.exi.read_u32(addr - EXI_BASE);
+        }
+
+        // ── Audio Interface ────────────────────────────────────────────────
+        if addr >= AI_BASE && addr < AI_BASE + AI_SIZE {
+            return self.ai.read_u32(addr - AI_BASE);
+        }
+
         0
     }
 
@@ -78,24 +118,21 @@ impl WasmEmulator {
     ///
     /// Called by the JavaScript `write_u32` hook when the guest address has
     /// the prefix `0xCC` or `0xCD`, before `PHYS_MASK` is applied.
-    /// Both cached (`0xCC`) and uncached (`0xCD`) mirrors are accepted.
-    ///
-    /// Writing `DICR` (offset `0x1C`) with bit 0 set triggers an immediate
-    /// disc DMA: the stored [`DiState`] command registers are decoded and the
-    /// requested bytes are copied from `disc` into guest RAM.
-    ///
-    /// Currently handles:
-    /// - **Processor Interface** (`0xCC003000–0xCC00303F`): INTSR (W1C),
-    ///   INTMSK
-    /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register write + DMA
-    /// - All other hardware registers: silently ignored
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
         let addr = addr & !UNCACHED_MIRROR_BIT;
+
+        // ── Video Interface ────────────────────────────────────────────────
+        if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
+            self.vi.write_u32(addr - VI_BASE, val);
+            return;
+        }
+
+        // ── Processor Interface ────────────────────────────────────────────
         if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
             let offset = addr - PI_BASE;
             match offset {
-                // PI_INTSR: write-1-to-clear — guest OS writes back the bits
-                // it has handled to acknowledge the interrupt.
+                // PI_INTSR: write-1-to-clear — the OS writes back the bits it
+                // has handled to acknowledge the interrupt.
                 0x00 => self.pi_intsr &= !val,
                 // PI_INTMSK: interrupt enable mask (normal read/write).
                 0x04 => self.pi_intmsk = val,
@@ -103,61 +140,124 @@ impl WasmEmulator {
             }
             return;
         }
+
+        // ── DVD Interface ──────────────────────────────────────────────────
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             if self.di.write_reg(addr - DI_BASE, val) {
                 self.process_di_command();
             }
+            return;
         }
-        // All other hardware addresses are ignored (reads return 0 via hw_read_u32).
+
+        // ── Serial Interface ───────────────────────────────────────────────
+        if addr >= SI_BASE && addr < SI_BASE + SI_SIZE {
+            let triggered = self.si.write_u32(addr - SI_BASE, val, self.pad_buttons);
+            if triggered {
+                // Assert the SI interrupt (PI_INT_SI = bit 3 = 0x0008).
+                self.pi_intsr |= PI_SI;
+                self.maybe_deliver_external_interrupt();
+            }
+            return;
+        }
+
+        // ── External Interface ─────────────────────────────────────────────
+        if addr >= EXI_BASE && addr < EXI_BASE + EXI_SIZE {
+            self.exi.write_u32(addr - EXI_BASE, val);
+            return;
+        }
+
+        // ── Audio Interface ────────────────────────────────────────────────
+        if addr >= AI_BASE && addr < AI_BASE + AI_SIZE {
+            self.ai.write_u32(addr - AI_BASE, val);
+            return;
+        }
     }
 
     /// Read a 16-bit value from a GameCube hardware register.
     ///
-    /// Called by the JavaScript `read_u16` hook when the guest address has the
-    /// prefix `0xCC` or `0xCD`.  Currently handles:
-    ///
-    /// - **DSP Interface** (`0xCC005000–0xCC00500F`): DSP→CPU mailbox and
-    ///   control register.
-    /// - **DVD Interface** (`0xCC006000–0xCC006027`): 16-bit half of any 32-bit
-    ///   DI register.  The guest OS occasionally reads DISTATUS and other DI
-    ///   registers with `lhz` (halfword load), so we return the correct
-    ///   big-endian half of the underlying 32-bit register value.
-    /// - All other hardware addresses: returns `0`
+    /// Called by the JavaScript `read_u16` hook when the guest address has
+    /// the prefix `0xCC` or `0xCD`.
     pub fn hw_read_u16(&self, addr: u32) -> u16 {
         let addr = addr & !UNCACHED_MIRROR_BIT;
+
+        // ── Video Interface (16-bit registers VTR, DCR, VCOUNT, HCOUNT, HSR, VICLK) ──
+        if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
+            return self.vi.read_u16(addr - VI_BASE);
+        }
+
+        // ── DSP Interface ──────────────────────────────────────────────────
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             return self.dsp.read_u16(addr - DSP_BASE);
         }
+
+        // ── DVD Interface — 16-bit access to 32-bit DI register ───────────
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             let offset = addr - DI_BASE;
-            // DI registers are 32-bit; align to the containing 32-bit word
-            // and return the correct big-endian halfword.
-            let word_offset = offset & !3;
-            let word = self.di.read_reg(word_offset);
+            let word = self.di.read_reg(offset & !3);
             return if (offset & 2) == 0 {
-                (word >> 16) as u16  // upper (most-significant) halfword
+                (word >> 16) as u16
             } else {
-                word as u16          // lower (least-significant) halfword
+                word as u16
             };
         }
+
+        // ── Serial Interface — 16-bit access to 32-bit SI register ────────
+        if addr >= SI_BASE && addr < SI_BASE + SI_SIZE {
+            let word = self.si.read_u32(addr - SI_BASE & !3);
+            let offset = addr - SI_BASE;
+            return if (offset & 2) == 0 { (word >> 16) as u16 } else { word as u16 };
+        }
+
         0
     }
 
     /// Write a 16-bit value to a GameCube hardware register.
     ///
-    /// Called by the JavaScript `write_u16` hook when the guest address has the
-    /// prefix `0xCC` or `0xCD`.  Currently handles:
-    ///
-    /// - **DSP Interface** (`0xCC005000–0xCC00500F`): CPU→DSP mailbox.  Values
-    ///   written to `0xCC005004`/`0xCC005006` are echoed to the DSP→CPU
-    ///   mailbox so the OS's boot-ACK polling loop exits immediately.
-    /// - All other hardware addresses: silently ignored
+    /// Called by the JavaScript `write_u16` hook when the guest address has
+    /// the prefix `0xCC` or `0xCD`.
     pub fn hw_write_u16(&mut self, addr: u32, val: u16) {
         let addr = addr & !UNCACHED_MIRROR_BIT;
+
+        // ── Video Interface ────────────────────────────────────────────────
+        if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
+            self.vi.write_u16(addr - VI_BASE, val);
+            return;
+        }
+
+        // ── DSP Interface ──────────────────────────────────────────────────
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             self.dsp.write_u16(addr - DSP_BASE, val);
         }
-        // All other 16-bit hardware writes are silently ignored.
+    }
+
+    /// Read an 8-bit value from a GameCube hardware register.
+    ///
+    /// Most MMIO registers are 16- or 32-bit wide; 8-bit reads are unusual
+    /// but the OS sometimes uses `lbz` to check single-byte status fields.
+    /// Returns the appropriate byte from the containing 32-bit register.
+    pub fn hw_read_u8(&self, addr: u32) -> u8 {
+        let addr_n = addr & !UNCACHED_MIRROR_BIT;
+        // Align to the containing 32-bit word, preserving the high-address bits
+        // needed for MMIO dispatch (0xCCxxxxxx or 0xCDxxxxxx prefix).
+        let aligned = (addr_n & !3) | (addr & 0xFF00_0000);
+        let word = self.hw_read_u32(aligned);
+        // Extract the correct byte in big-endian order (byte 0 = MSB of word).
+        let byte_lane = addr_n & 3;
+        (word >> (24 - byte_lane * 8)) as u8
+    }
+
+    /// Write an 8-bit value to a GameCube hardware register.
+    ///
+    /// Reads the containing 32-bit register, merges the byte, and writes back.
+    pub fn hw_write_u8(&mut self, addr: u32, val: u8) {
+        let addr_n = addr & !UNCACHED_MIRROR_BIT;
+        let aligned = (addr_n & !3) | (addr & 0xFF00_0000);
+        let byte_lane = addr_n & 3;
+        let shift = 24 - byte_lane * 8;
+        let mask = 0xFFu32 << shift;
+        let current = self.hw_read_u32(aligned);
+        let merged = (current & !mask) | ((val as u32) << shift);
+        self.hw_write_u32(aligned, merged);
     }
 
     /// Assert a Video Interface (VI) vertical-retrace interrupt.
@@ -168,26 +268,30 @@ impl WasmEmulator {
     /// the OS has unmasked the VI interrupt in `PI_INTMSK`, delivers an
     /// `Exception::Interrupt` (vector `0x00000500`) to the CPU.
     pub fn assert_vi_interrupt(&mut self) {
+        // Advance the VI vertical counter by one field (called each RAF frame).
+        self.vi.advance_vcount();
+
         // Set the VI pending bit in PI_INTSR.
         self.pi_intsr |= PI_INT_VI;
 
         // Deliver the external interrupt immediately if EE=1 and the OS has
         // unmasked the VI interrupt in PI_INTMSK.  Do not pre-clear PI_INTSR:
         // the ISR must be able to read the bit to know which interrupt fired.
-        let ee = self.cpu.supervisor.config.msr.interrupts();
-        let vi_enabled = (self.pi_intmsk & PI_INT_VI) != 0;
-        if ee && vi_enabled {
-            self.cpu.raise_exception(gekko::Exception::Interrupt);
-        }
+        self.maybe_deliver_external_interrupt();
+    }
+
+    /// Physical RAM address of the External Frame Buffer as programmed by the
+    /// game into the VI TFBL register.
+    ///
+    /// Returns `0` if the game has not yet configured the VI (e.g. during
+    /// early boot).  JavaScript falls back to heuristic XFB detection when
+    /// this returns `0`.
+    pub fn vi_xfb_addr(&self) -> u32 {
+        self.vi.xfb_addr()
     }
 
     /// Return `true` if a DVD DMA has written new data into guest RAM since the
     /// last call, and reset the flag to `false`.
-    ///
-    /// JavaScript must call this after every `hw_write_u32` and, when it returns
-    /// `true`, invalidate any JIT modules whose code may have been overwritten.
-    /// Use [`last_dma_addr`] and [`last_dma_len`] to perform selective
-    /// per-address invalidation rather than flushing the entire cache.
     pub fn take_dma_dirty(&mut self) -> bool {
         let dirty = self.dma_dirty;
         self.dma_dirty = false;
@@ -196,18 +300,11 @@ impl WasmEmulator {
 
     /// Physical start address (in emulator RAM) of the most recent successful
     /// DVD DMA transfer.
-    ///
-    /// Valid only immediately after [`take_dma_dirty`] returns `true`.
-    /// JavaScript compares this against `(pc & PHYS_MASK)` for each cached
-    /// module to determine which blocks were overwritten by the DMA.
     pub fn last_dma_addr(&self) -> u32 {
         self.last_dma_addr
     }
 
     /// Byte length of the most recent successful DVD DMA transfer.
-    ///
-    /// Together with [`last_dma_addr`] this defines the half-open byte interval
-    /// `[last_dma_addr, last_dma_addr + last_dma_len)` that was overwritten.
     pub fn last_dma_len(&self) -> u32 {
         self.last_dma_len
     }
@@ -216,6 +313,18 @@ impl WasmEmulator {
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
 impl WasmEmulator {
+    /// Deliver an external interrupt to the CPU if EE=1 and any enabled
+    /// interrupt is pending in PI_INTSR & PI_INTMSK.
+    ///
+    /// Called after setting any PI_INTSR bit (VI, SI, AI, EXI, DI, …) so that
+    /// the interrupt reaches the CPU as soon as the OS re-enables EE.
+    pub(crate) fn maybe_deliver_external_interrupt(&mut self) {
+        let pending_and_enabled = self.pi_intsr & self.pi_intmsk;
+        if pending_and_enabled != 0 && self.cpu.supervisor.config.msr.interrupts() {
+            self.cpu.raise_exception(gekko::Exception::Interrupt);
+        }
+    }
+
     /// Process a DVD Interface DMA command (called when DICR bit 0 is written 1).
     ///
     /// Decodes the command in `DICMDBUF0` bits 31–24 and acts on it:

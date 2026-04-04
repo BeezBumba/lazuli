@@ -57,6 +57,11 @@ impl WasmBlockCache {
         self.modules.remove(&pc);
     }
 
+    /// Evict all cached modules.  Called after loading a savestate.
+    pub(crate) fn clear(&mut self) {
+        self.modules.clear();
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.modules.len()
     }

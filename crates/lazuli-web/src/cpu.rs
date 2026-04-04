@@ -379,6 +379,205 @@ impl WasmEmulator {
         }
     }
 
+    /// Serialize the complete emulator state to a byte array for savestate support.
+    ///
+    /// The returned [`js_sys::Uint8Array`] can be saved to `localStorage` or
+    /// downloaded as a file, then passed back to [`load_state`] to restore.
+    ///
+    /// ## Format (little-endian binary)
+    ///
+    /// ```text
+    ///   [4]  magic     = b"LAZU"
+    ///   [4]  version   = 2
+    ///   [4]  cpu_size  = size_of::<gekko::Cpu>()
+    ///   [N]  cpu       = raw bytes of gekko::Cpu
+    ///   [4]  ram_size  = self.ram.len()
+    ///   [M]  ram       = self.ram
+    ///   [4]  pi_intsr
+    ///   [4]  pi_intmsk
+    ///   [4]  pad_buttons
+    ///   [4]  flags     = decrementer_pending as u32
+    ///   [128] vi_regs  = 32 × u32 (raw VI register file)
+    ///   [12] si_out    = 3 × u32 SI output buffers 0–2
+    ///   [4]  si_out3   = SI output buffer 3
+    ///   [16] si_in_hi  = 4 × u32 SI input buffer high words
+    ///   [16] si_in_lo  = 4 × u32 SI input buffer low words
+    ///   [4]  si_poll
+    ///   [4]  si_comm_ctrl
+    ///   [4]  si_status
+    ///   [4]  ai_control
+    ///   [4]  ai_volume
+    ///   [4]  ai_sample_count
+    ///   [4]  ai_interrupt_sample
+    /// ```
+    pub fn save_state(&self) -> js_sys::Uint8Array {
+        let cpu_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&self.cpu as *const gekko::Cpu).cast::<u8>(),
+                size_of::<gekko::Cpu>(),
+            )
+        };
+
+        // Pre-calculate buffer size to avoid repeated reallocations.
+        let total = 4 + 4              // magic + version
+            + 4 + cpu_bytes.len()      // cpu_size + cpu
+            + 4 + self.ram.len()       // ram_size + ram
+            + 4 * 4                    // pi_intsr, pi_intmsk, pad_buttons, flags
+            + 128                      // VI regs (32 × u32)
+            + 4 * 4                    // SI out_buf (4 × u32)
+            + 4 * 4                    // SI in_buf_hi (4 × u32)
+            + 4 * 4                    // SI in_buf_lo (4 × u32)
+            + 4 * 4                    // SI poll, comm_ctrl, status, exi_clock_lock
+            + 4 * 4;                   // AI control, volume, sample_count, interrupt_sample
+
+        let mut buf = Vec::with_capacity(total);
+
+        // Header
+        buf.extend_from_slice(b"LAZU");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+
+        // CPU
+        buf.extend_from_slice(&(cpu_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(cpu_bytes);
+
+        // RAM
+        buf.extend_from_slice(&(self.ram.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.ram);
+
+        // PI registers
+        buf.extend_from_slice(&self.pi_intsr.to_le_bytes());
+        buf.extend_from_slice(&self.pi_intmsk.to_le_bytes());
+        buf.extend_from_slice(&self.pad_buttons.to_le_bytes());
+        buf.extend_from_slice(&(self.decrementer_pending as u32).to_le_bytes());
+
+        // VI registers (32 × u32, stored as raw u32 LE)
+        for i in 0..32usize {
+            buf.extend_from_slice(&self.vi.read_u32((i as u32) * 4).to_le_bytes());
+        }
+
+        // SI registers
+        for i in 0..4usize {
+            buf.extend_from_slice(&self.si.read_u32(match i { 0=>0, 1=>0x0C, 2=>0x18, _=>0x24 }).to_le_bytes());
+        }
+        for i in 0..4usize {
+            let base = match i { 0=>0x04, 1=>0x10, 2=>0x1C, _=>0x28 };
+            buf.extend_from_slice(&self.si.read_u32(base).to_le_bytes());
+        }
+        for i in 0..4usize {
+            let base = match i { 0=>0x08, 1=>0x14, 2=>0x20, _=>0x2C };
+            buf.extend_from_slice(&self.si.read_u32(base).to_le_bytes());
+        }
+        buf.extend_from_slice(&self.si.read_u32(0x30).to_le_bytes()); // poll
+        buf.extend_from_slice(&self.si.read_u32(0x34).to_le_bytes()); // comm_ctrl
+        buf.extend_from_slice(&self.si.read_u32(0x38).to_le_bytes()); // status
+        buf.extend_from_slice(&self.si.read_u32(0x3C).to_le_bytes()); // exi_clock_lock
+
+        // AI registers
+        buf.extend_from_slice(&self.ai.read_u32(0x00).to_le_bytes());
+        buf.extend_from_slice(&self.ai.read_u32(0x04).to_le_bytes());
+        buf.extend_from_slice(&self.ai.read_u32(0x08).to_le_bytes());
+        buf.extend_from_slice(&self.ai.read_u32(0x0C).to_le_bytes());
+
+        js_sys::Uint8Array::from(buf.as_slice())
+    }
+
+    /// Restore the complete emulator state from a savestate byte array.
+    ///
+    /// `data` must have been produced by a previous call to [`save_state`].
+    /// Returns `true` on success, `false` on format mismatch.
+    pub fn load_state(&mut self, data: &[u8]) -> bool {
+        // Validate magic
+        if data.len() < 8 || &data[0..4] != b"LAZU" {
+            console_log!("[lazuli] load_state: invalid magic");
+            return false;
+        }
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4]));
+        if version < 2 {
+            console_log!("[lazuli] load_state: unsupported version {}", version);
+            return false;
+        }
+
+        let mut pos = 8usize;
+
+        macro_rules! read_u32 {
+            () => {{
+                if pos + 4 > data.len() { return false; }
+                let v = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap_or([0;4]));
+                pos += 4;
+                v
+            }};
+        }
+        macro_rules! read_bytes {
+            ($n:expr) => {{
+                let n = $n as usize;
+                if pos + n > data.len() { return false; }
+                let s = &data[pos..pos+n];
+                pos += n;
+                s
+            }};
+        }
+
+        // CPU
+        let cpu_size = read_u32!() as usize;
+        let cpu_bytes = read_bytes!(cpu_size);
+        let expected_cpu = size_of::<gekko::Cpu>();
+        if cpu_size != expected_cpu {
+            console_log!("[lazuli] load_state: CPU size mismatch ({} != {})", cpu_size, expected_cpu);
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cpu_bytes.as_ptr(),
+                (&mut self.cpu as *mut gekko::Cpu).cast::<u8>(),
+                expected_cpu,
+            );
+        }
+
+        // RAM
+        let ram_size = read_u32!() as usize;
+        let ram_bytes = read_bytes!(ram_size);
+        let copy_len = ram_size.min(self.ram.len());
+        self.ram[..copy_len].copy_from_slice(&ram_bytes[..copy_len]);
+
+        // PI registers
+        self.pi_intsr = read_u32!();
+        self.pi_intmsk = read_u32!();
+        self.pad_buttons = read_u32!();
+        self.decrementer_pending = read_u32!() != 0;
+
+        // VI registers (32 × u32)
+        for i in 0..32u32 {
+            let val = read_u32!();
+            self.vi.write_u32(i * 4, val);
+        }
+
+        // SI registers
+        let si_out_offsets = [0u32, 0x0C, 0x18, 0x24];
+        let si_hi_offsets  = [0x04u32, 0x10, 0x1C, 0x28];
+        let si_lo_offsets  = [0x08u32, 0x14, 0x20, 0x2C];
+        for &off in &si_out_offsets { let v = read_u32!(); self.si.write_u32(off, v, 0); }
+        for &off in &si_hi_offsets  { let v = read_u32!(); self.si.write_u32(off, v, 0); }
+        for &off in &si_lo_offsets  { let v = read_u32!(); self.si.write_u32(off, v, 0); }
+        { let v = read_u32!(); self.si.write_u32(0x30, v, 0); }
+        { let v = read_u32!(); self.si.write_u32(0x34, v, 0); }
+        { let v = read_u32!(); self.si.write_u32(0x38, v, 0); }
+        { let v = read_u32!(); self.si.write_u32(0x3C, v, 0); }
+
+        // AI registers
+        for off in [0x00u32, 0x04, 0x08, 0x0C] {
+            let v = read_u32!();
+            self.ai.write_u32(off, v);
+        }
+
+        // Invalidate JIT cache since RAM was restored.
+        self.cache.clear();
+
+        true
+    }
+}
+
+#[wasm_bindgen]
+impl WasmEmulator {
     /// Return a snapshot of the emulator's guest RAM as a [`js_sys::Uint8Array`].
     pub fn get_ram_copy(&self) -> js_sys::Uint8Array {
         js_sys::Uint8Array::from(self.ram.as_slice())

@@ -36,7 +36,7 @@ mod loader;
 use ppcwasm::WasmJit;
 use wasm_bindgen::prelude::*;
 
-use hw::{DiState, DspState};
+use hw::{AiState, DiState, DspState, ExiState, SiState, ViState};
 use jit::WasmBlockCache;
 
 // Re-export the block type for JavaScript inspection.
@@ -117,6 +117,14 @@ pub struct WasmEmulator {
     pub(crate) di: DiState,
     /// DSP Interface hardware register state (mailbox echo HLE stub).
     pub(crate) dsp: DspState,
+    /// Video Interface (VI) hardware register state.
+    pub(crate) vi: ViState,
+    /// Serial Interface (SI) hardware register state + controller auto-response.
+    pub(crate) si: SiState,
+    /// External Interface (EXI) hardware register state.
+    pub(crate) exi: ExiState,
+    /// Audio Interface (AI) hardware register state.
+    pub(crate) ai: AiState,
     /// Processor Interface interrupt status register.
     pub(crate) pi_intsr: u32,
     /// Processor Interface interrupt mask register (PI_INTMSK at 0xCC003004).
@@ -170,6 +178,10 @@ impl WasmEmulator {
             disc: None,
             di: DiState::default(),
             dsp: DspState::default(),
+            vi: ViState::default(),
+            si: SiState::default(),
+            exi: ExiState::default(),
+            ai: AiState::default(),
             pi_intsr: 0,
             pi_intmsk: 0,
             decrementer_pending: false,
