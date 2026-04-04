@@ -627,19 +627,22 @@ impl WasmEmulator {
     /// `PI_INTSR`, sees the VI bit, increments the retrace counter, and
     /// `rfi`s back so the wait loop can observe the change and exit.
     ///
-    /// The VI bit in `PI_INTSR` is cleared by the guest OS writing `1` to
-    /// that bit via `hw_write_u32` (PI uses write-1-to-clear semantics),
-    /// which happens in the VI interrupt service routine.
+    /// The VI bit in `PI_INTSR` is **not** cleared here.  The bit remains set
+    /// so that the interrupt service routine can read `PI_INTSR` and discover
+    /// which interrupt fired.  The ISR clears the bit by writing `1` to it via
+    /// `hw_write_u32` (PI uses write-1-to-clear semantics).  After `raise_exception`
+    /// the CPU enters exception mode (`EE=0`), preventing re-delivery until the
+    /// ISR finishes and executes `rfi`.
     pub fn assert_vi_interrupt(&mut self) {
         // Set the VI pending bit in PI_INTSR.
         self.pi_intsr |= PI_INT_VI;
 
         // Deliver the external interrupt immediately if EE=1 and the OS has
-        // unmasked the VI interrupt in PI_INTMSK.
+        // unmasked the VI interrupt in PI_INTMSK.  Do not pre-clear PI_INTSR:
+        // the ISR must be able to read the bit to know which interrupt fired.
         let ee = self.cpu.supervisor.config.msr.interrupts();
         let vi_enabled = (self.pi_intmsk & PI_INT_VI) != 0;
         if ee && vi_enabled {
-            self.pi_intsr &= !PI_INT_VI; // acknowledged on delivery
             self.cpu.raise_exception(gekko::Exception::Interrupt);
         }
     }
@@ -863,10 +866,10 @@ impl WasmEmulator {
     /// until the handler writes a new positive value to DEC.
     ///
     /// After the decrementer check, any pending PI external interrupts
-    /// (e.g. VI retrace set by [`assert_vi_interrupt`]) that are both unmasked
-    /// in `PI_INTMSK` and pass the `MSR.EE` gate are also delivered here.
-    /// This piggy-backs on the per-block cadence so external interrupts fire
-    /// as soon as a block re-enables `EE`.
+    /// (e.g. VI retrace set by [`Self::assert_vi_interrupt`]) that are both
+    /// unmasked in `PI_INTMSK` and pass the `MSR.EE` gate are also delivered
+    /// here.  This piggy-backs on the per-block cadence so external interrupts
+    /// fire as soon as a block re-enables `EE`.
     ///
     /// Call this once per JIT block (not just once per animation frame) so that
     /// the exception fires as soon as the guest enables `EE` inside a spin-wait
@@ -899,13 +902,14 @@ impl WasmEmulator {
         }
 
         // Deliver any pending PI external interrupt (e.g. VI retrace) if EE=1
-        // and the interrupt source is unmasked in PI_INTMSK.
+        // and the interrupt source is unmasked in PI_INTMSK.  Do not pre-clear
+        // PI_INTSR: the ISR reads it to identify which interrupt fired and clears
+        // the bit itself via write-1-to-clear through hw_write_u32.  After
+        // raise_exception the CPU enters exception mode (EE=0), preventing
+        // re-delivery until the ISR executes rfi.
         if ee {
             let pending = self.pi_intsr & self.pi_intmsk;
             if pending != 0 {
-                // Clear the delivered bits from PI_INTSR (the ISR will write
-                // them back via hw_write_u32 to fully acknowledge).
-                self.pi_intsr &= !pending;
                 self.cpu.raise_exception(gekko::Exception::Interrupt);
             }
         }
