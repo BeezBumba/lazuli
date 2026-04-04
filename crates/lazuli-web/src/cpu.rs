@@ -155,6 +155,30 @@ impl WasmEmulator {
         }
     }
 
+    /// Force-deliver a decrementer exception regardless of whether `MSR.EE`
+    /// is set.
+    ///
+    /// On real PowerPC hardware the decrementer interrupt is maskable: it
+    /// cannot fire while `EE = 0`.  However, if a JIT or emulation bug leaves
+    /// the guest permanently stuck in a branch-to-self loop with `EE = 0` and
+    /// `DEC < 0`, the normal `advance_decrementer` path can never break the
+    /// deadlock.  The JavaScript host calls this method after detecting that
+    /// threshold-many consecutive same-PC blocks have executed with `EE = 0`
+    /// and the decrementer already expired, giving the OS decrementer handler
+    /// a chance to run and reset `DEC` to a positive value.
+    ///
+    /// The method clears `decrementer_pending` and calls `raise_exception` with
+    /// [`gekko::Exception::Decrementer`] (vector `0x00000900`) so that `SRR0`,
+    /// `SRR1`, and `MSR` are updated exactly as they would be for a normal
+    /// hardware decrementer interrupt.  This is the same exception type used by
+    /// the `decrementer_pending && ee` branch in [`advance_decrementer`] and is
+    /// distinct from [`gekko::Exception::Interrupt`] (vector `0x00000500`),
+    /// which is reserved for external PI interrupts.
+    pub fn force_decrementer_exception(&mut self) {
+        self.decrementer_pending = false;
+        self.cpu.raise_exception(gekko::Exception::Decrementer);
+    }
+
     // ── Compilation stats ─────────────────────────────────────────────────────
 
     /// Number of distinct blocks that have been JIT-compiled to WASM.

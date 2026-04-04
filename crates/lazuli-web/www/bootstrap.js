@@ -515,6 +515,21 @@ let stuckConsecutiveRuns = 0;
  * Also used to colour the stat row (yellow above this value, red above 4×).
  */
 const STUCK_PC_THRESHOLD = 50;
+/**
+ * Number of consecutive same-PC blocks after which the host force-delivers
+ * the decrementer exception to break an EE=0 / DEC-expired deadlock.
+ *
+ * When the guest spins in a branch-to-self loop with MSR.EE=0 and the
+ * decrementer already expired, `advance_decrementer` can never fire (it
+ * requires EE=1).  After this many stuck blocks the host calls
+ * `force_decrementer_exception` so the OS decrementer handler gets a chance
+ * to run and reset DEC, exactly as it would under a real non-masked interrupt.
+ * The threshold is deliberately generous (10 × STUCK_PC_THRESHOLD = 500
+ * blocks ≈ 1 frame) to avoid triggering for brief OS spin-waits that resolve
+ * on their own.  The force fires repeatedly every STUCK_FORCE_EXC_THRESHOLD
+ * blocks while the deadlock persists.
+ */
+const STUCK_FORCE_EXC_THRESHOLD = STUCK_PC_THRESHOLD * 10;
 /** Ring buffer of the last DEBUG_EVENT_MAX notable emulation events. */
 let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
@@ -1354,6 +1369,25 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `nextPc=${hexU32(lastNextPc)} LR=${hexU32(lrVal)} MSR=${hexU32(msrVal)} (EE=${eeEnabled}) ` +
           `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
         );
+
+        // ── Force-deliver decrementer when EE=0 blocks the normal path ────────
+        // If the guest is stuck with EE=0 and DEC already expired, the normal
+        // advance_decrementer() call can never fire the exception.  After
+        // STUCK_FORCE_EXC_THRESHOLD consecutive same-PC blocks (≈ 1 frame) we
+        // force the exception so the OS decrementer handler can reset DEC and
+        // resume normal execution.  The force repeats every
+        // STUCK_FORCE_EXC_THRESHOLD blocks while the deadlock persists.
+        if (!eeEnabled && (decVal | 0) < 0 &&
+            (stuckConsecutiveRuns % STUCK_FORCE_EXC_THRESHOLD) === 0) {
+          console.warn(
+            `[lazuli] force-delivering decrementer exception @ ${stuckHex} ` +
+            `(EE=0, DEC=${decVal | 0}, run #${stuckConsecutiveRuns})`,
+          );
+          pushDebugEvent(
+            `⚡ force-dec @ ${stuckHex} (EE=0, DEC=${decVal | 0}, run #${stuckConsecutiveRuns})`,
+          );
+          emu.force_decrementer_exception();
+        }
       }
     } else {
       if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD) {
