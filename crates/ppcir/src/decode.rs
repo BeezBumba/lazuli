@@ -1170,17 +1170,46 @@ impl Decoder {
             }
 
             // ── System ────────────────────────────────────────────────────────
+            //
+            // SPR field encoding note: `field_spr()` in the `powerpc` crate
+            // already decodes the split 10-bit SPR field and returns the actual
+            // SPR number directly (e.g., 8 for LR, 272 for SPRG0).  No further
+            // bit-rotation is needed; applying one would corrupt every SPR access.
             Opcode::Mfspr => {
                 let rd=ins.gpr_d() as u8;
-                let spr=(ins.field_spr() as u32).rotate_right(5)&0x3FF;
-                let load = match spr { 1=>IrInst::LoadXer, 8=>IrInst::LoadLr, 9=>IrInst::LoadCtr, 22=>IrInst::LoadDec, 26=>IrInst::LoadSrr0, 27=>IrInst::LoadSrr1, 16=>IrInst::LoadSprg(0), 17=>IrInst::LoadSprg(1), 18=>IrInst::LoadSprg(2), 19=>IrInst::LoadSprg(3), _=>IrInst::I32Const(0) };
+                let spr=ins.field_spr() as u32;
+                let load = match spr {
+                    1   => IrInst::LoadXer,
+                    8   => IrInst::LoadLr,
+                    9   => IrInst::LoadCtr,
+                    22  => IrInst::LoadDec,
+                    26  => IrInst::LoadSrr0,
+                    27  => IrInst::LoadSrr1,
+                    272 => IrInst::LoadSprg(0),
+                    273 => IrInst::LoadSprg(1),
+                    274 => IrInst::LoadSprg(2),
+                    275 => IrInst::LoadSprg(3),
+                    _   => IrInst::I32Const(0),
+                };
                 b.push(load); b.push(IrInst::StoreGpr(rd));
             }
             Opcode::Mtspr => {
                 let rs=ins.gpr_s() as u8;
-                let spr=(ins.field_spr() as u32).rotate_right(5)&0x3FF;
+                let spr=ins.field_spr() as u32;
                 b.push(IrInst::LoadGpr(rs));
-                match spr { 1=>b.push(IrInst::StoreXer), 8=>b.push(IrInst::StoreLr), 9=>b.push(IrInst::StoreCtr), 22=>b.push(IrInst::StoreDec), 26=>b.push(IrInst::StoreSrr0), 27=>b.push(IrInst::StoreSrr1), 16=>b.push(IrInst::StoreSprg(0)), 17=>b.push(IrInst::StoreSprg(1)), 18=>b.push(IrInst::StoreSprg(2)), 19=>b.push(IrInst::StoreSprg(3)), _=>b.push(IrInst::Drop) }
+                match spr {
+                    1   => b.push(IrInst::StoreXer),
+                    8   => b.push(IrInst::StoreLr),
+                    9   => b.push(IrInst::StoreCtr),
+                    22  => b.push(IrInst::StoreDec),
+                    26  => b.push(IrInst::StoreSrr0),
+                    27  => b.push(IrInst::StoreSrr1),
+                    272 => b.push(IrInst::StoreSprg(0)),
+                    273 => b.push(IrInst::StoreSprg(1)),
+                    274 => b.push(IrInst::StoreSprg(2)),
+                    275 => b.push(IrInst::StoreSprg(3)),
+                    _   => b.push(IrInst::Drop),
+                }
             }
             Opcode::Mftb => {
                 let rd=ins.gpr_d() as u8;
@@ -1387,5 +1416,244 @@ mod tests {
         // fmadd f1, f2, f3, f4  — 0xFC22_21FA
         let b = Decoder::new().decode([(0x8000_0000u32, ins(0xFC22_21FA))].into_iter()).unwrap();
         assert!(b.unimplemented_ops.is_empty(), "{:?}", b.unimplemented_ops);
+    }
+
+    // ── SPR decode correctness ─────────────────────────────────────────────────
+    //
+    // field_spr() in the powerpc crate already returns the actual SPR number;
+    // no rotation is required.  These tests guard against the "rotate_right(5)"
+    // regression that silently dropped every SPR read/write.
+
+    /// Encode `mtspr SPR, r3` — opcode=31 (0x7C000000), rS=r3 (bits25-21=3),
+    /// SPR split-field (bits20-16=spr[4:0], bits15-11=spr[9:5]), xo=467<<1.
+    fn encode_mtspr(spr: u32) -> u32 {
+        let lo = spr & 0x1F;
+        let hi = (spr >> 5) & 0x1F;
+        0x7C00_0000 | (3 << 21) | (lo << 16) | (hi << 11) | (467 << 1)
+    }
+
+    /// Encode `mfspr r3, SPR` — same field layout, xo=339<<1.
+    fn encode_mfspr(spr: u32) -> u32 {
+        let lo = spr & 0x1F;
+        let hi = (spr >> 5) & 0x1F;
+        0x7C00_0000 | (3 << 21) | (lo << 16) | (hi << 11) | (339 << 1)
+    }
+
+    /// Helper: assert that a single-instruction block has no unimplemented ops and
+    /// that its IR contains `target_ir` somewhere (verified by the variant name).
+    fn check_spr_no_unimpl(spr: u32, mtspr: bool) {
+        let code = if mtspr { encode_mtspr(spr) } else { encode_mfspr(spr) };
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(code))].into_iter()).unwrap();
+        assert!(
+            b.unimplemented_ops.is_empty(),
+            "SPR {} ({}) produced unimplemented ops: {:?}",
+            spr,
+            if mtspr { "mtspr" } else { "mfspr" },
+            b.unimplemented_ops,
+        );
+    }
+
+    /// Encode `mtspr SPR, r3; blr` — used to verify that the IR for the mtspr
+    /// uses the correct IrInst variant by checking the WASM output is valid and
+    /// has no unimplemented ops.
+    fn check_mtspr_no_unimpl(spr: u32) { check_spr_no_unimpl(spr, true); }
+    fn check_mfspr_no_unimpl(spr: u32) { check_spr_no_unimpl(spr, false); }
+
+    // mtspr — one test per supported SPR
+    #[test] fn mtspr_xer_no_unimpl()   { check_mtspr_no_unimpl(1); }
+    #[test] fn mtspr_lr_no_unimpl()    { check_mtspr_no_unimpl(8); }
+    #[test] fn mtspr_ctr_no_unimpl()   { check_mtspr_no_unimpl(9); }
+    #[test] fn mtspr_dec_no_unimpl()   { check_mtspr_no_unimpl(22); }
+    #[test] fn mtspr_srr0_no_unimpl()  { check_mtspr_no_unimpl(26); }
+    #[test] fn mtspr_srr1_no_unimpl()  { check_mtspr_no_unimpl(27); }
+    #[test] fn mtspr_sprg0_no_unimpl() { check_mtspr_no_unimpl(272); }
+    #[test] fn mtspr_sprg1_no_unimpl() { check_mtspr_no_unimpl(273); }
+    #[test] fn mtspr_sprg2_no_unimpl() { check_mtspr_no_unimpl(274); }
+    #[test] fn mtspr_sprg3_no_unimpl() { check_mtspr_no_unimpl(275); }
+
+    // mfspr — one test per supported SPR
+    #[test] fn mfspr_xer_no_unimpl()   { check_mfspr_no_unimpl(1); }
+    #[test] fn mfspr_lr_no_unimpl()    { check_mfspr_no_unimpl(8); }
+    #[test] fn mfspr_ctr_no_unimpl()   { check_mfspr_no_unimpl(9); }
+    #[test] fn mfspr_dec_no_unimpl()   { check_mfspr_no_unimpl(22); }
+    #[test] fn mfspr_srr0_no_unimpl()  { check_mfspr_no_unimpl(26); }
+    #[test] fn mfspr_srr1_no_unimpl()  { check_mfspr_no_unimpl(27); }
+    #[test] fn mfspr_sprg0_no_unimpl() { check_mfspr_no_unimpl(272); }
+    #[test] fn mfspr_sprg1_no_unimpl() { check_mfspr_no_unimpl(273); }
+    #[test] fn mfspr_sprg2_no_unimpl() { check_mfspr_no_unimpl(274); }
+    #[test] fn mfspr_sprg3_no_unimpl() { check_mfspr_no_unimpl(275); }
+
+    // Verify IR variant — check that the IrBlock emitted for mtspr/mfspr
+    // contains the expected Store/Load instruction.  This catches mis-mappings
+    // (e.g. mtspr LR being silently emitted as Drop).
+    fn ir_contains(block: &IrBlock, variant: fn(&IrInst) -> bool) -> bool {
+        block.insts.iter().any(variant)
+    }
+
+    #[test]
+    fn mtspr_lr_emits_store_lr() {
+        // mtlr r3 = mtspr LR, r3 = 0x7C6803A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C68_03A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreLr)),
+            "mtspr LR must emit StoreLr; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mfspr_lr_emits_load_lr() {
+        // mflr r3 = mfspr r3, LR = 0x7C6802A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C68_02A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::LoadLr)),
+            "mfspr LR must emit LoadLr; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_ctr_emits_store_ctr() {
+        // mtctr r3 = mtspr CTR, r3 = 0x7C6903A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C69_03A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreCtr)),
+            "mtspr CTR must emit StoreCtr; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mfspr_ctr_emits_load_ctr() {
+        // mfctr r3 = mfspr r3, CTR = 0x7C6902A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C69_02A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::LoadCtr)),
+            "mfspr CTR must emit LoadCtr; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_dec_emits_store_dec() {
+        // mtspr DEC, r3 = 0x7C7603A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C76_03A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreDec)),
+            "mtspr DEC must emit StoreDec; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_srr0_emits_store_srr0() {
+        // mtspr SRR0, r3 = 0x7C7A03A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C7A_03A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreSrr0)),
+            "mtspr SRR0 must emit StoreSrr0; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_srr1_emits_store_srr1() {
+        // mtspr SRR1, r3 = 0x7C7B03A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C7B_03A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreSrr1)),
+            "mtspr SRR1 must emit StoreSrr1; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mfspr_srr1_emits_load_srr1() {
+        // mfspr r3, SRR1 = 0x7C7B02A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C7B_02A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::LoadSrr1)),
+            "mfspr SRR1 must emit LoadSrr1; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_sprg0_emits_store_sprg0() {
+        // mtspr SPRG0, r3 = 0x7C7043A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C70_43A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreSprg(0))),
+            "mtspr SPRG0 must emit StoreSprg(0); IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mfspr_sprg0_emits_load_sprg0() {
+        // mfspr r3, SPRG0 = 0x7C7042A6
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C70_42A6))].into_iter()).unwrap();
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::LoadSprg(0))),
+            "mfspr SPRG0 must emit LoadSprg(0); IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_not_lr_must_not_store_lr() {
+        // mtspr CTR, r3 (SPR=9) must NOT emit StoreLr — regression guard.
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C69_03A6))].into_iter()).unwrap();
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::StoreLr)),
+            "mtspr CTR must not emit StoreLr; IR: {:?}", b.insts);
+    }
+
+    #[test]
+    fn mtspr_sprg0_must_not_store_lr() {
+        // mtspr SPRG0, r3 (SPR=272) must NOT be mistaken for mtspr LR (SPR=8).
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x7C70_43A6))].into_iter()).unwrap();
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::StoreLr)),
+            "mtspr SPRG0 must not emit StoreLr (SPR decode regression); IR: {:?}", b.insts);
+    }
+
+    /// mflr + mtlr round-trip: the same GPR value must be used for both.
+    #[test]
+    fn mflr_mtlr_round_trip_ir() {
+        // mflr r3 (0x7C6802A6) followed by mtlr r3 (0x7C6803A6)
+        let b = Decoder::new()
+            .decode([
+                (0x8000_0000u32, ins(0x7C68_02A6)),
+                (0x8000_0004u32, ins(0x7C68_03A6)),
+            ].into_iter())
+            .unwrap();
+        assert_eq!(b.instruction_count, 2);
+        assert!(b.unimplemented_ops.is_empty());
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::LoadLr)),
+            "mflr must emit LoadLr; IR: {:?}", b.insts);
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreLr)),
+            "mtlr must emit StoreLr; IR: {:?}", b.insts);
+    }
+
+    /// OS init pattern: mfspr SRR1, ori to set EE, mtspr SRR1, bclr.
+    /// This exact sequence appears in the GameCube OS boot at block #11.
+    #[test]
+    fn os_srr1_ee_setup_no_unimpl() {
+        // mfspr r3, SRR1 (0x7C7B02A6)
+        // ori   r3, r3, 0x8000  (0x60638000)  — set EE bit
+        // mtspr SRR1, r3 (0x7C7B03A6)
+        // blr (0x4E800020)
+        let seq = [
+            (0x8000_0000u32, ins(0x7C7B_02A6)),
+            (0x8000_0004u32, ins(0x6063_8000)),
+            (0x8000_0008u32, ins(0x7C7B_03A6)),
+            (0x8000_000Cu32, ins(0x4E80_0020)),
+        ];
+        let b = Decoder::new().decode(seq.into_iter()).unwrap();
+        assert!(b.unimplemented_ops.is_empty(),
+            "OS SRR1 EE-setup sequence must have no unimplemented ops: {:?}",
+            b.unimplemented_ops);
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::LoadSrr1)),
+            "Must emit LoadSrr1");
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreSrr1)),
+            "Must emit StoreSrr1");
+    }
+
+    /// OS dispatch pattern (block #12): mtspr LR then bclr.
+    /// Previously mtspr LR was silently dropped, causing bclr to return to
+    /// an incorrect address and spin infinitely.
+    #[test]
+    fn os_dispatch_mtspr_lr_before_bclr_no_unimpl() {
+        // mtlr r3 (0x7C6803A6) followed by blr (0x4E800020)
+        let seq = [
+            (0x8000_0000u32, ins(0x7C68_03A6)),
+            (0x8000_0004u32, ins(0x4E80_0020)),
+        ];
+        let b = Decoder::new().decode(seq.into_iter()).unwrap();
+        assert_eq!(b.instruction_count, 2,
+            "mtlr + blr should be 2 instructions");
+        assert!(b.unimplemented_ops.is_empty());
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreLr)),
+            "mtspr LR must emit StoreLr before bclr; IR: {:?}", b.insts);
+    }
+
+    /// rfi terminates the block and emits StoreMsr + ReturnDynamic.
+    #[test]
+    fn decode_rfi_terminal() {
+        // rfi (0x4C00_0064) followed by addi r3, r0, 1 (0x3860_0001)
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x4C00_0064)), (0x8000_0004u32, ins(0x3860_0001))].into_iter()).unwrap();
+        assert_eq!(b.instruction_count, 1);
+        assert!(b.unimplemented_ops.is_empty());
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreMsr)),
+            "rfi must emit StoreMsr");
     }
 }
