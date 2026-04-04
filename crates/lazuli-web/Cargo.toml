@@ -25,19 +25,10 @@ features = [
     "HtmlCanvasElement",
 ]
 
-# ── WebGPU rendering backend (wasm32 targets only) ────────────────────────────
-# wgpu 27 supports the browser's native WebGPU API when targeting wasm32.
-# Adding the "webgpu" feature here enables check_webgpu_support() and lays the
-# foundation for porting the `renderer` crate to the browser.  Non-wasm builds
-# continue to use their platform-specific backends (Vulkan / Metal / D3D12)
-# declared in the `renderer` crate.
-[target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
-workspace = true
-features = ["webgpu", "wgsl"]
-
-[target.'cfg(target_arch = "wasm32")'.dependencies.renderer]
-workspace = true
-features = ["webgpu"]
+# ── WebGPU rendering backend (future) ─────────────────────────────────────────
+# Phase 4: add wgpu + renderer wasm32 deps here once renderer is ported to
+# wasm32 (wgpu::SurfaceTarget::Canvas).  Until then these deps are omitted
+# because renderer has native windowing imports incompatible with wasm32.
 
 # Disable wasm-opt during wasm-pack builds so that the package can be built
 # without a network connection.  Re-enable for distribution builds by removing
