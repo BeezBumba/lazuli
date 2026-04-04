@@ -1405,6 +1405,15 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `nextPc=${hexU32(lastNextPc)} LR=${hexU32(lrVal)} MSR=${hexU32(msrVal)} (EE=${eeEnabled}) ` +
           `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
         );
+
+        // If EE=0 and the decrementer has already expired (DEC < 0 as signed),
+        // normal advance_decrementer() can never fire the interrupt while the
+        // guest keeps interrupts disabled.  Force-deliver it so the OS
+        // decrementer handler can run and let execution progress.
+        if (!eeEnabled && ((decVal | 0) < 0)) {
+          console.info(`[lazuli] force_decrementer_exception @ ${stuckHex} (EE=0, DEC expired)`);
+          emu.force_decrementer_exception();
+        }
       }
     } else {
       if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD) {
