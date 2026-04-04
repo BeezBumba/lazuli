@@ -45,22 +45,28 @@ import init, { WasmEmulator, wasm_memory } from "./pkg/lazuli_web.js";
 // ── DOM helpers ───────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 
+function setText(id, val) {
+  const el = $(id);
+  if (el) el.textContent = val;
+}
+
 function setStatus(msg, cls = "status-info") {
   const el = $("status-bar");
+  if (!el) return;
   el.textContent = msg;
   el.className = cls;
 }
 
 function updateStats(emu) {
-  $("stat-compiled").textContent = emu.blocks_compiled();
-  $("stat-executed").textContent = emu.blocks_executed();
-  $("stat-cache").textContent    = moduleCache.size;
-  $("stat-pad").textContent      = "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
+  setText("stat-compiled", emu.blocks_compiled());
+  setText("stat-executed", emu.blocks_executed());
+  setText("stat-cache",    moduleCache.size);
+  setText("stat-pad",      "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
 
   // Live current PC
   const curPc = emu.get_pc();
-  $("stat-current-pc").textContent =
-    "0x" + curPc.toString(16).toUpperCase().padStart(8, "0");
+  setText("stat-current-pc",
+    "0x" + curPc.toString(16).toUpperCase().padStart(8, "0"));
 
   // Stuck-PC streak indicator
   const stuckEl = $("stat-stuck-runs");
@@ -73,26 +79,26 @@ function updateStats(emu) {
 
   // Last exception info
   if (lastRaisedExceptionPc !== 0) {
-    $("stat-exc-pc").textContent =
+    setText("stat-exc-pc",
       "0x" + lastRaisedExceptionPc.toString(16).toUpperCase().padStart(8, "0") +
-      ` (kind=${lastRaisedExceptionKind})`;
+      ` (kind=${lastRaisedExceptionKind})`);
   }
 
   // LR register
   const lr = emu.get_lr();
-  $("stat-lr").textContent = "0x" + lr.toString(16).toUpperCase().padStart(8, "0");
+  setText("stat-lr", "0x" + lr.toString(16).toUpperCase().padStart(8, "0"));
 
   // Last compiled block details — shown once at least one block has been compiled
   if (emu.blocks_compiled() > 0) {
     const lastPc = emu.last_compiled_pc() >>> 0;
-    $("stat-last-pc").textContent   = "0x" + lastPc.toString(16).toUpperCase().padStart(8, "0");
-    $("stat-last-ins").textContent  = emu.last_compiled_ins_count();
-    $("stat-last-wasm").textContent = emu.last_compiled_wasm_bytes() + " B";
+    setText("stat-last-pc",   "0x" + lastPc.toString(16).toUpperCase().padStart(8, "0"));
+    setText("stat-last-ins",  emu.last_compiled_ins_count());
+    setText("stat-last-wasm", emu.last_compiled_wasm_bytes() + " B");
   }
 
   // Exception / unimplemented counters
-  $("stat-exceptions").textContent   = emu.raise_exception_count();
-  $("stat-unimpl-blocks").textContent = emu.unimplemented_block_count();
+  setText("stat-exceptions",    emu.raise_exception_count());
+  setText("stat-unimpl-blocks", emu.unimplemented_block_count());
 
   // Hot block (most-executed PC)
   let hotPc = 0, hotHits = 0;
@@ -100,11 +106,11 @@ function updateStats(emu) {
     if (hits > hotHits) { hotPc = pc; hotHits = hits; }
   }
   if (hotHits > 0) {
-    $("stat-hot-pc").textContent   = "0x" + hotPc.toString(16).toUpperCase().padStart(8, "0");
-    $("stat-hot-hits").textContent = hotHits;
+    setText("stat-hot-pc",   "0x" + hotPc.toString(16).toUpperCase().padStart(8, "0"));
+    setText("stat-hot-hits", hotHits);
   } else {
-    $("stat-hot-pc").textContent   = "—";
-    $("stat-hot-hits").textContent = "—";
+    setText("stat-hot-pc",   "—");
+    setText("stat-hot-hits", "—");
   }
 
 }
@@ -1489,8 +1495,8 @@ async function main() {
       e.preventDefault();
       keyboardBits |= bit;
       emu.set_pad_buttons(keyboardBits | gamepadBits);
-      $("stat-pad").textContent =
-        "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
+      setText("stat-pad",
+        "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
     }
   });
   document.addEventListener("keyup", (e) => {
@@ -1498,8 +1504,8 @@ async function main() {
     if (bit) {
       keyboardBits &= ~bit;
       emu.set_pad_buttons(keyboardBits | gamepadBits);
-      $("stat-pad").textContent =
-        "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0");
+      setText("stat-pad",
+        "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
     }
   });
 
