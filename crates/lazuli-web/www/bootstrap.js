@@ -635,9 +635,25 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
         if (emu) {
           emu.hw_write_u32(addr, val);
           // A DVD Read DMA may have just overwritten guest code in RAM.
-          // Flush the JIT cache so stale WASM modules for those addresses
-          // are not reused; they will be recompiled from the new RAM bytes.
-          if (emu.take_dma_dirty()) moduleCache.clear();
+          // Selectively invalidate only cached blocks whose physical address
+          // range overlaps the DMA destination — mirroring ppcjit's per-address
+          // Blocks::invalidate() rather than a blanket cache flush.
+          if (emu.take_dma_dirty()) {
+            const dmaPhysStart = emu.last_dma_addr() >>> 0;
+            const dmaPhysLen   = emu.last_dma_len()  >>> 0;
+            const dmaPhysEnd   = dmaPhysStart + dmaPhysLen;
+            for (const [vpc] of moduleCache) {
+              const physPc   = (vpc & PHYS_MASK) >>> 0;
+              const meta     = blockMetaMap.get(vpc);
+              // Block covers [physPc, physPc + insCount*4); if insCount is
+              // unknown fall back to 4 bytes (one instruction — conservative).
+              const blockEnd = physPc + (meta ? meta.insCount * 4 : 4);
+              if (physPc < dmaPhysEnd && blockEnd > dmaPhysStart) {
+                moduleCache.delete(vpc);
+                blockMetaMap.delete(vpc);
+              }
+            }
+          }
         }
         return;
       }
@@ -689,6 +705,19 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
 const moduleCache = new Map(); // u32 pc → WebAssembly.Module
 
 /**
+ * Per-PC block metadata: cycles count and instruction count.
+ *
+ * Populated whenever a block is compiled for the first time.  JavaScript uses
+ * this to advance the decrementer by the correct number of timebase ticks
+ * (`cycles / 12`) rather than a fixed per-block constant — mirroring the way
+ * the native emulator's `Scheduler` is fed by `Block::meta().cycles` from
+ * ppcjit.  The `insCount` field (instruction count × 4 = byte span) is used
+ * during DMA invalidation to determine whether a cached block overlaps the
+ * written address range.
+ */
+const blockMetaMap = new Map(); // u32 pc → { cycles: u32, insCount: u32 }
+
+/**
  * Per-PC execution hit counts.  Incremented each time a block at that PC is
  * executed; cleared alongside `moduleCache` on ISO load / Reset.
  */
@@ -696,6 +725,7 @@ const pcHitMap = new Map(); // u32 pc → number
 
 function clearModuleCache() {
   moduleCache.clear();
+  blockMetaMap.clear();
   pcHitMap.clear();
   raiseExceptionTotal = 0;
   regsMemCache = null;
@@ -779,6 +809,13 @@ function executeOneBlockSync(emu, ram, log) {
       return false;
     }
     moduleCache.set(pc, module);
+    // Record cycle count and size so the game loop can use the real block
+    // cost for decrementer advancement (mirrors ppcjit's Meta::cycles feed
+    // into the native Scheduler).
+    blockMetaMap.set(pc, {
+      cycles:   emu.last_compiled_cycles(),
+      insCount: emu.last_compiled_ins_count(),
+    });
   }
 
   // ── Step 2: write CPU register file into the shared (cached) WASM memory ──
@@ -1227,30 +1264,16 @@ const BLOCKS_PER_FRAME = 500;
 const TIMEBASE_TICKS_PER_FRAME = 675_000;
 
 /**
- * Decrementer ticks to advance after each individual JIT block.
+ * Fallback decrementer ticks to advance when a block's real cycle count is
+ * unavailable (e.g. before any block at that PC has been compiled this
+ * session).  Equals `ceil(675000 / 500) = 1350` — the same fixed budget
+ * used before per-block cycle tracking was introduced.
  *
- * Distributing the per-frame decrement across every block (rather than
- * applying it once at frame start) means the decrementer exception fires as
- * soon as a block enables external interrupts in the MSR — for example,
- * inside an OS spin-wait that briefly calls OSEnableInterrupts().  With the
- * old once-per-frame scheme the MSR check always happened when the loop had
- * already disabled interrupts again, so the exception never triggered.
- *
- * The Rust `advance_decrementer` treats the decrementer interrupt as
- * **level-sensitive** (matching real PowerPC hardware): `decrementer_pending`
- * is `true` whenever `DEC < 0` and `false` whenever `DEC >= 0`.  This means:
- *
- *  - The exception fires on the very first `advance_decrementer` call after a
- *    block enables EE, even if the exception was previously delivered and DEC
- *    was never reset (the handler must write a new positive value to DEC via
- *    `mtspr DEC` to stop continuous re-firing, as on real hardware).
- *  - Writing a non-negative value to DEC via `mtspr DEC` (synced through
- *    `set_cpu_bytes` before `advance_decrementer` runs) de-asserts the
- *    interrupt immediately, clearing any stale pending state.
- *
- * BLOCKS_PER_FRAME = 500, so TICKS_PER_BLOCK = ceil(675000 / 500) = 1350.
+ * In the steady state this constant is never used because `blockMetaMap`
+ * always has a `cycles` entry for every executed block: a block must be
+ * compiled (and its metadata recorded) before it can be executed.
  */
-const TICKS_PER_BLOCK = Math.ceil(TIMEBASE_TICKS_PER_FRAME / BLOCKS_PER_FRAME);
+const TICKS_PER_BLOCK_FALLBACK = Math.ceil(TIMEBASE_TICKS_PER_FRAME / BLOCKS_PER_FRAME);
 
 let running        = false;
 let animFrameId    = null;
@@ -1299,12 +1322,25 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     }
     blocksThisFrame++;
 
-    // Advance the decrementer after each block so the exception fires as soon
-    // as a block enables MSR.EE (e.g. inside an OS spin-wait loop).  Doing
-    // this once per frame at frame start meant the MSR check always happened
-    // while interrupts were disabled at the tail of the loop, so the
-    // decrementer exception never triggered and the game stayed stuck.
-    emu.advance_decrementer(TICKS_PER_BLOCK);
+    // Advance the decrementer after each block using the block's actual CPU
+    // cycle count rather than a fixed per-block constant.  This mirrors the
+    // native emulator's Scheduler, which is fed by Block::meta().cycles from
+    // ppcjit after every block execution.
+    //
+    // The Gekko timebase (and decrementer) decrements at CPU/12 ≈ 40.5 MHz.
+    // blockMeta.cycles is in CPU cycles, so the number of timebase/DEC ticks
+    // consumed by this block is floor(cycles / 12).  We clamp to at least 1
+    // so a zero-cycle block (should not happen) still makes forward progress.
+    //
+    // The Rust `advance_decrementer` is level-sensitive: the exception fires
+    // on the first call after a block enables EE if DEC < 0, and is
+    // de-asserted immediately when the handler writes a non-negative DEC.
+    const blockMeta = blockMetaMap.get(blockPc);
+    const decTicks  = blockMeta
+      ? Math.max(1, Math.floor(blockMeta.cycles / 12))
+      : TICKS_PER_BLOCK_FALLBACK;
+    emu.add_cpu_cycles(blockMeta ? blockMeta.cycles : TICKS_PER_BLOCK_FALLBACK * 12);
+    emu.advance_decrementer(decTicks);
 
     // Stuck-PC detection: track how many consecutive blocks leave the PC
     // unchanged.  This catches both "branch to self" tight loops and the

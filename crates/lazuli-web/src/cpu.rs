@@ -216,6 +216,38 @@ impl WasmEmulator {
         self.last_compiled_wasm_bytes
     }
 
+    /// Estimated CPU cycle count of the most recently compiled block.
+    ///
+    /// Mirrors [`ppcwasm::WasmBlock::cycles`], which is set to one cycle per
+    /// PPC instruction (the same heuristic used by ppcjit's `Meta::cycles`).
+    /// JavaScript should read this immediately after `compile_block` returns
+    /// and store it per-PC so the game loop can advance the decrementer by
+    /// the correct number of timebase ticks (`cycles / 12`) rather than a
+    /// fixed per-block constant.
+    pub fn last_compiled_cycles(&self) -> u32 {
+        self.last_compiled_cycles
+    }
+
+    /// Advance the internal CPU cycle counter by `delta` emulated cycles.
+    ///
+    /// This mirrors the role of `Lazuli::exec`'s per-block cycle accumulator.
+    /// JavaScript calls this after every block execution with the block's own
+    /// cycle count so the counter stays accurate regardless of how many blocks
+    /// happen to run per animation frame.
+    pub fn add_cpu_cycles(&mut self, delta: u32) {
+        self.cpu_cycles = self.cpu_cycles.wrapping_add(delta as u64);
+    }
+
+    /// Low 32 bits of the total emulated CPU cycle counter.
+    pub fn cpu_cycles_lo(&self) -> u32 {
+        self.cpu_cycles as u32
+    }
+
+    /// High 32 bits of the total emulated CPU cycle counter.
+    pub fn cpu_cycles_hi(&self) -> u32 {
+        (self.cpu_cycles >> 32) as u32
+    }
+
     /// Number of compiled blocks that contained at least one unimplemented opcode.
     pub fn unimplemented_block_count(&self) -> u32 {
         self.unimplemented_block_count as u32
