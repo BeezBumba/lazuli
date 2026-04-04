@@ -1384,7 +1384,9 @@ impl Decoder {
 
             // ── Cache/sync hints (no-ops) ─────────────────────────────────────
             Opcode::Sync|Opcode::Isync|Opcode::Eieio|Opcode::Dcbst|Opcode::Dcbz|Opcode::Icbi|Opcode::Dcbi|Opcode::Dcbf
-            | Opcode::Dcbt | Opcode::Dcbtst | Opcode::DcbzL | Opcode::Tlbie | Opcode::Tlbsync => {}
+            | Opcode::Dcbt | Opcode::Dcbtst | Opcode::DcbzL | Opcode::Tlbie | Opcode::Tlbsync
+            // External control instructions — no-ops (no physical device attached)
+            | Opcode::Eciwx | Opcode::Ecowx => {}
 
             // ── Exceptions ────────────────────────────────────────────────────
             Opcode::Sc => {

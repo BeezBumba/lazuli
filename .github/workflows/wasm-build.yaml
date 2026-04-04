@@ -1,0 +1,29 @@
+name: WASM build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  wasm-build:
+    name: Build lazuli-web (wasm-pack)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.7.7
+        with:
+          cache-on-failure: true
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Build lazuli-web
+        run: cd crates/lazuli-web && wasm-pack build --target web --out-dir www/pkg
