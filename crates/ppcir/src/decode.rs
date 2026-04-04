@@ -1383,7 +1383,266 @@ impl Decoder {
             }
 
             // ── Cache/sync hints (no-ops) ─────────────────────────────────────
-            Opcode::Sync|Opcode::Isync|Opcode::Eieio|Opcode::Dcbst|Opcode::Dcbz|Opcode::Icbi|Opcode::Dcbi|Opcode::Dcbf => {}
+            Opcode::Sync|Opcode::Isync|Opcode::Eieio|Opcode::Dcbst|Opcode::Dcbz|Opcode::Icbi|Opcode::Dcbi|Opcode::Dcbf
+            | Opcode::Dcbt | Opcode::Dcbtst | Opcode::DcbzL | Opcode::Tlbie | Opcode::Tlbsync => {}
+
+            // ── Exceptions ────────────────────────────────────────────────────
+            Opcode::Sc => {
+                // Syscall: save return address, then raise syscall exception.
+                b.push(IrInst::I32Const((pc + 4) as i32)); b.push(IrInst::StorePC);
+                b.push(IrInst::RaiseException(0x0C00));
+                return true;
+            }
+            Opcode::Illegal => {
+                b.push(IrInst::RaiseException(0x0700));
+                return true;
+            }
+
+            // ── Float select ──────────────────────────────────────────────────
+            Opcode::Fsel => {
+                let fd = ins.fpr_d() as u8; let fa = ins.fpr_a() as u8;
+                let fb = ins.fpr_b() as u8; let fc = ins.fpr_c() as u8;
+                // cond = fa.ps0 >= 0.0  (NaN-safe: F64Gt|F64Eq returns 0 for NaN)
+                let la = b.alloc_local(IrTy::F64);
+                let cond = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LocalSet(la));
+                b.push(IrInst::LocalGet(la)); b.push(IrInst::F64Const(0.0)); b.push(IrInst::F64Gt);
+                b.push(IrInst::LocalGet(la)); b.push(IrInst::F64Const(0.0)); b.push(IrInst::F64Eq);
+                b.push(IrInst::I32Or); b.push(IrInst::LocalSet(cond));
+                // fd.ps0 = cond ? fc.ps0 : fb.ps0
+                b.push(IrInst::LoadFprPs0(fc)); b.push(IrInst::LoadFprPs0(fb));
+                b.push(IrInst::LocalGet(cond)); b.push(IrInst::F64Select);
+                b.push(IrInst::StoreFprPs0(fd));
+                // fd.ps1 = cond ? fc.ps1 : fb.ps1 (same condition per ppcjit)
+                b.push(IrInst::LoadFprPs1(fc)); b.push(IrInst::LoadFprPs1(fb));
+                b.push(IrInst::LocalGet(cond)); b.push(IrInst::F64Select);
+                b.push(IrInst::StoreFprPs1(fd));
+            }
+            Opcode::PsSel => {
+                let fd = ins.fpr_d() as u8; let fa = ins.fpr_a() as u8;
+                let fb = ins.fpr_b() as u8; let fc = ins.fpr_c() as u8;
+                let la0 = b.alloc_local(IrTy::F64); let la1 = b.alloc_local(IrTy::F64);
+                let c0 = b.alloc_local(IrTy::I32);  let c1 = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LocalSet(la0));
+                b.push(IrInst::LoadFprPs1(fa)); b.push(IrInst::LocalSet(la1));
+                // c0 = fa.ps0 >= 0.0
+                b.push(IrInst::LocalGet(la0)); b.push(IrInst::F64Const(0.0)); b.push(IrInst::F64Gt);
+                b.push(IrInst::LocalGet(la0)); b.push(IrInst::F64Const(0.0)); b.push(IrInst::F64Eq);
+                b.push(IrInst::I32Or); b.push(IrInst::LocalSet(c0));
+                // c1 = fa.ps1 >= 0.0
+                b.push(IrInst::LocalGet(la1)); b.push(IrInst::F64Const(0.0)); b.push(IrInst::F64Gt);
+                b.push(IrInst::LocalGet(la1)); b.push(IrInst::F64Const(0.0)); b.push(IrInst::F64Eq);
+                b.push(IrInst::I32Or); b.push(IrInst::LocalSet(c1));
+                // fd.ps0 = c0 ? fc.ps0 : fb.ps0
+                b.push(IrInst::LoadFprPs0(fc)); b.push(IrInst::LoadFprPs0(fb));
+                b.push(IrInst::LocalGet(c0)); b.push(IrInst::F64Select); b.push(IrInst::StoreFprPs0(fd));
+                // fd.ps1 = c1 ? fc.ps1 : fb.ps1
+                b.push(IrInst::LoadFprPs1(fc)); b.push(IrInst::LoadFprPs1(fb));
+                b.push(IrInst::LocalGet(c1)); b.push(IrInst::F64Select); b.push(IrInst::StoreFprPs1(fd));
+            }
+
+            // ── Float loads with update-indexed ──────────────────────────────
+            Opcode::Lfsux => {
+                let fd = ins.fpr_d() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea));
+                b.push(IrInst::ReadU32); b.push(IrInst::F64PromoteSingleBits);
+                b.push(IrInst::StoreFprPs0(fd)); b.push(IrInst::LoadFprPs0(fd)); b.push(IrInst::StoreFprPs1(fd));
+            }
+            Opcode::Lfdux => {
+                let fd = ins.fpr_d() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea));
+                b.push(IrInst::ReadF64); b.push(IrInst::StoreFprPs0(fd));
+            }
+
+            // ── Float stores with update-indexed ─────────────────────────────
+            Opcode::Stfsux => {
+                let fs = ins.fpr_s() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea));
+                b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::I32DemoteToSingleBits); b.push(IrInst::WriteU32);
+            }
+            Opcode::Stfdux => {
+                let fs = ins.fpr_s() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea));
+                b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::WriteF64);
+            }
+
+            // ── Store float as integer word indexed ───────────────────────────
+            Opcode::Stfiwx => {
+                let fs = ins.fpr_s() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::I32FromF64LowBits); b.push(IrInst::WriteU32);
+            }
+
+            // ── Byte-reverse loads ────────────────────────────────────────────
+            Opcode::Lwbrx => {
+                let rd = ins.gpr_d() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::ReadU32); b.push(IrInst::I32Bswap); b.push(IrInst::StoreGpr(rd));
+            }
+            Opcode::Lhbrx => {
+                let rd = ins.gpr_d() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::ReadU16); b.push(IrInst::I32Bswap16); b.push(IrInst::StoreGpr(rd));
+            }
+
+            // ── Byte-reverse stores ───────────────────────────────────────────
+            Opcode::Stwbrx => {
+                let rs = ins.gpr_s() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::LoadGpr(rs)); b.push(IrInst::I32Bswap); b.push(IrInst::WriteU32);
+            }
+            Opcode::Sthbrx => {
+                let rs = ins.gpr_s() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::LoadGpr(rs)); b.push(IrInst::I32Bswap16); b.push(IrInst::WriteU16);
+            }
+
+            // ── Load word and reserve indexed (treat as plain lwzx) ───────────
+            Opcode::Lwarx => {
+                let rd = ins.gpr_d() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::ReadU32); b.push(IrInst::StoreGpr(rd));
+            }
+
+            // ── Store word conditional indexed (always succeeds) ──────────────
+            Opcode::Stwcx_ => {
+                let rs = ins.gpr_s() as u8; let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                // Store the word unconditionally.
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::LoadGpr(rs)); b.push(IrInst::WriteU32);
+                // Set CR0: LT=0, GT=0, EQ=1 (reservation always succeeds), SO from XER.
+                // In our CR layout: field 0 is bits 31..28 (LT=31, GT=30, EQ=29, SO=28).
+                let so = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadXer); b.push(IrInst::I32Const(31)); b.push(IrInst::I32ShrU);
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(so));
+                b.push(IrInst::LoadCr);
+                b.push(IrInst::I32Const(!(0xFu32 << 28) as i32)); b.push(IrInst::I32And);
+                b.push(IrInst::I32Const(1i32 << 29)); b.push(IrInst::I32Or); // EQ = 1
+                b.push(IrInst::LocalGet(so)); b.push(IrInst::I32Const(28)); b.push(IrInst::I32Shl);
+                b.push(IrInst::I32Or);
+                b.push(IrInst::StoreCr);
+            }
+
+            // ── Load string word immediate ─────────────────────────────────────
+            Opcode::Lswi => {
+                let rd = ins.gpr_d() as u8; let ra = ins.gpr_a() as u8;
+                let nb_field = ins.field_nb() as u8;
+                let byte_count = if nb_field == 0 { 32u8 } else { nb_field };
+                let ea = b.alloc_local(IrTy::I32);
+                if ra == 0 { b.push(IrInst::I32Const(0)); } else { b.push(IrInst::LoadGpr(ra)); }
+                b.push(IrInst::LocalSet(ea));
+                // Zero out all destination registers before ORing bytes in.
+                let num_regs = (byte_count as u32 + 3) / 4;
+                for i in 0..num_regs as u8 { b.push(IrInst::I32Const(0)); b.push(IrInst::StoreGpr((rd + i) % 32)); }
+                // Load each byte and OR it into the appropriate register.
+                for i in 0u8..byte_count {
+                    let reg = ((rd as u32 + i as u32 / 4) % 32) as u8;
+                    let shift = 8 * (3 - (i % 4)) as i32;
+                    b.push(IrInst::LocalGet(ea));
+                    if i > 0 { b.push(IrInst::I32Const(i as i32)); b.push(IrInst::I32Add); }
+                    b.push(IrInst::ReadU8);
+                    if shift > 0 { b.push(IrInst::I32Const(shift)); b.push(IrInst::I32Shl); }
+                    b.push(IrInst::LoadGpr(reg)); b.push(IrInst::I32Or); b.push(IrInst::StoreGpr(reg));
+                }
+            }
+
+            // ── Store string word immediate ────────────────────────────────────
+            Opcode::Stswi => {
+                let rs = ins.gpr_s() as u8; let ra = ins.gpr_a() as u8;
+                let nb_field = ins.field_nb() as u8;
+                let byte_count = if nb_field == 0 { 32u8 } else { nb_field };
+                let ea = b.alloc_local(IrTy::I32);
+                if ra == 0 { b.push(IrInst::I32Const(0)); } else { b.push(IrInst::LoadGpr(ra)); }
+                b.push(IrInst::LocalSet(ea));
+                for i in 0u8..byte_count {
+                    let reg = ((rs as u32 + i as u32 / 4) % 32) as u8;
+                    let shift = 8 * (3 - (i % 4)) as i32;
+                    // Push addr = ea + i
+                    b.push(IrInst::LocalGet(ea));
+                    if i > 0 { b.push(IrInst::I32Const(i as i32)); b.push(IrInst::I32Add); }
+                    // Push val = (reg >> shift) & 0xFF
+                    b.push(IrInst::LoadGpr(reg));
+                    if shift > 0 { b.push(IrInst::I32Const(shift)); b.push(IrInst::I32ShrU); }
+                    b.push(IrInst::I32Const(0xFF)); b.push(IrInst::I32And);
+                    b.push(IrInst::WriteU8);
+                }
+            }
+
+            // ── Move to CR from XER ───────────────────────────────────────────
+            Opcode::Mcrxr => {
+                // Copy XER[SO,OV,CA] (bits 31,30,29) to CRfd[LT,GT,EQ]; set CRfd[SO]=0.
+                // Clear XER SO, OV, CA bits afterwards.
+                let crfd = ins.field_crfd() as u8;
+                let lt_bit = 31u32.wrapping_sub(crfd as u32 * 4);
+                let so_bit = lt_bit.wrapping_sub(3);
+                let clear_mask = !(0xFu32 << so_bit) as i32;
+                let xer_val = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadXer); b.push(IrInst::LocalTee(xer_val));
+                // Clear XER SO, OV, CA (bits 31, 30, 29) and write back.
+                b.push(IrInst::I32Const(!(7u32 << 29) as i32)); b.push(IrInst::I32And); b.push(IrInst::StoreXer);
+                // Place XER bits 31,30,29 at CRfd bits lt_bit,lt_bit-1,lt_bit-2 (shift right by crfd*4).
+                b.push(IrInst::LoadCr);
+                b.push(IrInst::I32Const(clear_mask)); b.push(IrInst::I32And);
+                b.push(IrInst::LocalGet(xer_val));
+                b.push(IrInst::I32Const((7u32 << 29) as i32)); b.push(IrInst::I32And);
+                if crfd > 0 { b.push(IrInst::I32Const(crfd as i32 * 4)); b.push(IrInst::I32ShrU); }
+                b.push(IrInst::I32Or); b.push(IrInst::StoreCr);
+            }
+
+            // ── Segment registers (not tracked in browser emulator) ───────────
+            Opcode::Mfsr => {
+                // Move from segment register: return 0 (SR not tracked).
+                let rd = ins.gpr_d() as u8;
+                b.push(IrInst::I32Const(0)); b.push(IrInst::StoreGpr(rd));
+            }
+            Opcode::Mtsr => { /* no-op: segment registers not tracked */ }
+
+            // ── Paired-single compare (ps0 or ps1 slot) ───────────────────────
+            Opcode::PsCmpu0 | Opcode::PsCmpo0 => {
+                let cr = ins.field_crfd() as u8; let fa = ins.fpr_a() as u8; let fb = ins.fpr_b() as u8;
+                let la = b.alloc_local(IrTy::F64); let lb = b.alloc_local(IrTy::F64);
+                b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LocalSet(la));
+                b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::LocalSet(lb));
+                self.update_cr_float(b, cr, la, lb);
+            }
+            Opcode::PsCmpu1 | Opcode::PsCmpo1 => {
+                let cr = ins.field_crfd() as u8; let fa = ins.fpr_a() as u8; let fb = ins.fpr_b() as u8;
+                let la = b.alloc_local(IrTy::F64); let lb = b.alloc_local(IrTy::F64);
+                b.push(IrInst::LoadFprPs1(fa)); b.push(IrInst::LocalSet(la));
+                b.push(IrInst::LoadFprPs1(fb)); b.push(IrInst::LocalSet(lb));
+                self.update_cr_float(b, cr, la, lb);
+            }
+
+            // ── PS quantized load / store with update ─────────────────────────
+            Opcode::PsqLu => {
+                let fd = ins.fpr_d() as u8; let ra = ins.gpr_a() as u8; let d = ins.field_offset() as i32;
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
+                b.push(IrInst::LocalGet(ea));
+                b.push(IrInst::ReadU32); b.push(IrInst::F64PromoteSingleBits);
+                b.push(IrInst::StoreFprPs0(fd)); b.push(IrInst::LoadFprPs0(fd)); b.push(IrInst::StoreFprPs1(fd));
+            }
+            Opcode::PsqStu => {
+                let fs = ins.fpr_s() as u8; let ra = ins.gpr_a() as u8; let d = ins.field_offset() as i32;
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
+                b.push(IrInst::LocalTee(ea));
+                b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::I32DemoteToSingleBits); b.push(IrInst::WriteU32);
+                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
+            }
 
             // ── Unimplemented ─────────────────────────────────────────────────
             _ => {

@@ -106,6 +106,18 @@ pub enum IrInst {
     F64PromoteSingleBits,
     /// `(f64) → (i32)` — demote f64 to f32, reinterpret as u32 (`stfs`).
     I32DemoteToSingleBits,
+    /// `(f64) → (i32)` — reinterpret f64 bit-pattern as i64, take low 32 bits (`stfiwx`).
+    I32FromF64LowBits,
+
+    // ─── Float select ─────────────────────────────────────────────────────────
+    /// `(f64, f64, i32) → (f64)` — if cond≠0 return first f64, else second (`fsel`).
+    F64Select,
+
+    // ─── Integer byte-swap ────────────────────────────────────────────────────
+    /// `(i32) → (i32)` — byte-swap all 4 bytes (`lwbrx`, `stwbrx`).
+    I32Bswap,
+    /// `(i32) → (i32)` — byte-swap low 2 bytes, zero-extend (`lhbrx`, `sthbrx`).
+    I32Bswap16,
 
     // ─── 64-bit helpers (for high-word multiply, no i64 locals needed) ───────
     /// `(i32) → (i64)` — sign-extend i32 to i64.
