@@ -64,10 +64,12 @@ function updateStats(emu) {
 
   // Stuck-PC streak indicator
   const stuckEl = $("stat-stuck-runs");
-  stuckEl.textContent = stuckConsecutiveRuns;
-  stuckEl.style.color =
-    stuckConsecutiveRuns > STUCK_PC_THRESHOLD * 4 ? "var(--red)" :
-    stuckConsecutiveRuns > STUCK_PC_THRESHOLD      ? "var(--yellow)" : "";
+  if (stuckEl) {
+    stuckEl.textContent = stuckConsecutiveRuns;
+    stuckEl.style.color =
+      stuckConsecutiveRuns > STUCK_PC_THRESHOLD * 4 ? "var(--red)" :
+      stuckConsecutiveRuns > STUCK_PC_THRESHOLD      ? "var(--yellow)" : "";
+  }
 
   // Last exception info
   if (lastRaisedExceptionPc !== 0) {
@@ -109,6 +111,7 @@ function updateStats(emu) {
 
 function renderRegisters(emu) {
   const grid = $("reg-grid");
+  if (!grid) return;
   grid.innerHTML = "";
 
   for (let i = 0; i < 32; i++) {
