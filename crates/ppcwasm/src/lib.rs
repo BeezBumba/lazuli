@@ -241,4 +241,107 @@ mod tests {
         assert_eq!(&b.bytes[..4], b"\0asm");
         assert!(b.unimplemented_ops.is_empty(), "stbu hit unimpl: {:?}", b.unimplemented_ops);
     }
+
+    // ── SPR WASM output correctness ────────────────────────────────────────────
+    //
+    // The following tests verify that the JIT correctly lowers SPR reads and
+    // writes all the way to valid WebAssembly binary modules.  These complement
+    // the IR-level tests in ppcir, ensuring the full pipeline is sound.
+
+    /// Helper: build a one-instruction block and assert it is valid WASM with no
+    /// unimplemented ops.
+    fn build_one_no_unimpl(opcode: u32) -> WasmBlock {
+        let b = WasmJit::new()
+            .build([(0x8000_0000u32, ins(opcode))].into_iter())
+            .unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm", "not a WASM magic header for opcode 0x{:08X}", opcode);
+        assert!(
+            b.unimplemented_ops.is_empty(),
+            "opcode 0x{:08X} produced unimplemented ops: {:?}", opcode, b.unimplemented_ops
+        );
+        b
+    }
+
+    // mtspr — produced WASM must be a valid module with no unimplemented ops.
+    #[test] fn mtspr_xer_valid_wasm()   { build_one_no_unimpl(0x7C61_03A6); } // mtspr XER, r3
+    #[test] fn mtspr_lr_valid_wasm()    { build_one_no_unimpl(0x7C68_03A6); } // mtlr r3
+    #[test] fn mtspr_ctr_valid_wasm()   { build_one_no_unimpl(0x7C69_03A6); } // mtctr r3
+    #[test] fn mtspr_dec_valid_wasm()   { build_one_no_unimpl(0x7C76_03A6); } // mtspr DEC, r3
+    #[test] fn mtspr_srr0_valid_wasm()  { build_one_no_unimpl(0x7C7A_03A6); } // mtspr SRR0, r3
+    #[test] fn mtspr_srr1_valid_wasm()  { build_one_no_unimpl(0x7C7B_03A6); } // mtspr SRR1, r3
+    #[test] fn mtspr_sprg0_valid_wasm() { build_one_no_unimpl(0x7C70_43A6); } // mtspr SPRG0, r3
+    #[test] fn mtspr_sprg1_valid_wasm() { build_one_no_unimpl(0x7C71_43A6); } // mtspr SPRG1, r3
+    #[test] fn mtspr_sprg2_valid_wasm() { build_one_no_unimpl(0x7C72_43A6); } // mtspr SPRG2, r3
+    #[test] fn mtspr_sprg3_valid_wasm() { build_one_no_unimpl(0x7C73_43A6); } // mtspr SPRG3, r3
+
+    // mfspr — produced WASM must be a valid module with no unimplemented ops.
+    #[test] fn mfspr_xer_valid_wasm()   { build_one_no_unimpl(0x7C61_02A6); } // mfspr r3, XER
+    #[test] fn mfspr_lr_valid_wasm()    { build_one_no_unimpl(0x7C68_02A6); } // mflr r3
+    #[test] fn mfspr_ctr_valid_wasm()   { build_one_no_unimpl(0x7C69_02A6); } // mfctr r3
+    #[test] fn mfspr_dec_valid_wasm()   { build_one_no_unimpl(0x7C76_02A6); } // mfspr r3, DEC
+    #[test] fn mfspr_srr0_valid_wasm()  { build_one_no_unimpl(0x7C7A_02A6); } // mfspr r3, SRR0
+    #[test] fn mfspr_srr1_valid_wasm()  { build_one_no_unimpl(0x7C7B_02A6); } // mfspr r3, SRR1
+    #[test] fn mfspr_sprg0_valid_wasm() { build_one_no_unimpl(0x7C70_42A6); } // mfspr r3, SPRG0
+    #[test] fn mfspr_sprg1_valid_wasm() { build_one_no_unimpl(0x7C71_42A6); } // mfspr r3, SPRG1
+    #[test] fn mfspr_sprg2_valid_wasm() { build_one_no_unimpl(0x7C72_42A6); } // mfspr r3, SPRG2
+    #[test] fn mfspr_sprg3_valid_wasm() { build_one_no_unimpl(0x7C73_42A6); } // mfspr r3, SPRG3
+
+    /// OS boot pattern (block #12): lwz loads a function pointer, mtspr LR sets
+    /// it, bclr dispatches to it.  The mtspr LR must NOT be dropped.
+    #[test]
+    fn os_dispatch_sequence_valid_wasm() {
+        // lwz r3, 0(r4)  (0x80640000)
+        // mtlr r3        (0x7C6803A6)
+        // blr            (0x4E800020)
+        let b = WasmJit::new()
+            .build([
+                (0x8000_0000u32, ins(0x8064_0000)),
+                (0x8000_0004u32, ins(0x7C68_03A6)),
+                (0x8000_0008u32, ins(0x4E80_0020)),
+            ].into_iter())
+            .unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert_eq!(b.instruction_count, 3,
+            "lwz + mtlr + blr should be 3 instructions");
+        assert!(b.unimplemented_ops.is_empty(),
+            "OS dispatch sequence must have no unimplemented ops: {:?}", b.unimplemented_ops);
+    }
+
+    /// OS init sequence (block #11): mfspr SRR1 → ori to enable EE → mtspr SRR1 → blr.
+    #[test]
+    fn os_srr1_ee_sequence_valid_wasm() {
+        // mfspr r3, SRR1 (0x7C7B02A6)
+        // ori   r3, r3, 0x8000  (0x60638000)
+        // mtspr SRR1, r3 (0x7C7B03A6)
+        // blr (0x4E800020)
+        let b = WasmJit::new()
+            .build([
+                (0x8000_0000u32, ins(0x7C7B_02A6)),
+                (0x8000_0004u32, ins(0x6063_8000)),
+                (0x8000_0008u32, ins(0x7C7B_03A6)),
+                (0x8000_000Cu32, ins(0x4E80_0020)),
+            ].into_iter())
+            .unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert!(b.unimplemented_ops.is_empty(),
+            "OS SRR1 EE-enable sequence must produce valid WASM: {:?}", b.unimplemented_ops);
+    }
+
+    /// mtspr followed by rfi: both must appear in the same block and produce
+    /// valid WASM.  This models the OS context-switch path.
+    #[test]
+    fn mtspr_srr0_then_rfi_valid_wasm() {
+        // mtspr SRR0, r3 (0x7C7A03A6)
+        // rfi (0x4C000064) — terminates the block
+        let b = WasmJit::new()
+            .build([
+                (0x8000_0000u32, ins(0x7C7A_03A6)),
+                (0x8000_0004u32, ins(0x4C00_0064)),
+                (0x8000_0008u32, ins(0x3860_0001)), // addi — must not be compiled
+            ].into_iter())
+            .unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm");
+        assert_eq!(b.instruction_count, 2, "mtspr SRR0 + rfi = 2 insns");
+        assert!(b.unimplemented_ops.is_empty());
+    }
 }
