@@ -57,12 +57,19 @@ impl DspState {
     /// to the DSP→CPU mailbox (`0x00`/`0x02`) as a minimal HLE stub: the OS
     /// sends a boot command and polls for an ACK; by echoing we satisfy the
     /// poll without running real DSP microcode.
+    ///
+    /// Writes to DSPCONTROL (`0x08`) auto-clear bit 0 (DSP Reset), because
+    /// in hardware the reset pulse is instantaneous and the bit self-clears
+    /// once the DSP has been reset.  Without this, the OS's reset-complete
+    /// polling loop would spin forever.
     pub(crate) fn write_u16(&mut self, offset: u32, val: u16) {
         match offset {
             // CPU→DSP mailbox: echo immediately to DSP→CPU (HLE DSP boot stub).
             0x04 => self.dsp2cpu_hi = val,
             0x06 => self.dsp2cpu_lo = val,
-            0x08 => self.control = val,
+            // DSPCONTROL: store the value but auto-clear the Reset bit (bit 0)
+            // so that the OS's "wait for reset complete" poll exits immediately.
+            0x08 => self.control = val & !0x0001,
             _ => {}
         }
     }

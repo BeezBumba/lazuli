@@ -101,10 +101,26 @@ impl WasmEmulator {
     ///
     /// - **DSP Interface** (`0xCC005000–0xCC00500F`): DSP→CPU mailbox and
     ///   control register.
+    /// - **DVD Interface** (`0xCC006000–0xCC006027`): 16-bit half of any 32-bit
+    ///   DI register.  The guest OS occasionally reads DISTATUS and other DI
+    ///   registers with `lhz` (halfword load), so we return the correct
+    ///   big-endian half of the underlying 32-bit register value.
     /// - All other hardware addresses: returns `0`
     pub fn hw_read_u16(&self, addr: u32) -> u16 {
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             return self.dsp.read_u16(addr - DSP_BASE);
+        }
+        if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
+            let offset = addr - DI_BASE;
+            // DI registers are 32-bit; align to the containing 32-bit word
+            // and return the correct big-endian halfword.
+            let word_offset = offset & !3;
+            let word = self.di.read_reg(word_offset);
+            return if (offset & 2) == 0 {
+                (word >> 16) as u16  // upper (most-significant) halfword
+            } else {
+                word as u16          // lower (least-significant) halfword
+            };
         }
         0
     }
