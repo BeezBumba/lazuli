@@ -185,13 +185,31 @@ impl WasmEmulator {
     /// last call, and reset the flag to `false`.
     ///
     /// JavaScript must call this after every `hw_write_u32` and, when it returns
-    /// `true`, flush the JIT module cache so that any blocks whose code was
-    /// overwritten by the DMA are recompiled from the updated RAM contents on
-    /// the next execution.
+    /// `true`, invalidate any JIT modules whose code may have been overwritten.
+    /// Use [`last_dma_addr`] and [`last_dma_len`] to perform selective
+    /// per-address invalidation rather than flushing the entire cache.
     pub fn take_dma_dirty(&mut self) -> bool {
         let dirty = self.dma_dirty;
         self.dma_dirty = false;
         dirty
+    }
+
+    /// Physical start address (in emulator RAM) of the most recent successful
+    /// DVD DMA transfer.
+    ///
+    /// Valid only immediately after [`take_dma_dirty`] returns `true`.
+    /// JavaScript compares this against `(pc & PHYS_MASK)` for each cached
+    /// module to determine which blocks were overwritten by the DMA.
+    pub fn last_dma_addr(&self) -> u32 {
+        self.last_dma_addr
+    }
+
+    /// Byte length of the most recent successful DVD DMA transfer.
+    ///
+    /// Together with [`last_dma_addr`] this defines the half-open byte interval
+    /// `[last_dma_addr, last_dma_addr + last_dma_len)` that was overwritten.
+    pub fn last_dma_len(&self) -> u32 {
+        self.last_dma_len
     }
 }
 
@@ -229,9 +247,11 @@ impl WasmEmulator {
                         self.ram[dma_dest..dma_dest + dma_len]
                             .copy_from_slice(&disc[disc_offset..src_end]);
                         // New code may have been written into guest RAM; signal JS
-                        // to flush the JIT module cache so stale compiled blocks
-                        // are not re-used for addresses overwritten by this DMA.
+                        // to perform selective JIT cache invalidation for the
+                        // affected address range.
                         self.dma_dirty = true;
+                        self.last_dma_addr = dma_dest as u32;
+                        self.last_dma_len  = dma_len  as u32;
                     } else {
                         console_log!(
                             "[lazuli] DI: DVD Read out of bounds \

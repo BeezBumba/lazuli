@@ -118,6 +118,7 @@ impl WasmEmulator {
         self.last_compiled_pc = guest_pc;
         self.last_compiled_ins_count = block.instruction_count;
         self.last_compiled_wasm_bytes = block.bytes.len() as u32;
+        self.last_compiled_cycles = block.cycles;
         if !block.unimplemented_ops.is_empty() {
             self.unimplemented_block_count += 1;
         }
@@ -146,6 +147,7 @@ impl WasmEmulator {
         self.last_compiled_pc = guest_pc;
         self.last_compiled_ins_count = ins_count;
         self.last_compiled_wasm_bytes = byte_len;
+        self.last_compiled_cycles = block.cycles;
         if !block.unimplemented_ops.is_empty() {
             self.unimplemented_block_count += 1;
         }

@@ -127,6 +127,22 @@ pub struct WasmEmulator {
     /// Set to `true` by `process_di_command` whenever a DVD Read (0xA8)
     /// successfully copies disc bytes into guest RAM.
     pub(crate) dma_dirty: bool,
+    /// Estimated CPU cycle count of the most recently compiled block.
+    /// Mirrors [`ppcwasm::WasmBlock::cycles`] and is used by JavaScript to
+    /// drive cycle-accurate decrementer advancement (matching how ppcjit uses
+    /// `Block::meta().cycles` to feed the native scheduler).
+    pub(crate) last_compiled_cycles: u32,
+    /// Running total of emulated CPU cycles since emulator creation.
+    /// Advanced by `add_cpu_cycles()` after each block; JavaScript maintains
+    /// this to implement the same cycle-counting that `Lazuli::exec` performs
+    /// internally via its `Scheduler`.
+    pub(crate) cpu_cycles: u64,
+    /// Physical start address of the most recent successful DVD DMA transfer.
+    /// JavaScript reads this (alongside `last_dma_len`) to perform selective
+    /// per-address JIT cache invalidation instead of a full `moduleCache.clear()`.
+    pub(crate) last_dma_addr: u32,
+    /// Byte length of the most recent successful DVD DMA transfer.
+    pub(crate) last_dma_len: u32,
 }
 
 #[wasm_bindgen]
@@ -158,6 +174,10 @@ impl WasmEmulator {
             pi_intmsk: 0,
             decrementer_pending: false,
             dma_dirty: false,
+            last_compiled_cycles: 0,
+            cpu_cycles: 0,
+            last_dma_addr: 0,
+            last_dma_len: 0,
         }
     }
 }
