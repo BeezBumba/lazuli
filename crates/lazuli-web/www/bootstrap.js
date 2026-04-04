@@ -105,33 +105,6 @@ function updateStats(emu) {
     $("stat-hot-hits").textContent = "—";
   }
 
-  // Compiled block PC list — read from JS moduleCache (the Rust WasmBlockCache
-  // is a separate structure used only by the developer compile tool, not the
-  // main emulation loop which stores modules in the JS `moduleCache` Map).
-  const pcs = Array.from(moduleCache.keys())
-    .map(pc => (pc >>> 0))
-    .sort((a, b) => a - b)
-    .map(pc => "0x" + pc.toString(16).toUpperCase().padStart(8, "0"))
-    .join("  ");
-  const blockRow = $("stat-block-row");
-  const blockList = $("stat-block-list");
-  if (pcs) {
-    blockRow.style.flexDirection = "column";
-    blockRow.style.alignItems = "flex-start";
-    blockRow.style.gap = "4px";
-    blockList.style.fontSize = "0.7rem";
-    blockList.style.wordBreak = "break-all";
-    blockList.style.textAlign = "left";
-    blockList.textContent = pcs;
-  } else {
-    blockRow.style.flexDirection = "";
-    blockRow.style.alignItems = "";
-    blockRow.style.gap = "";
-    blockList.style.fontSize = "";
-    blockList.style.wordBreak = "";
-    blockList.style.textAlign = "";
-    blockList.textContent = "—";
-  }
 }
 
 function renderRegisters(emu) {
