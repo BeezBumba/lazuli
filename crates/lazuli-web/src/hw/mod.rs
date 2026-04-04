@@ -4,7 +4,7 @@
 //! This module exposes `hw_read_u32`, `hw_write_u32`, `hw_read_u16`,
 //! `hw_write_u16`, and `assert_vi_interrupt` on [`WasmEmulator`].  These are
 //! called from JavaScript when the guest accesses an MMIO address (prefix
-//! `0xCC`), before the `PHYS_MASK` is applied.
+//! `0xCC` cached or `0xCD` uncached), before the `PHYS_MASK` is applied.
 
 pub(crate) mod di;
 pub(crate) mod dsp;
@@ -19,6 +19,12 @@ pub(crate) use pi::{
 use wasm_bindgen::prelude::*;
 
 use crate::WasmEmulator;
+
+/// Bit that distinguishes the uncached (`0xCDxxxxxx`) MMIO mirror from the
+/// cached (`0xCCxxxxxx`) mirror.  Both aliases map to the same physical
+/// registers; clearing this bit normalises uncached addresses to the cached
+/// base so a single set of `*_BASE` constants covers both variants.
+const UNCACHED_MIRROR_BIT: u32 = 0x0100_0000;
 
 macro_rules! console_log {
     ($($t:tt)*) => {
@@ -50,7 +56,7 @@ impl WasmEmulator {
     pub fn hw_read_u32(&self, addr: u32) -> u32 {
         // Normalise uncached (0xCDxxxxxx) addresses to the cached (0xCCxxxxxx)
         // mirror so a single set of base-address constants covers both aliases.
-        let addr = addr & !0x0100_0000;
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
             let offset = addr - PI_BASE;
             return match offset {
@@ -84,7 +90,7 @@ impl WasmEmulator {
     /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register write + DMA
     /// - All other hardware registers: silently ignored
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
-        let addr = addr & !0x0100_0000;
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
             let offset = addr - PI_BASE;
             match offset {
@@ -118,7 +124,7 @@ impl WasmEmulator {
     ///   big-endian half of the underlying 32-bit register value.
     /// - All other hardware addresses: returns `0`
     pub fn hw_read_u16(&self, addr: u32) -> u16 {
-        let addr = addr & !0x0100_0000;
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             return self.dsp.read_u16(addr - DSP_BASE);
         }
@@ -147,7 +153,7 @@ impl WasmEmulator {
     ///   mailbox so the OS's boot-ACK polling loop exits immediately.
     /// - All other hardware addresses: silently ignored
     pub fn hw_write_u16(&mut self, addr: u32, val: u16) {
-        let addr = addr & !0x0100_0000;
+        let addr = addr & !UNCACHED_MIRROR_BIT;
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             self.dsp.write_u16(addr - DSP_BASE, val);
         }

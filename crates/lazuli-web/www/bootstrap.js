@@ -468,14 +468,16 @@ function getRamView(emu) {
  * `0x00006000` — an address inside guest RAM — causing silent corruption.
  *
  * Both cached (`0xCC`) and uncached (`0xCD`) mirrors are detected by checking
- * `(addr >>> 24 & 0xFE) === 0xCC` (clears the cached/uncached bit).  The
- * Rust hw dispatch functions perform the same normalisation internally.
+ * `(addr >>> 24 & 0xFE) === 0xCC` — this clears bit 0 of the top byte,
+ * normalising `0xCD` (uncached) to `0xCC` (cached) before the comparison.
+ * The Rust hw dispatch functions perform the same normalisation internally.
  *
  * For 32-bit reads/writes the Rust `hw_read_u32` / `hw_write_u32` exports are
- * called instead; they dispatch to the appropriate hardware module (currently
- * PI, DI, and DSP).  Sub-32-bit accesses to hardware space return 0 / are
- * ignored for 8-bit widths since all GameCube MMIO registers are 16- or
- * 32-bit wide.
+ * called instead; they dispatch to the appropriate hardware module (PI, DI,
+ * DSP).  8-bit accesses to MMIO space return 0 / are silently ignored since
+ * GameCube MMIO registers are 16-bit (DSP) or 32-bit (PI, DI) wide.
+ * 16-bit accesses are forwarded to `hw_read_u16` / `hw_write_u16` for the
+ * DSP Interface registers (accessed with `lhz`/`sth` by the OS).
  *
  * For all non-hardware addresses `PHYS_MASK` is applied as before, converting
  * `0x80xxxxxx` guest virtual addresses to 25-bit physical RAM offsets.
