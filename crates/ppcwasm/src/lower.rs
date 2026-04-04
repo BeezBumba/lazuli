@@ -227,9 +227,11 @@ fn emit_inst(
         IrInst::I32ShrS => b.push(Instruction::I32ShrS),
         IrInst::I32Rotl => b.push(Instruction::I32Rotl),
         IrInst::I32Clz  => b.push(Instruction::I32Clz),
+        IrInst::I32Ctz  => b.push(Instruction::I32Ctz),
 
         // ── Integer comparisons → i32 0 or 1 ──────────────────────────────────
         IrInst::I32Eq  => b.push(Instruction::I32Eq),
+        IrInst::I32Ne  => b.push(Instruction::I32Ne),
         IrInst::I32LtS => b.push(Instruction::I32LtS),
         IrInst::I32LtU => b.push(Instruction::I32LtU),
         IrInst::I32GtS => b.push(Instruction::I32GtS),
@@ -271,6 +273,23 @@ fn emit_inst(
             // f64 → f32 → i32 bits  (implements `stfs`)
             b.push(Instruction::F32DemoteF64);
             b.push(Instruction::I32ReinterpretF32);
+        }
+
+        // ── 64-bit helpers for high-word multiply ─────────────────────────────
+        IrInst::I64ExtendI32S => b.push(Instruction::I64ExtendI32S),
+        IrInst::I64ExtendI32U => b.push(Instruction::I64ExtendI32U),
+        IrInst::I64Mul        => b.push(Instruction::I64Mul),
+        IrInst::I64ShrS32 => {
+            // arithmetic shift right by 32, then wrap to i32
+            b.push(Instruction::I64Const(32));
+            b.push(Instruction::I64ShrS);
+            b.push(Instruction::I32WrapI64);
+        }
+        IrInst::I64ShrU32 => {
+            // logical shift right by 32, then wrap to i32
+            b.push(Instruction::I64Const(32));
+            b.push(Instruction::I64ShrU);
+            b.push(Instruction::I32WrapI64);
         }
 
         // ── Memory access via host hooks ───────────────────────────────────────
