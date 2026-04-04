@@ -3,7 +3,6 @@
 mod cli;
 mod runner;
 mod windows;
-use ppcint;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
