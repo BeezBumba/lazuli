@@ -274,6 +274,62 @@ fn emit_inst(
             b.push(Instruction::F32DemoteF64);
             b.push(Instruction::I32ReinterpretF32);
         }
+        IrInst::I32FromF64LowBits => {
+            // f64 bit-pattern as i64, take low 32 bits  (implements `stfiwx`)
+            b.push(Instruction::I64ReinterpretF64);
+            b.push(Instruction::I32WrapI64);
+        }
+
+        // ── Float select ──────────────────────────────────────────────────────
+        // Stack: (f64 val1, f64 val2, i32 cond) → (f64): cond ? val1 : val2
+        IrInst::F64Select => b.push(Instruction::Select),
+
+        // ── Integer byte-swap ─────────────────────────────────────────────────
+        IrInst::I32Bswap => {
+            // Byte-swap 32-bit value using shifts and masks (no native WASM bswap).
+            // Result: ((x&0xFF)<<24) | ((x&0xFF00)<<8) | ((x>>8)&0xFF00) | (x>>24)
+            b.push(Instruction::LocalSet(si32));
+            // byte at position 3 → position 0 (shift left 24)
+            b.push(Instruction::LocalGet(si32));
+            b.push(Instruction::I32Const(0xFF));
+            b.push(Instruction::I32And);
+            b.push(Instruction::I32Const(24));
+            b.push(Instruction::I32Shl);
+            // byte at position 2 → position 1 (shift left 8)
+            b.push(Instruction::LocalGet(si32));
+            b.push(Instruction::I32Const(0xFF00));
+            b.push(Instruction::I32And);
+            b.push(Instruction::I32Const(8));
+            b.push(Instruction::I32Shl);
+            b.push(Instruction::I32Or);
+            // byte at position 1 → position 2 (shift right 8)
+            b.push(Instruction::LocalGet(si32));
+            b.push(Instruction::I32Const(8));
+            b.push(Instruction::I32ShrU);
+            b.push(Instruction::I32Const(0xFF00));
+            b.push(Instruction::I32And);
+            b.push(Instruction::I32Or);
+            // byte at position 0 → position 3 (shift right 24)
+            b.push(Instruction::LocalGet(si32));
+            b.push(Instruction::I32Const(24));
+            b.push(Instruction::I32ShrU);
+            b.push(Instruction::I32Or);
+        }
+        IrInst::I32Bswap16 => {
+            // Byte-swap low 2 bytes, zero-extend: ((x&0xFF)<<8) | ((x>>8)&0xFF)
+            b.push(Instruction::LocalSet(si32));
+            b.push(Instruction::LocalGet(si32));
+            b.push(Instruction::I32Const(0xFF));
+            b.push(Instruction::I32And);
+            b.push(Instruction::I32Const(8));
+            b.push(Instruction::I32Shl);
+            b.push(Instruction::LocalGet(si32));
+            b.push(Instruction::I32Const(8));
+            b.push(Instruction::I32ShrU);
+            b.push(Instruction::I32Const(0xFF));
+            b.push(Instruction::I32And);
+            b.push(Instruction::I32Or);
+        }
 
         // ── 64-bit helpers for high-word multiply ─────────────────────────────
         IrInst::I64ExtendI32S => b.push(Instruction::I64ExtendI32S),
