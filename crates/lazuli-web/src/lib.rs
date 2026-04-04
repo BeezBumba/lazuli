@@ -170,6 +170,100 @@ const DI_BASE: u32 = 0xCC00_6000;
 /// Number of bytes covered by the DI register bank (10 × 4-byte registers).
 const DI_SIZE: u32 = 0x28;
 
+// ─── Processor Interface (PI) ─────────────────────────────────────────────────
+
+/// Physical base address of the Processor Interface registers.
+const PI_BASE: u32 = 0xCC00_3000;
+/// Number of bytes covered by the PI register bank.
+const PI_SIZE: u32 = 0x40;
+
+/// PI interrupt-status bit for the Video Interface (VI) retrace interrupt.
+///
+/// This is bit 7 of PI_INTSR/PI_INTMSK (value `0x80`), matching the GameCube
+/// SDK constant `PI_INTERRUPT_VI`.
+const PI_INT_VI: u32 = 0x0000_0080;
+
+/// Value returned from PI_MEMSIZE (0xCC003028): 24 MiB of main RAM.
+const PI_MEMSIZE_VAL: u32 = 24 * 1024 * 1024;
+
+/// Value returned from PI_BUSCLK (0xCC00302C): GameCube bus clock in Hz.
+const PI_BUSCLK_VAL: u32 = 162_000_000;
+
+/// Value returned from PI_CPUCLK (0xCC003030): GameCube CPU clock in Hz.
+const PI_CPUCLK_VAL: u32 = 486_000_000;
+
+// ─── DSP Interface ────────────────────────────────────────────────────────────
+
+/// Physical base address of the DSP Interface registers.
+///
+/// The DSP uses 16-bit registers accessed with `lhz`/`sth` (halfword
+/// load/store).  The OS boots the DSP by writing a boot-code address to the
+/// CPU→DSP mailbox (`0xCC005004`/`0xCC005006`) and then polling the DSP→CPU
+/// mailbox (`0xCC005000`/`0xCC005002`) until it sees a non-zero ACK.
+///
+/// Without a real DSP implementation the OS would spin forever in
+/// `__OSInitAudioSystem`.  The [`DspState`] below provides a minimal HLE
+/// stub: any value written to the CPU→DSP mailbox is immediately echoed back
+/// to the DSP→CPU mailbox, so the OS sees its own boot command as the ACK
+/// and proceeds.
+const DSP_BASE: u32 = 0xCC00_5000;
+/// Number of bytes covered by the DSP register bank (8 × 2-byte registers).
+const DSP_SIZE: u32 = 0x10;
+
+/// DSP Interface hardware register file.
+///
+/// All registers are 16-bit (halfword); they are accessed with `lhz`/`sth`
+/// instructions by the OS, which calls our [`WasmEmulator::hw_read_u16`] /
+/// [`WasmEmulator::hw_write_u16`] exports via the JS hooks.
+///
+/// ## Register map (offsets from `DSP_BASE`)
+///
+/// | Offset | Name        | Description                                |
+/// |--------|-------------|--------------------------------------------|
+/// | 0x00   | DSMAILBOX_H | DSP→CPU mailbox high 16 bits (R)           |
+/// | 0x02   | DSMAILBOX_L | DSP→CPU mailbox low 16 bits (R)            |
+/// | 0x04   | CSMAILBOX_H | CPU→DSP mailbox high 16 bits (W)           |
+/// | 0x06   | CSMAILBOX_L | CPU→DSP mailbox low 16 bits (W)            |
+/// | 0x08   | DSPCONTROL  | Control/status register (R/W)              |
+#[derive(Default)]
+struct DspState {
+    /// DSP→CPU mailbox high 16 bits (returned on read from 0xCC005000).
+    dsp2cpu_hi: u16,
+    /// DSP→CPU mailbox low 16 bits (returned on read from 0xCC005002).
+    dsp2cpu_lo: u16,
+    /// DSP control/status register (read from 0xCC005008).
+    control: u16,
+}
+
+impl DspState {
+    /// Read a 16-bit value from the DSP register at `offset` bytes from
+    /// `DSP_BASE`.
+    fn read_u16(&self, offset: u32) -> u16 {
+        match offset {
+            0x00 => self.dsp2cpu_hi,
+            0x02 => self.dsp2cpu_lo,
+            0x08 => self.control,
+            _ => 0,
+        }
+    }
+
+    /// Write `val` to the DSP register at `offset` bytes from `DSP_BASE`.
+    ///
+    /// Writes to the CPU→DSP mailbox (`0x04`/`0x06`) are immediately echoed
+    /// to the DSP→CPU mailbox (`0x00`/`0x02`) as a minimal HLE stub: the OS
+    /// sends a boot command and polls for an ACK; by echoing we satisfy the
+    /// poll without running real DSP microcode.
+    fn write_u16(&mut self, offset: u32, val: u16) {
+        match offset {
+            // CPU→DSP mailbox: echo immediately to DSP→CPU (HLE DSP boot stub).
+            0x04 => self.dsp2cpu_hi = val,
+            0x06 => self.dsp2cpu_lo = val,
+            0x08 => self.control = val,
+            _ => {}
+        }
+    }
+}
+
 /// DVD Interface hardware register file.
 ///
 /// Mirrors the ten memory-mapped I/O registers at `0xCC006000–0xCC006027`.
@@ -303,6 +397,17 @@ pub struct WasmEmulator {
     disc: Option<Vec<u8>>,
     /// DVD Interface (DI) hardware register state.
     di: DiState,
+    /// DSP Interface hardware register state (mailbox echo HLE stub).
+    dsp: DspState,
+    /// Processor Interface interrupt status register.
+    ///
+    /// Bits are set by hardware events (e.g. VI retrace) and cleared by the
+    /// guest OS writing a `1` bit to `PI_INTSR` (write-1-to-clear).
+    pi_intsr: u32,
+    /// Processor Interface interrupt mask register (PI_INTMSK at 0xCC003004).
+    ///
+    /// Written by the OS to enable/disable individual interrupt sources.
+    pi_intmsk: u32,
     /// True when the decrementer has transitioned from non-negative to negative
     /// but the exception has not yet been delivered because MSR.EE was clear at
     /// the time of the transition.  The exception is held pending and will be
@@ -340,6 +445,9 @@ impl WasmEmulator {
             raise_exception_count: 0,
             disc: None,
             di: DiState::default(),
+            dsp: DspState::default(),
+            pi_intsr: 0,
+            pi_intmsk: 0,
             decrementer_pending: false,
             dma_dirty: false,
         }
@@ -413,9 +521,22 @@ impl WasmEmulator {
     /// silently alias into guest RAM instead of the DVD Interface registers.
     ///
     /// Currently handles:
+    /// - **Processor Interface** (`0xCC003000–0xCC00303F`): INTSR, INTMSK,
+    ///   MEMSIZE, BUSCLK, CPUCLK
     /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register read
     /// - All other hardware registers: returns `0`
     pub fn hw_read_u32(&self, addr: u32) -> u32 {
+        if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
+            let offset = addr - PI_BASE;
+            return match offset {
+                0x00 => self.pi_intsr,
+                0x04 => self.pi_intmsk,
+                0x28 => PI_MEMSIZE_VAL,
+                0x2C => PI_BUSCLK_VAL,
+                0x30 => PI_CPUCLK_VAL,
+                _ => 0,
+            };
+        }
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             return self.di.read_reg(addr - DI_BASE);
         }
@@ -433,15 +554,94 @@ impl WasmEmulator {
     /// requested bytes are copied from `disc` into guest RAM.
     ///
     /// Currently handles:
+    /// - **Processor Interface** (`0xCC003000–0xCC00303F`): INTSR (W1C),
+    ///   INTMSK
     /// - **DVD Interface** (`0xCC006000–0xCC006027`): full register write + DMA
     /// - All other hardware registers: silently ignored
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
+        if addr >= PI_BASE && addr < PI_BASE + PI_SIZE {
+            let offset = addr - PI_BASE;
+            match offset {
+                // PI_INTSR: write-1-to-clear — guest OS writes back the bits
+                // it has handled to acknowledge the interrupt.
+                0x00 => self.pi_intsr &= !val,
+                // PI_INTMSK: interrupt enable mask (normal read/write).
+                0x04 => self.pi_intmsk = val,
+                _ => {}
+            }
+            return;
+        }
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             if self.di.write_reg(addr - DI_BASE, val) {
                 self.process_di_command();
             }
         }
         // All other hardware addresses are ignored (reads return 0 via hw_read_u32).
+    }
+
+    /// Read a 16-bit value from a GameCube hardware register.
+    ///
+    /// Called by the JavaScript `read_u16` hook when the guest address has the
+    /// prefix `0xCC`.  Currently handles:
+    ///
+    /// - **DSP Interface** (`0xCC005000–0xCC00500F`): DSP→CPU mailbox and
+    ///   control register.  The OS polls `0xCC005000`/`0xCC005002` (the
+    ///   DSP→CPU mailbox high/low) waiting for an ACK after booting the DSP.
+    ///   Our HLE stub echoes every value the OS writes to the CPU→DSP mailbox
+    ///   back to the DSP→CPU mailbox, satisfying the poll immediately.
+    /// - All other hardware addresses: returns `0`
+    pub fn hw_read_u16(&self, addr: u32) -> u16 {
+        if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
+            return self.dsp.read_u16(addr - DSP_BASE);
+        }
+        0
+    }
+
+    /// Write a 16-bit value to a GameCube hardware register.
+    ///
+    /// Called by the JavaScript `write_u16` hook when the guest address has
+    /// the prefix `0xCC`.  Currently handles:
+    ///
+    /// - **DSP Interface** (`0xCC005000–0xCC00500F`): CPU→DSP mailbox.  Values
+    ///   written to `0xCC005004`/`0xCC005006` are echoed to the DSP→CPU
+    ///   mailbox so the OS's boot-ACK polling loop exits immediately.
+    /// - All other hardware addresses: silently ignored
+    pub fn hw_write_u16(&mut self, addr: u32, val: u16) {
+        if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
+            self.dsp.write_u16(addr - DSP_BASE, val);
+        }
+        // All other 16-bit hardware writes are silently ignored.
+    }
+
+    /// Assert a Video Interface (VI) vertical-retrace interrupt.
+    ///
+    /// Call this **once per animation frame** (~60 Hz) from the JavaScript
+    /// game loop.  The function sets the VI bit in `PI_INTSR` and, if the
+    /// guest CPU currently has external interrupts enabled (`MSR.EE = 1`) and
+    /// the OS has unmasked the VI interrupt in `PI_INTMSK`, delivers an
+    /// `Exception::Interrupt` (vector `0x00000500`) to the CPU.
+    ///
+    /// This allows OS spin-wait loops such as `VIWaitForRetrace()` to exit:
+    /// those loops briefly enable `EE` so that any pending interrupt can fire.
+    /// When the VI interrupt fires, the OS interrupt dispatcher reads
+    /// `PI_INTSR`, sees the VI bit, increments the retrace counter, and
+    /// `rfi`s back so the wait loop can observe the change and exit.
+    ///
+    /// The VI bit in `PI_INTSR` is cleared by the guest OS writing `1` to
+    /// that bit via `hw_write_u32` (PI uses write-1-to-clear semantics),
+    /// which happens in the VI interrupt service routine.
+    pub fn assert_vi_interrupt(&mut self) {
+        // Set the VI pending bit in PI_INTSR.
+        self.pi_intsr |= PI_INT_VI;
+
+        // Deliver the external interrupt immediately if EE=1 and the OS has
+        // unmasked the VI interrupt in PI_INTMSK.
+        let ee = self.cpu.supervisor.config.msr.interrupts();
+        let vi_enabled = (self.pi_intmsk & PI_INT_VI) != 0;
+        if ee && vi_enabled {
+            self.pi_intsr &= !PI_INT_VI; // acknowledged on delivery
+            self.cpu.raise_exception(gekko::Exception::Interrupt);
+        }
     }
 
     // ── Register access (for JS debugging) ───────────────────────────────────
@@ -662,6 +862,12 @@ impl WasmEmulator {
     /// matching real hardware where the exception fires on every `rfi` return
     /// until the handler writes a new positive value to DEC.
     ///
+    /// After the decrementer check, any pending PI external interrupts
+    /// (e.g. VI retrace set by [`assert_vi_interrupt`]) that are both unmasked
+    /// in `PI_INTMSK` and pass the `MSR.EE` gate are also delivered here.
+    /// This piggy-backs on the per-block cadence so external interrupts fire
+    /// as soon as a block re-enables `EE`.
+    ///
     /// Call this once per JIT block (not just once per animation frame) so that
     /// the exception fires as soon as the guest enables `EE` inside a spin-wait
     /// loop.
@@ -677,14 +883,31 @@ impl WasmEmulator {
         // stale pending flag from a previous negative phase.
         self.decrementer_pending = (new_dec as i32) < 0;
 
-        // Deliver the exception as soon as external interrupts are enabled.
-        // Clearing the flag here and then unconditionally recomputing it at the
-        // top of the next call is intentional: if DEC is still negative after
-        // the handler runs `rfi` without resetting DEC, the flag is re-latched
-        // and the exception fires again — exactly as on real hardware.
-        if self.decrementer_pending && self.cpu.supervisor.config.msr.interrupts() {
+        let ee = self.cpu.supervisor.config.msr.interrupts();
+
+        // Deliver the decrementer exception as soon as external interrupts are
+        // enabled.  Clearing the flag here and then unconditionally recomputing
+        // it at the top of the next call is intentional: if DEC is still
+        // negative after the handler runs `rfi` without resetting DEC, the
+        // flag is re-latched and the exception fires again — exactly as on
+        // real hardware.  Decrementer takes priority over PI external
+        // interrupts.
+        if self.decrementer_pending && ee {
             self.decrementer_pending = false;
             self.cpu.raise_exception(gekko::Exception::Decrementer);
+            return;
+        }
+
+        // Deliver any pending PI external interrupt (e.g. VI retrace) if EE=1
+        // and the interrupt source is unmasked in PI_INTMSK.
+        if ee {
+            let pending = self.pi_intsr & self.pi_intmsk;
+            if pending != 0 {
+                // Clear the delivered bits from PI_INTSR (the ISR will write
+                // them back via hw_write_u32 to fully acknowledge).
+                self.pi_intsr &= !pending;
+                self.cpu.raise_exception(gekko::Exception::Interrupt);
+            }
         }
     }
 

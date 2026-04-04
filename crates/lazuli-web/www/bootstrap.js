@@ -583,7 +583,11 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     read_u16(addr) {
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) return 0;
+      if ((addr >>> 24) === 0xCC) {
+        // Route to Rust hw_read_u16 for hardware registers (e.g. DSP mailbox).
+        if (emu) return emu.hw_read_u16(addr) & 0xFFFF;
+        return 0;
+      }
       addr &= PHYS_MASK;
       if (addr + 1 >= ram.length) return 0;
       return (ram[addr] << 8) | ram[addr + 1];
@@ -620,7 +624,11 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     write_u16(addr, val) {
       addr = addr >>> 0;
-      if ((addr >>> 24) === 0xCC) return; // HW registers are 32-bit only
+      if ((addr >>> 24) === 0xCC) {
+        // Route to Rust hw_write_u16 for hardware registers (e.g. DSP mailbox).
+        if (emu) emu.hw_write_u16(addr, val & 0xFFFF);
+        return;
+      }
       addr &= PHYS_MASK;
       if (addr + 1 < ram.length) {
         ram[addr]     = (val >> 8) & 0xff;
@@ -1271,6 +1279,14 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // Advance the time base before executing blocks so that mftb-based timing
   // loops inside the game see a non-zero delta on the very first frame.
   emu.advance_timebase(TIMEBASE_TICKS_PER_FRAME);
+
+  // Assert the VI (Video Interface) vertical-retrace interrupt once per frame
+  // (~60 Hz).  Games and the OS use VIWaitForRetrace() — a spin loop that
+  // briefly enables EE so the VI external interrupt can fire.  Without this
+  // call the OS retrace counter never increments and VIWaitForRetrace() spins
+  // forever.  advance_decrementer (called after every block below) will
+  // deliver the pending External exception as soon as EE=1.
+  emu.assert_vi_interrupt();
 
   // Execute blocks for this frame
   const ram = getRamView(emu);
