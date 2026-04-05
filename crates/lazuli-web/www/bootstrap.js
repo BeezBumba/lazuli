@@ -92,7 +92,7 @@ function updateStats(emu) {
   const cr  = emu.get_cr() >>> 0;
   const ctr = emu.get_ctr() >>> 0;
   setText("stat-cr",  "0x" + cr.toString(16).toUpperCase().padStart(8, "0"));
-  setText("stat-ctr", "0x" + ctr.toString(16).toUpperCase().padStart(8, "0"));
+  setText("stat-ctr", (ctr >>> 0).toString(10));
 
   // CR field breakdown: CR0 (bits 31-28) … CR7 (bits 3-0)
   const crGrid = $("cr-field-grid");
