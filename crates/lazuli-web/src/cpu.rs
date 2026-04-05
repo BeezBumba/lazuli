@@ -36,6 +36,12 @@ impl WasmEmulator {
         self.cpu.user.gpr[i as usize] = value;
     }
 
+    /// Get the primary (ps0) value of FPR[i].
+    pub fn get_fpr(&self, i: u8) -> f64 {
+        if i >= 32 { return 0.0; }
+        self.cpu.user.fpr[i as usize].0[0]
+    }
+
     /// Current Link Register value.
     pub fn get_lr(&self) -> u32 {
         self.cpu.user.lr

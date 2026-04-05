@@ -139,6 +139,22 @@ function renderRegisters(emu) {
   grid.appendChild(pcCell);
 }
 
+function renderFprRegisters(emu) {
+  const grid = $("fpr-grid");
+  if (!grid) return;
+  grid.innerHTML = "";
+
+  for (let i = 0; i < 32; i++) {
+    const cell = document.createElement("div");
+    cell.className = "reg-cell";
+    const val = emu.get_fpr(i);
+    cell.innerHTML =
+      `<span class="reg-name">f${i}&nbsp;</span>` +
+      `<span class="reg-val">${val.toExponential(4)}</span>`;
+    grid.appendChild(cell);
+  }
+}
+
 // ── Hex dump helper ───────────────────────────────────────────────────────────
 function annotateWasm(bytes) {
   if (bytes.length === 0) return "(empty)";
@@ -1523,6 +1539,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     setStatus(`✗ Stopped at ${errHex} — see console / debug log`, "status-err");
     updateStats(emu);
     renderRegisters(emu);
+    renderFprRegisters(emu);
     return;
   }
 
@@ -1542,6 +1559,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   if (frameCount % 10 === 0) {
     updateStats(emu);
     renderRegisters(emu);
+    renderFprRegisters(emu);
   }
 
   animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
@@ -1658,6 +1676,7 @@ async function main() {
   }
 
   renderRegisters(emu);
+  renderFprRegisters(emu);
   updateStats(emu);
 
   // ── Keyboard controller ────────────────────────────────────────────────────
@@ -1690,6 +1709,7 @@ async function main() {
   $("btn-stop").addEventListener("click", () => {
     stopLoop();
     renderRegisters(emu);
+    renderFprRegisters(emu);
     updateStats(emu);
   });
 
@@ -1704,6 +1724,7 @@ async function main() {
     emu.set_pc(lastEntryPoint);
     drawPlaceholder(ctx, gameTitle, null);
     renderRegisters(emu);
+    renderFprRegisters(emu);
     updateStats(emu);
     setStatus(
       `↺ Reset to entry 0x${lastEntryPoint.toString(16).toUpperCase()} — press ▶ Start`,
@@ -1767,6 +1788,7 @@ async function main() {
 
         drawPlaceholder(ctx, gameTitle, emu);
         renderRegisters(emu);
+        renderFprRegisters(emu);
         updateStats(emu);
 
         setStatus(
@@ -1863,6 +1885,7 @@ async function main() {
     const ok  = executeOneBlockSync(emu, ram, log);
     for (const line of log) appendExecLog(line);
     renderRegisters(emu);
+    renderFprRegisters(emu);
     updateStats(emu);
     setStatus(
       ok
@@ -1885,6 +1908,7 @@ async function main() {
       count++;
     }
     renderRegisters(emu);
+    renderFprRegisters(emu);
     updateStats(emu);
     setStatus(
       count > 0
