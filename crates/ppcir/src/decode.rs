@@ -1396,7 +1396,12 @@ impl Decoder {
                 return true;
             }
             Opcode::Illegal => {
-                panic!("illegal instruction at 0x{:08X}", pc);
+                // Illegal/unrecognized instruction: raise a Program Exception
+                // (vector 0x0700) exactly as real PowerPC hardware does.
+                // SRR0 is set to the address of the faulting instruction.
+                b.push(IrInst::I32Const(pc as i32)); b.push(IrInst::StorePC);
+                b.push(IrInst::RaiseException(0x0700));
+                return true;
             }
 
             // ── Float select ──────────────────────────────────────────────────
@@ -1647,7 +1652,12 @@ impl Decoder {
 
             // ── Unimplemented ─────────────────────────────────────────────────
             _ => {
-                panic!("unimplemented instruction {:?} at 0x{:08X}", ins.op, pc);
+                // Record the missing opcode for diagnostics, then skip over the
+                // instruction (ReturnStatic to pc+4) so compilation can continue
+                // from the next block rather than crashing the emulator.
+                b.unimplemented_ops.push(format!("{:?} @ 0x{:08X}", ins.op, pc));
+                b.push(IrInst::ReturnStatic(pc + 4));
+                return true;
             }
         }
         false
