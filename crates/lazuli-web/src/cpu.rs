@@ -52,6 +52,16 @@ impl WasmEmulator {
         self.cpu.user.ctr
     }
 
+    /// Current Condition Register (CR) as a raw 32-bit word.
+    ///
+    /// The CR is split into eight 4-bit fields CR0–CR7 (CR0 occupies the
+    /// most-significant nibble, CR7 the least-significant). Each field holds
+    /// the LT, GT, EQ, and SO comparison flags produced by integer compare
+    /// instructions or the `Rc` update path.
+    pub fn get_cr(&self) -> u32 {
+        self.cpu.user.cr.to_bits()
+    }
+
     /// Current Machine State Register (MSR) as a raw 32-bit word.
     ///
     /// Bit 15 (`interrupts` / `EE`) is the external-interrupt enable flag.

@@ -88,6 +88,29 @@ function updateStats(emu) {
   const lr = emu.get_lr();
   setText("stat-lr", "0x" + lr.toString(16).toUpperCase().padStart(8, "0"));
 
+  // Condition Register (CR) and CTR
+  const cr  = emu.get_cr() >>> 0;
+  const ctr = emu.get_ctr() >>> 0;
+  setText("stat-cr",  "0x" + cr.toString(16).toUpperCase().padStart(8, "0"));
+  setText("stat-ctr", "0x" + ctr.toString(16).toUpperCase().padStart(8, "0"));
+
+  // CR field breakdown: CR0 (bits 31-28) … CR7 (bits 3-0)
+  const crGrid = $("cr-field-grid");
+  if (crGrid) {
+    const FLAG_NAMES = ["LT", "GT", "EQ", "SO"];
+    crGrid.innerHTML = "";
+    for (let field = 0; field < 8; field++) {
+      const nibble = (cr >>> (28 - field * 4)) & 0xF;
+      const flags  = FLAG_NAMES.filter((_, i) => nibble & (8 >> i));
+      const cell   = document.createElement("div");
+      cell.className = "reg-cell";
+      cell.innerHTML =
+        `<span class="reg-name">CR${field}</span> ` +
+        `<span class="reg-val">${flags.length ? flags.join("|") : "—"}</span>`;
+      crGrid.appendChild(cell);
+    }
+  }
+
   // Last compiled block details — shown once at least one block has been compiled
   if (emu.blocks_compiled() > 0) {
     const lastPc = emu.last_compiled_pc() >>> 0;
