@@ -981,6 +981,16 @@ function executeOneBlockSync(emu, ram, log) {
     try {
       wasmBytes = emu.compile_block(pc);
     } catch (e) {
+      // Dump full CPU state so the register values that led to the bad PC are
+      // visible in the log even though no block executed at this address yet.
+      const gprDump = Array.from({ length: 32 }, (_, i) =>
+        `r${i}=${hexU32(emu.get_gpr(i))}`
+      ).join(" ");
+      console.error(
+        `[lazuli] compile_block pre-failure CPU state @ ${pcHex}:\n` +
+        `  GPR: ${gprDump}\n` +
+        `  CR=${hexU32(emu.get_cr())}  CTR=${hexU32(emu.get_ctr())}  LR=${hexU32(emu.get_lr())}`,
+      );
       const msg = `compile error @ ${pcHex}: ${e}`;
       console.error(`[lazuli] ${msg}`);
       if (log) log.push(`[${pcHex}] compile error: ${e}`);
