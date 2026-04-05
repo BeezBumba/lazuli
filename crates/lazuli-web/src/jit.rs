@@ -256,6 +256,10 @@ impl WasmEmulator {
                     // decoder so the host interrupt-check loop sees the new
                     // MSR value before any further instructions execute.
                     | gekko::disasm::Opcode::Mtmsr
+                    // Illegal terminates the block in the IR decoder (emits
+                    // ReturnStatic(pc+4)); stop fetching to avoid including
+                    // unreachable instructions in the fetched slice.
+                    | gekko::disasm::Opcode::Illegal
             );
             out.push((pc, ins));
             if is_terminal {
