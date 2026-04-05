@@ -237,9 +237,10 @@ function parseDol(view, bytes, dolOffset) {
  *
  * @param {ArrayBuffer} arrayBuffer Raw ISO bytes
  * @param {WasmEmulator} emu        Emulator instance
+ * @param {Uint8Array|null} iplHleDol ipl-hle DOL bytes (fetched at startup)
  * @returns {{ gameId: string, gameName: string, entry: number }}
  */
-function parseAndLoadIso(arrayBuffer, emu) {
+function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   const view  = new DataView(arrayBuffer);
   const bytes = new Uint8Array(arrayBuffer);
 
@@ -339,13 +340,17 @@ function parseAndLoadIso(arrayBuffer, emu) {
   const apploaderBody = bytes.slice(apploaderBodyOffset, apploaderBodyOffset + apploaderSize);
   emu.load_bytes(0x81200000, apploaderBody);
 
-  // ── Step 4: load the embedded ipl-hle DOL into guest RAM, mirroring
-  // load_ipl_hle() in system.rs.  ipl-hle is baked into the WASM binary at
-  // build time (include_bytes! in lazuli-web/src/loader.rs) and linked at
-  // 0x81300000 (see crates/ipl-hle/linker.ld).  Its main() expects the real
-  // apploader's entry function address in r3, exactly as the native emulator
-  // sets cpu.user.gpr[3] = entry.value() after load_apploader().
-  const iplEntry = emu.load_ipl_hle();
+  // ── Step 4: load the ipl-hle DOL into guest RAM.
+  // ipl-hle is fetched from the server at startup (ipl-hle.dol, built via
+  // `just ipl-hle build` and copied to the www/ directory by `just web-build`).
+  // Its main() expects the real apploader's entry function address in r3.
+  if (!iplHleDol) {
+    throw new Error(
+      "ipl-hle.dol is not available — run `just ipl-hle build` then `just web-build` " +
+      "to generate and deploy the ipl-hle binary before loading an ISO."
+    );
+  }
+  const iplEntry = emu.load_ipl_hle(iplHleDol);
   emu.set_gpr(3, apploaderEntrypoint);
 
   // Point the CPU at the ipl-hle entry (0x81300000), not the raw apploader
@@ -1606,6 +1611,11 @@ async function main() {
   // Last ISO entry point — used by the Reset button to restart at the correct PC.
   let lastEntryPoint = 0x80000000;
 
+  // ipl-hle DOL bytes fetched from the server at startup.  null when the file
+  // is not available (built from crates/ipl-hle/ via `just ipl-hle build` and
+  // copied to this directory by the `web-build` justfile recipe).
+  let iplHleDol = null;
+
   // Draw splash screen while WASM loads
   drawPlaceholder(ctx, null, null);
 
@@ -1623,6 +1633,20 @@ async function main() {
     setStatus(`✗ Failed to load WASM module: ${e}`, "status-err");
     console.error(e);
     return;
+  }
+
+  // Fetch the ipl-hle DOL (built from crates/ipl-hle/ and served alongside
+  // the WASM).  A missing file is non-fatal — ISO boot will fail gracefully.
+  try {
+    const resp = await fetch("./ipl-hle.dol");
+    if (resp.ok) {
+      iplHleDol = new Uint8Array(await resp.arrayBuffer());
+      console.log(`[lazuli] ipl-hle.dol fetched (${iplHleDol.byteLength} bytes)`);
+    } else {
+      console.warn(`[lazuli] ipl-hle.dol not found (${resp.status}); ISO boot unavailable`);
+    }
+  } catch (e) {
+    console.warn("[lazuli] Could not fetch ipl-hle.dol:", e);
   }
 
   renderRegisters(emu);
@@ -1718,7 +1742,7 @@ async function main() {
         xfbHasContent = false;
         xfbAddr       = XFB_PHYS_DEFAULT;
 
-        const meta = parseAndLoadIso(evt.target.result, emu);
+        const meta = parseAndLoadIso(evt.target.result, emu, iplHleDol);
         // Store the raw ISO bytes in the Rust DiscImageDevice so the emulated
         // DVD controller can service in-game sector reads (streams, audio,
         // textures) without re-reading from the JS File object.
