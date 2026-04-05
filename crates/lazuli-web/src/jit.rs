@@ -95,7 +95,13 @@ impl WasmEmulator {
         let block = self
             .jit
             .build(instructions.into_iter())
-            .ok_or_else(|| JsValue::from_str("JIT produced no block"))?;
+            .map_err(|e| {
+                console_log!(
+                    "[lazuli] ❌ compile_block FAILED @ 0x{:08X}: {} | disasm: {}",
+                    guest_pc, e, disasm.join(" | "),
+                );
+                JsValue::from_str(&format!("JIT decode error @ 0x{:08X}: {}", guest_pc, e))
+            })?;
 
         if block.unimplemented_ops.is_empty() {
             console_log!(
@@ -139,10 +145,21 @@ impl WasmEmulator {
             return Err(JsValue::from_str("no instructions at guest PC"));
         }
 
+        let disasm: Vec<String> = instructions
+            .iter()
+            .map(|(pc, ins)| format!("0x{:08X}: {:?}", pc, ins.op))
+            .collect();
+
         let block = self
             .jit
             .build(instructions.into_iter())
-            .ok_or_else(|| JsValue::from_str("JIT produced no block"))?;
+            .map_err(|e| {
+                console_log!(
+                    "[lazuli] ❌ compile_and_cache_block FAILED @ 0x{:08X}: {} | disasm: {}",
+                    guest_pc, e, disasm.join(" | "),
+                );
+                JsValue::from_str(&format!("JIT decode error @ 0x{:08X}: {}", guest_pc, e))
+            })?;
 
         let ins_count = block.instruction_count;
         let byte_len = block.bytes.len() as u32;

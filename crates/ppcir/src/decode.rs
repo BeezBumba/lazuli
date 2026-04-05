@@ -21,20 +21,24 @@ pub struct Decoder;
 impl Decoder {
     pub fn new() -> Self { Self }
 
-    pub fn decode(&self, instructions: impl Iterator<Item = (u32, Ins)>) -> Option<IrBlock> {
+    pub fn decode(&self, instructions: impl Iterator<Item = (u32, Ins)>) -> Result<IrBlock, String> {
         let mut block = IrBlock::default();
         let mut last_pc = 0u32;
         let mut count = 0u32;
         for (pc, ins) in instructions {
             last_pc = pc;
             count += 1;
-            if self.emit_inst(&mut block, ins, pc) {
-                return Some(block);
+            // Err(msg) means fatal decode failure — abort compilation with a
+            // diagnostic message the caller can log and surface to the user.
+            match self.emit_inst(&mut block, ins, pc) {
+                Err(msg) => return Err(msg),
+                Ok(true) => return Ok(block),
+                Ok(false) => {}
             }
         }
-        if count == 0 { return None; }
+        if count == 0 { return Err("block contains no instructions".to_string()); }
         block.push(IrInst::ReturnStatic(last_pc + 4));
-        Some(block)
+        Ok(block)
     }
 
     // ── Address helpers ───────────────────────────────────────────────────────
@@ -357,7 +361,7 @@ impl Decoder {
 
     // ── Main dispatch ─────────────────────────────────────────────────────────
 
-    fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> bool {
+    fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> Result<bool, String> {
         b.instruction_count += 1;
         b.cycles += 1;
         match ins.op {
@@ -1148,7 +1152,7 @@ impl Decoder {
                 let target = if aa { li as u32 } else { pc.wrapping_add_signed(li as i32) };
                 if lk { b.push(IrInst::I32Const((pc+4) as i32)); b.push(IrInst::StoreLr); }
                 b.push(IrInst::ReturnStatic(target));
-                return true;
+                return Ok(true);
             }
             Opcode::Bc => {
                 let bo=ins.field_bo(); let bi=ins.field_bi() as u8; let bd=ins.field_bd(); let lk=ins.field_lk(); let aa=ins.field_aa();
@@ -1156,7 +1160,7 @@ impl Decoder {
                 if lk { b.push(IrInst::I32Const((pc+4) as i32)); b.push(IrInst::StoreLr); }
                 self.emit_branch_cond(b, bo as u8, bi);
                 b.push(IrInst::BranchIf { taken, fallthrough: pc+4 });
-                return true;
+                return Ok(true);
             }
             Opcode::Bclr => {
                 let bo=ins.field_bo(); let bi=ins.field_bi() as u8; let lk=ins.field_lk();
@@ -1169,7 +1173,7 @@ impl Decoder {
                     self.emit_branch_cond(b, bo as u8, bi);
                     b.push(IrInst::BranchRegIf { reg_local: lr, fallthrough: pc+4 });
                 }
-                return true;
+                return Ok(true);
             }
             Opcode::Bcctr => {
                 let bo=ins.field_bo(); let bi=ins.field_bi() as u8; let lk=ins.field_lk();
@@ -1186,7 +1190,7 @@ impl Decoder {
                     self.emit_branch_cond(b, bo as u8 | 4, bi);
                     b.push(IrInst::BranchRegIf { reg_local: ctr, fallthrough: pc+4 });
                 }
-                return true;
+                return Ok(true);
             }
 
             // ── System ────────────────────────────────────────────────────────
@@ -1364,7 +1368,7 @@ impl Decoder {
                 b.push(IrInst::LoadGpr(rs));
                 b.push(IrInst::StoreMsr);
                 b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                return Ok(true);
             }
             Opcode::Rfi => {
                 // Match ppcjit: only copy SRR1_TO_MSR_MASK bits from SRR1 into MSR,
@@ -1383,7 +1387,7 @@ impl Decoder {
                 // new_pc = srr0 & ~0b11
                 b.push(IrInst::LoadSrr0); b.push(IrInst::I32Const(NOT_LOW2)); b.push(IrInst::I32And);
                 b.push(IrInst::ReturnDynamic);
-                return true;
+                return Ok(true);
             }
 
             // ── Cache/sync hints (no-ops) ─────────────────────────────────────
@@ -1397,20 +1401,19 @@ impl Decoder {
                 // Syscall: save return address, then raise syscall exception.
                 b.push(IrInst::I32Const((pc + 4) as i32)); b.push(IrInst::StorePC);
                 b.push(IrInst::RaiseException(0x0C00));
-                return true;
+                return Ok(true);
             }
             Opcode::Illegal => {
-                // Illegal/unrecognized instruction: raise a Program Exception
-                // (vector 0x0700), which is the hardware-accurate response.
-                // StorePC saves the faulting address into CPU::pc so that
-                // deliver_exception sets SRR0 correctly; the host's
-                // skipAndRfi stub at 0x00000700 then advances SRR0 past the
-                // faulting instruction (SRR0 += 4) and rfi's back.
-                b.unimplemented_ops.push(format!("Illegal @ 0x{:08X}", pc));
-                b.push(IrInst::I32Const(pc as i32));
-                b.push(IrInst::StorePC);
-                b.push(IrInst::RaiseException(0x0700));
-                return true;
+                // Illegal instruction — fail compilation with a diagnostic message.
+                // Games should never execute an illegal encoding; encountering one
+                // indicates a corrupted PC, executing data memory, or an emulator
+                // bug. The error message carries the PC and opcode so the caller
+                // can log it and feed it back for debugging.
+                return Err(format!(
+                    "Illegal instruction {:?} @ pc=0x{:08X} \
+                     (hint: check for corrupted PC, bad branch target, or executing data)",
+                    ins.op, pc,
+                ));
             }
 
             // ── Float select ──────────────────────────────────────────────────
@@ -1666,10 +1669,10 @@ impl Decoder {
                 // from the next block rather than crashing the emulator.
                 b.unimplemented_ops.push(format!("{:?} @ 0x{:08X}", ins.op, pc));
                 b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -1681,7 +1684,7 @@ mod tests {
 
     #[test] fn ppc_mask_full() { assert_eq!(ppc_mask(0,31), 0xFFFF_FFFF); }
     #[test] fn ppc_mask_low_byte() { assert_eq!(ppc_mask(24,31), 0xFF); }
-    #[test] fn decode_empty() { assert!(Decoder::new().decode(std::iter::empty()).is_none()); }
+    #[test] fn decode_empty() { assert!(Decoder::new().decode(std::iter::empty()).is_err()); }
     #[test] fn decode_addi_ok() {
         let b = Decoder::new().decode([(0x8000_0000u32, ins(0x3860_002A))].into_iter()).unwrap();
         assert_eq!(b.instruction_count, 1);

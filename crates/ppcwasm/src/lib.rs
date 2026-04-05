@@ -49,13 +49,15 @@ impl WasmJit {
 
     /// Compile a PowerPC instruction sequence into a [`WasmBlock`].
     ///
-    /// Returns `None` if the iterator yields no instructions.
+    /// Returns `Err` if the iterator yields no instructions or an illegal
+    /// instruction is encountered. The error string contains a diagnostic
+    /// message suitable for logging.
     pub fn build(
         &self,
         instructions: impl Iterator<Item = (u32, Ins)>,
-    ) -> Option<WasmBlock> {
+    ) -> Result<WasmBlock, String> {
         let ir = self.decoder.decode(instructions)?;
-        Some(lower::lower(&ir, &self.offsets))
+        Ok(lower::lower(&ir, &self.offsets))
     }
 }
 
@@ -67,8 +69,8 @@ mod tests {
     fn ins(code: u32) -> Ins { Ins::new(code, Extensions::gekko_broadway()) }
 
     #[test]
-    fn build_empty_returns_none() {
-        assert!(WasmJit::new().build(std::iter::empty()).is_none());
+    fn build_empty_returns_err() {
+        assert!(WasmJit::new().build(std::iter::empty()).is_err());
     }
 
     #[test]
