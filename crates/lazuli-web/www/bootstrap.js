@@ -215,8 +215,11 @@ function parseDol(view, bytes, dolOffset) {
 
 /**
  * Parse a GameCube ISO image, extract the boot DOL, load every section into
- * the emulator's RAM, zero the BSS, load the apploader, and set the CPU entry
- * point to the apploader's entrypoint (e.g. 0x81300000).
+ * the emulator's RAM, zero the BSS, load the apploader, load the embedded
+ * ipl-hle binary, and point the CPU at the ipl-hle entry (0x81300000).
+ *
+ * The real apploader entry function address (from the ISO apploader header)
+ * is passed to ipl-hle via r3, matching what the native load_ipl_hle() does.
  *
  * GameCube ISO header layout (big-endian):
  *   0x000  console_id (1 B) + game_id (5 B)
@@ -322,9 +325,7 @@ function parseAndLoadIso(arrayBuffer, emu) {
   //   0x18  trailer_size
   //   0x1C  padding (4 bytes)
   //   0x20  body[size]
-  // The body is placed at guest 0x81200000 (physical 0x01200000) and the
-  // CPU is pointed at the apploader's entrypoint rather than the raw DOL
-  // entrypoint, matching the real IPL boot sequence.
+  // The body is placed at guest 0x81200000 (physical 0x01200000).
   const APPLOADER_ISO_OFFSET = 0x2440;
   const apploaderEntrypoint  = view.getUint32(APPLOADER_ISO_OFFSET + 0x10, false);
   const apploaderSize        = view.getUint32(APPLOADER_ISO_OFFSET + 0x14, false);
@@ -338,10 +339,20 @@ function parseAndLoadIso(arrayBuffer, emu) {
   const apploaderBody = bytes.slice(apploaderBodyOffset, apploaderBodyOffset + apploaderSize);
   emu.load_bytes(0x81200000, apploaderBody);
 
-  // Point the CPU at the apploader's entrypoint (e.g. 0x81300000), not the
-  // raw DOL entrypoint.  This matches what the real IPL ROM does: it loads
-  // the apploader at 0x81200000 and jumps to its entry function.
-  emu.set_pc(apploaderEntrypoint);
+  // ── Step 4: load the embedded ipl-hle DOL into guest RAM, mirroring
+  // load_ipl_hle() in system.rs.  ipl-hle is baked into the WASM binary at
+  // build time (include_bytes! in lazuli-web/src/loader.rs) and linked at
+  // 0x81300000 (see crates/ipl-hle/linker.ld).  Its main() expects the real
+  // apploader's entry function address in r3, exactly as the native emulator
+  // sets cpu.user.gpr[3] = entry.value() after load_apploader().
+  const iplEntry = emu.load_ipl_hle();
+  emu.set_gpr(3, apploaderEntrypoint);
+
+  // Point the CPU at the ipl-hle entry (0x81300000), not the raw apploader
+  // entrypoint.  This matches what the real IPL ROM does: it loads the
+  // apploader at 0x81200000, then hands control to its own stub which calls
+  // the apploader's init/main/close functions before jumping to the game DOL.
+  emu.set_pc(iplEntry);
 
   // Initialise the MSR to the state the IPL ROM leaves the CPU in before
   // handing control to the game DOL.  The critical bit to clear is IP
@@ -360,7 +371,7 @@ function parseAndLoadIso(arrayBuffer, emu) {
   // OSInit will configure them before enabling external interrupts.
   emu.set_msr(0);
 
-  return { gameId, gameName, entry: apploaderEntrypoint };
+  return { gameId, gameName, entry: iplEntry };
 }
 
 // ── GameCube button bitmask ───────────────────────────────────────────────────
