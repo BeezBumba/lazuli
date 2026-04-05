@@ -367,7 +367,14 @@ fn emit_inst(
             b.push(Instruction::Return);
         }
         IrInst::ReturnDynamic => {
-            // The PC value is already on the stack.
+            // The PC value is already on the stack.  Write it to CPU::pc in the
+            // register file so that the host's `set_cpu_bytes` / `get_pc()` path
+            // sees the correct next-PC even when the value is 0 (e.g. `bctrl`
+            // with CTR=0 or `rfi` with SRR0=0).  Without this write the JS
+            // fallback `emu.get_pc()` returns the *old* PC (the block start),
+            // leaving the emulator permanently stuck at the same address.
+            store_i32(off.pc, si32, b);            // pop, store to CPU::pc, keep in si32
+            b.push(Instruction::LocalGet(si32));   // re-push the value for the return
             b.push(Instruction::Return);
         }
 

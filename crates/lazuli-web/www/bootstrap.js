@@ -1467,11 +1467,12 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         const srr1Val = emu.get_srr1();
         const decVal  = emu.get_dec();
         const r1Val   = emu.get_gpr(1);
-        // nextPc=0 → BranchRegIf path: PC was written into CPU struct (check LR == stuckHex)
-        // nextPc=stuckHex → ReturnDynamic path: LR/CTR returned own PC → branch-to-self
+        // nextPc=0 → dynamic branch (blr/bctr/rfi) resolved to address 0, or an
+        //            exception was raised; either way CPU::pc is written by the block.
+        // nextPc=stuckHex → block returns own start address (branch-to-self).
         const nextPcNote = lastNextPc === 0
-          ? `nextPc=0 (BranchRegIf/exception path — CPU::pc was written; emu.get_pc()=${stuckHex})`
-          : `nextPc=${hexU32(lastNextPc)} (ReturnDynamic — LR/CTR returned this value)`;
+          ? `nextPc=0 (branch target=0 or exception — CPU::pc written; emu.get_pc()=${stuckHex})`
+          : `nextPc=${hexU32(lastNextPc)} (block returned this target — branch-to-self or loop)`;
         const eeEnabled = (msrVal >> 15) & 1;
         console.warn(
           `[lazuli] STUCK CPU dump @ ${stuckHex}:\n` +

@@ -327,6 +327,35 @@ mod tests {
             "OS SRR1 EE-enable sequence must produce valid WASM: {:?}", b.unimplemented_ops);
     }
 
+
+    /// ipl-hle apploader call pattern (block #397): mtctr + bctrl.
+    ///
+    /// When CTR=0 at runtime, `bctrl` branches to address 0.  Previously,
+    /// `ReturnDynamic` did not write CPU::pc into the register-file memory, so
+    /// the JS host's `emu.get_pc()` fallback read the stale block-start address
+    /// (0x813002EC) instead of 0, leaving the emulator permanently stuck.
+    ///
+    /// After the fix, `ReturnDynamic` stores the branch target into `CPU::pc`
+    /// before returning, so `get_pc()` correctly reflects the new PC even when
+    /// the target is 0.
+    #[test]
+    fn mtctr_bctrl_valid_wasm() {
+        // mtctr r3  (0x7C6903A6 — move r3 to CTR)
+        // bctrl     (0x4E800421 — branch to CTR, link; LK=1 sets LR=PC+4)
+        let b = WasmJit::new()
+            .build([
+                (0x8130_02ECu32, ins(0x7C69_03A6)), // mtctr r3
+                (0x8130_02F0u32, ins(0x4E80_0421)), // bctrl
+            ].into_iter())
+            .unwrap();
+        assert_eq!(&b.bytes[..4], b"\0asm",
+            "mtctr+bctrl must produce a valid WASM module");
+        assert_eq!(b.instruction_count, 2,
+            "mtctr+bctrl should be exactly 2 instructions");
+        assert!(b.unimplemented_ops.is_empty(),
+            "mtctr+bctrl must have no unimplemented ops: {:?}", b.unimplemented_ops);
+    }
+
     /// mtspr followed by rfi: both must appear in the same block and produce
     /// valid WASM.  This models the OS context-switch path.
     #[test]
