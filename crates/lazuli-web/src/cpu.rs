@@ -73,19 +73,20 @@ impl WasmEmulator {
     /// Overwrite the Machine State Register with a raw 32-bit value.
     ///
     /// Call this once after loading a DOL/ISO to establish the CPU state that
-    /// the IPL ROM would normally leave before handing off to the game.  The
-    /// most important bit to clear is **IP** (bit 6, `exception_prefix`):
+    /// the IPL ROM would normally leave before handing off to the apploader.
+    /// The two critical bits are:
     ///
-    /// * `IP = 1` (default reset value): exception vectors at `0xFFF0xxxx` —
-    ///   physical `0x01F00900` for the decrementer, which is **beyond** the
-    ///   24 MiB GameCube RAM and therefore unexecutable.
-    /// * `IP = 0`: exception vectors at `0x000xxxxx` — physical `0x00000900`
-    ///   for the decrementer, which is within RAM and where the Dolphin OS
-    ///   (`OSInit`) installs its exception handlers.
+    /// * **IP** (bit 6, `exception_prefix`) — `0` here so exception vectors
+    ///   land at `0x000xxxxx` (physical `0x00000900` for the decrementer),
+    ///   which is within the 24 MiB GameCube RAM.  The default reset value
+    ///   (`IP = 1`) would put vectors at `0xFFF0xxxx` — beyond RAM.
+    /// * **EE** (bit 15, `interrupts`) — `1` here so decrementer and external
+    ///   interrupts can fire.  The real IPL ROM jumps to the apploader with
+    ///   `EE = 1`; without it, any spin-loop that waits for a decrementer
+    ///   interrupt would stall forever.
     ///
-    /// Passing `0` clears all MSR bits (EE=0, FP=0, IP=0 …), which matches
-    /// the state the IPL ROM leaves the CPU in before the game's `__start`
-    /// runs `OSInit`.
+    /// Typically called with `0x8000` (`EE = 1`, all other bits cleared).  The
+    /// game's own `__start` / `OSInit` will reconfigure MSR as needed.
     pub fn set_msr(&mut self, value: u32) {
         self.cpu.supervisor.config.msr = gekko::MachineState::from_bits(value);
     }
@@ -137,11 +138,13 @@ impl WasmEmulator {
     }
 
     /// Tick the decrementer down by `delta` ticks and deliver a decrementer
-    /// exception if the result is negative and external interrupts are enabled.
+    /// exception if a new underflow occurred and external interrupts are enabled.
     ///
-    /// The interrupt request is **level-sensitive**: it is asserted whenever
-    /// DEC < 0 and de-asserted as soon as the guest writes a non-negative value
-    /// back to DEC via `mtspr DEC`.
+    /// The Gekko hardware fires the decrementer interrupt on the **edge** when
+    /// DEC transitions from non-negative to negative (bit 31 goes from 0 to 1).
+    /// Subsequent calls while DEC is still negative do **not** re-assert the
+    /// interrupt — the guest OS handler is responsible for writing a new
+    /// positive value to DEC via `mtspr DEC` to re-arm the timer.
     ///
     /// Call this once per JIT block (not just once per animation frame) so that
     /// the exception fires as soon as the guest enables `EE` inside a spin-wait
@@ -151,7 +154,11 @@ impl WasmEmulator {
         let new_dec = old_dec.wrapping_sub(delta);
         self.cpu.supervisor.misc.dec = new_dec;
 
-        self.decrementer_pending = (new_dec as i32) < 0;
+        // Edge-triggered: only pend an interrupt when DEC crosses from
+        // non-negative to negative (the hardware underflow edge).
+        if (old_dec as i32) >= 0 && (new_dec as i32) < 0 {
+            self.decrementer_pending = true;
+        }
 
         let ee = self.cpu.supervisor.config.msr.interrupts();
 
@@ -169,30 +176,6 @@ impl WasmEmulator {
                 self.cpu.raise_exception(gekko::Exception::Interrupt);
             }
         }
-    }
-
-    /// Force-deliver a decrementer exception regardless of whether `MSR.EE`
-    /// is set.
-    ///
-    /// On real PowerPC hardware the decrementer interrupt is maskable: it
-    /// cannot fire while `EE = 0`.  However, if a JIT or emulation bug leaves
-    /// the guest permanently stuck in a branch-to-self loop with `EE = 0` and
-    /// `DEC < 0`, the normal `advance_decrementer` path can never break the
-    /// deadlock.  The JavaScript host calls this method after detecting that
-    /// threshold-many consecutive same-PC blocks have executed with `EE = 0`
-    /// and the decrementer already expired, giving the OS decrementer handler
-    /// a chance to run and reset `DEC` to a positive value.
-    ///
-    /// The method clears `decrementer_pending` and calls `raise_exception` with
-    /// [`gekko::Exception::Decrementer`] (vector `0x00000900`) so that `SRR0`,
-    /// `SRR1`, and `MSR` are updated exactly as they would be for a normal
-    /// hardware decrementer interrupt.  This is the same exception type used by
-    /// the `decrementer_pending && ee` branch in [`advance_decrementer`] and is
-    /// distinct from [`gekko::Exception::Interrupt`] (vector `0x00000500`),
-    /// which is reserved for external PI interrupts.
-    pub fn force_decrementer_exception(&mut self) {
-        self.decrementer_pending = false;
-        self.cpu.raise_exception(gekko::Exception::Decrementer);
     }
 
     // ── Compilation stats ─────────────────────────────────────────────────────
