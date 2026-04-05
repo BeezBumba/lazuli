@@ -1396,11 +1396,16 @@ impl Decoder {
                 return true;
             }
             Opcode::Illegal => {
-                // Illegal/unrecognized instruction: raise a Program Exception
-                // (vector 0x0700) exactly as real PowerPC hardware does.
-                // SRR0 is set to the address of the faulting instruction.
-                b.push(IrInst::I32Const(pc as i32)); b.push(IrInst::StorePC);
-                b.push(IrInst::RaiseException(0x0700));
+                // Illegal/unrecognized instruction: skip it, matching the
+                // native ppcjit `ignore_unimplemented` behavior.  Valid game
+                // code never contains truly illegal encodings; reaching here
+                // means execution branched to a bad target (e.g. a null
+                // function pointer).  Raising 0x0700 here only causes an
+                // infinite loop: the OS Program Exception handler at 0x0700
+                // adds 4 to SRR0 and rfi's back, hitting the next Illegal,
+                // and so on forever.  Skipping is safer and consistent.
+                b.unimplemented_ops.push(format!("Illegal @ 0x{:08X}", pc));
+                b.push(IrInst::ReturnStatic(pc + 4));
                 return true;
             }
 
