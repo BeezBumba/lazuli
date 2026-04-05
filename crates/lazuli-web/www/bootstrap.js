@@ -1011,6 +1011,26 @@ function executeOneBlockSync(emu, ram, log) {
   const { mem: regsMem, view: regsView } = getRegsMem(emu);
   regsView.set(emu.get_cpu_bytes(), 0);
 
+  // ── Pre-execution GPR dump for the mtspr CTR / bcctr diagnostic block ─────
+  // Block #205 @ 0x813002EC: "mtspr CTR, rX ; bcctr" — CTR ends up 0 in WASM
+  // but 0x8000522C on native.  Log all 32 GPRs from WASM memory immediately
+  // after the register file copy so we can see which rX the mtspr instruction
+  // reads and why it is wrong.
+  if (pc === 0x813002EC) {
+    const off = emu.get_reg_offsets();
+    const mem32 = new DataView(regsMem.buffer);
+    const gprOffsets = Array.from(off.gpr);
+    const gprVals = gprOffsets.map((o, i) => `r${i}=${hexU32(mem32.getUint32(o, true))}`);
+    const ctrVal  = hexU32(mem32.getUint32(off.ctr, true));
+    const lrVal   = hexU32(mem32.getUint32(off.lr,  true));
+    console.warn(
+      `[lazuli] PRE-EXEC ${pcHex} GPR dump:\n` +
+      gprVals.slice(0, 16).join("  ") + "\n" +
+      gprVals.slice(16).join("  ") + "\n" +
+      `  LR=${lrVal}  CTR=${ctrVal}`,
+    );
+  }
+
   // Reset exception tracking so we can detect whether THIS block raises an
   // exception (vs. a stale value left by a previous block).
   lastRaisedExceptionKind = -1;
