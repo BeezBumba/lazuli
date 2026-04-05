@@ -340,8 +340,8 @@ mod tests {
     /// the target is 0.
     #[test]
     fn mtctr_bctrl_valid_wasm() {
-        // mtctr r3  (0x7C6903A6 — move r3 to CTR)
-        // bctrl     (0x4E800421 — branch to CTR, link; LK=1 sets LR=PC+4)
+        // mtctr r3  (0x7C69_03A6 — move r3 to CTR)
+        // bctrl     (0x4E80_0421 — branch to CTR, link; LK=1 sets LR=PC+4)
         let b = WasmJit::new()
             .build([
                 (0x8130_02ECu32, ins(0x7C69_03A6)), // mtctr r3

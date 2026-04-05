@@ -373,7 +373,7 @@ fn emit_inst(
             // with CTR=0 or `rfi` with SRR0=0).  Without this write the JS
             // fallback `emu.get_pc()` returns the *old* PC (the block start),
             // leaving the emulator permanently stuck at the same address.
-            store_i32(off.pc, si32, b);            // pop, store to CPU::pc, keep in si32
+            store_i32(off.pc, si32, b);            // pop and store to CPU::pc; value stays in si32
             b.push(Instruction::LocalGet(si32));   // re-push the value for the return
             b.push(Instruction::Return);
         }
