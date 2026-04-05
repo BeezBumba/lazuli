@@ -340,7 +340,10 @@ impl WasmEmulator {
     /// (TCINT — transfer complete) is set.
     fn process_di_command(&mut self) {
         let cmd = (self.di.cmd_buf0 >> 24) as u8;
-        let disc_offset = self.di.cmd_buf1 as usize;
+        // DICMDBUF1 stores the disc address in 4-byte units, not bytes.
+        // ipl-hle (and the real apploader) write `byte_offset >> 2` to this
+        // register, so we must shift left by 2 to recover the byte offset.
+        let disc_offset = (self.di.cmd_buf1 as usize) << 2;
         let dma_len = self.di.dma_len as usize;
         let dma_dest = crate::phys_addr(self.di.dma_addr);
 

@@ -41,7 +41,10 @@ pub(crate) struct DiState {
     pub(crate) cover: u32,
     /// DICMDBUF0 (0x08): command word; bits 31–24 hold the command code.
     pub(crate) cmd_buf0: u32,
-    /// DICMDBUF1 (0x0C): disc byte offset used by the DVD Read command.
+    /// DICMDBUF1 (0x0C): disc address for the DVD Read command, in 4-byte units.
+    ///
+    /// Real hardware (and ipl-hle) store `byte_offset >> 2` here; callers must
+    /// shift left by 2 to recover the actual byte offset into the disc image.
     pub(crate) cmd_buf1: u32,
     /// DICMDBUF2 (0x10): second command parameter (reserved for most commands).
     pub(crate) cmd_buf2: u32,
