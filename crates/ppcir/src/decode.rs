@@ -21,23 +21,24 @@ pub struct Decoder;
 impl Decoder {
     pub fn new() -> Self { Self }
 
-    pub fn decode(&self, instructions: impl Iterator<Item = (u32, Ins)>) -> Option<IrBlock> {
+    pub fn decode(&self, instructions: impl Iterator<Item = (u32, Ins)>) -> Result<IrBlock, String> {
         let mut block = IrBlock::default();
         let mut last_pc = 0u32;
         let mut count = 0u32;
         for (pc, ins) in instructions {
             last_pc = pc;
             count += 1;
-            // Err(()) means fatal (e.g. Illegal instruction) — abort compilation.
+            // Err(msg) means fatal decode failure — abort compilation with a
+            // diagnostic message the caller can log and surface to the user.
             match self.emit_inst(&mut block, ins, pc) {
-                Err(()) => return None,
-                Ok(true) => return Some(block),
+                Err(msg) => return Err(msg),
+                Ok(true) => return Ok(block),
                 Ok(false) => {}
             }
         }
-        if count == 0 { return None; }
+        if count == 0 { return Err("block contains no instructions".to_string()); }
         block.push(IrInst::ReturnStatic(last_pc + 4));
-        Some(block)
+        Ok(block)
     }
 
     // ── Address helpers ───────────────────────────────────────────────────────
@@ -360,7 +361,7 @@ impl Decoder {
 
     // ── Main dispatch ─────────────────────────────────────────────────────────
 
-    fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> Result<bool, ()> {
+    fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> Result<bool, String> {
         b.instruction_count += 1;
         b.cycles += 1;
         match ins.op {
@@ -1403,13 +1404,16 @@ impl Decoder {
                 return Ok(true);
             }
             Opcode::Illegal => {
-                // Illegal instruction — fail compilation, matching the native JIT's
-                // strict mode (BuilderError::Illegal). Games should never execute
-                // an illegal encoding; encountering one indicates a corrupted PC or
-                // emulator bug. Returning Err(()) causes decode() to return None,
-                // which surfaces as a JIT compile error in the caller.
-                b.unimplemented_ops.push(format!("Illegal @ 0x{:08X}", pc));
-                return Err(());
+                // Illegal instruction — fail compilation with a diagnostic message.
+                // Games should never execute an illegal encoding; encountering one
+                // indicates a corrupted PC, executing data memory, or an emulator
+                // bug. The error message carries the PC and opcode so the caller
+                // can log it and feed it back for debugging.
+                return Err(format!(
+                    "Illegal instruction {:?} @ pc=0x{:08X} \
+                     (hint: check for corrupted PC, bad branch target, or executing data)",
+                    ins.op, pc,
+                ));
             }
 
             // ── Float select ──────────────────────────────────────────────────
@@ -1680,7 +1684,7 @@ mod tests {
 
     #[test] fn ppc_mask_full() { assert_eq!(ppc_mask(0,31), 0xFFFF_FFFF); }
     #[test] fn ppc_mask_low_byte() { assert_eq!(ppc_mask(24,31), 0xFF); }
-    #[test] fn decode_empty() { assert!(Decoder::new().decode(std::iter::empty()).is_none()); }
+    #[test] fn decode_empty() { assert!(Decoder::new().decode(std::iter::empty()).is_err()); }
     #[test] fn decode_addi_ok() {
         let b = Decoder::new().decode([(0x8000_0000u32, ins(0x3860_002A))].into_iter()).unwrap();
         assert_eq!(b.instruction_count, 1);
