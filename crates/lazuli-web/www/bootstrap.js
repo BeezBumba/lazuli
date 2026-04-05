@@ -1074,13 +1074,54 @@ function executeOneBlockSync(emu, ram, log) {
       );
     }
 
+    // Warn when a dynamic branch (blr / bcctr / rfi via ReturnDynamic, or a
+    // conditional bcctr/blr via BranchRegIf) resolves to an unexpectedly low
+    // address.  Two sub-cases:
+    //
+    //   • lastNextPc === 0, no exception raised:
+    //       ReturnDynamic stored 0 to CPU::pc and returned 0, OR BranchRegIf
+    //       wrote CTR/LR=0 to CPU::pc and returned 0.  Either way the dynamic
+    //       branch target was 0x00000000, which is almost always a bug
+    //       (CTR=0 before bcctr, or LR=0 before blr).
+    //
+    //   • lastNextPc !== 0 but newPc < 0x80000000:
+    //       ReturnDynamic returned a non-zero target that is below the normal
+    //       GameCube RAM window — likely a corrupted CTR/LR value.
+    //
+    // In both cases we log CTR and LR at the exact moment the branch fires
+    // (CPU state has already been synced back from WASM memory above).
+    const ctrVal = emu.get_ctr();
+    const lrVal  = emu.get_lr();
+    if (lastNextPc === 0 && lastRaisedExceptionKind < 0) {
+      // Dynamic branch resolved to 0x00000000 with no exception — most likely
+      // bcctr/blr with CTR=0 / LR=0.
+      console.warn(
+        `[lazuli] ${pcHex}: dynamic branch → 0x00000000 (no exception) — ` +
+        `CTR=${hexU32(ctrVal)} LR=${hexU32(lrVal)} ` +
+        `(BranchRegIf or ReturnDynamic with target=0; check CTR/LR before bcctr/blr)`,
+      );
+      pushDebugEvent(`⚠ dyn-branch→0 @ ${pcHex} CTR=${hexU32(ctrVal)} LR=${hexU32(lrVal)}`);
+    } else if (lastNextPc !== 0 && newPc < 0x80000000) {
+      // ReturnDynamic returned a non-zero target below the GameCube RAM window.
+      console.warn(
+        `[lazuli] ${pcHex}: dynamic branch → low address ${hexU32(newPc)} — ` +
+        `CTR=${hexU32(ctrVal)} LR=${hexU32(lrVal)} ` +
+        `(possible corrupted CTR/LR; rawNextPc=${hexU32(lastNextPc)})`,
+      );
+      pushDebugEvent(`⚠ dyn-branch→low ${hexU32(newPc)} @ ${pcHex} CTR=${hexU32(ctrVal)}`);
+    }
+
     emu.set_pc(newPc);
   }
 
   if (log) {
     const curPc = emu.get_pc();
+    const ctrVal = emu.get_ctr();
     const newHex = "0x" + (curPc >>> 0).toString(16).toUpperCase().padStart(8, "0");
-    log.push(`[${pcHex}] executed → next PC ${newHex} (rawNextPc=${hexU32(lastNextPc)})`);
+    log.push(
+      `[${pcHex}] executed → next PC ${newHex} ` +
+      `(rawNextPc=${hexU32(lastNextPc)} CTR=${hexU32(ctrVal)})`,
+    );
   }
   return true;
 }
