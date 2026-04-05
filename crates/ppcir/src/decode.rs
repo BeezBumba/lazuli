@@ -1179,7 +1179,11 @@ impl Decoder {
                 if (bo>>4)&1!=0 && (bo>>2)&1!=0 {
                     b.push(IrInst::LocalGet(ctr)); b.push(IrInst::ReturnDynamic);
                 } else {
-                    self.emit_branch_cond(b, bo as u8, bi);
+                    // Per the PowerPC Architecture manual, bcctr/bcctrl must NEVER
+                    // decrement CTR (BO[2] must be 1; BO[2]=0 is boundedly undefined).
+                    // Force ignore_ctr=1 (bit 2) so emit_branch_cond cannot decrement
+                    // CTR regardless of the BO field in the instruction encoding.
+                    self.emit_branch_cond(b, bo as u8 | 4, bi);
                     b.push(IrInst::BranchRegIf { reg_local: ctr, fallthrough: pc+4 });
                 }
                 return true;
@@ -1934,6 +1938,50 @@ mod tests {
         assert!(b.unimplemented_ops.is_empty());
         assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreLr)),
             "mtspr LR must emit StoreLr before bclr; IR: {:?}", b.insts);
+    }
+
+    // ── bcctr / bcctrl: CTR must never be decremented ────────────────────────
+    //
+    // The PowerPC Architecture manual states that BO[2] must be 1 for all
+    // bcctr / bcctrl encodings; BO[2]=0 is "boundedly undefined".  The JIT
+    // must never emit a CTR decrement (LoadCtr / I32Sub / StoreCtr sequence)
+    // for any bcctr or bcctrl instruction regardless of the BO field value.
+
+    /// bcctr (BO=20, unconditional): 0x4E800420 — must not decrement CTR.
+    #[test]
+    fn bcctr_unconditional_no_ctr_decrement() {
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x4E80_0420))].into_iter()).unwrap();
+        // The IR must not contain a StoreCtr — that would signal CTR was decremented.
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::StoreCtr)),
+            "bcctr must not decrement CTR; IR: {:?}", b.insts);
+    }
+
+    /// bcctr with BO[2]=0 (BO=16, invalid encoding): 0x4E000420.
+    /// Even though this encoding is undefined by the spec, we must not
+    /// decrement CTR because CTR holds the branch target.
+    #[test]
+    fn bcctr_invalid_bo_no_ctr_decrement() {
+        // BO=16=0b10000: ignore_cr=1, ignore_ctr=0 (invalid for bcctr per spec)
+        // Encoding: opcode=19, BO=16, BI=0, BH=0, XO=528, LK=0 → 0x4E000420
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x4E00_0420))].into_iter()).unwrap();
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::StoreCtr)),
+            "bcctr with BO[2]=0 must not decrement CTR; IR: {:?}", b.insts);
+    }
+
+    /// bcctrl (BO=20, unconditional call via CTR): 0x4E800421 — must not decrement CTR.
+    #[test]
+    fn bcctrl_unconditional_no_ctr_decrement() {
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x4E80_0421))].into_iter()).unwrap();
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::StoreCtr)),
+            "bcctrl must not decrement CTR; IR: {:?}", b.insts);
+    }
+
+    /// bcctrl with BO[2]=0 (invalid encoding): 0x4E000421 — must not decrement CTR.
+    #[test]
+    fn bcctrl_invalid_bo_no_ctr_decrement() {
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0x4E00_0421))].into_iter()).unwrap();
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::StoreCtr)),
+            "bcctrl with BO[2]=0 must not decrement CTR; IR: {:?}", b.insts);
     }
 
     /// rfi terminates the block and emits StoreMsr + ReturnDynamic.
