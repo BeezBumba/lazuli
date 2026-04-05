@@ -215,13 +215,22 @@ function parseDol(view, bytes, dolOffset) {
 
 /**
  * Parse a GameCube ISO image, extract the boot DOL, load every section into
- * the emulator's RAM, zero the BSS, and set the CPU entry point.
+ * the emulator's RAM, zero the BSS, load the apploader, and set the CPU entry
+ * point to the apploader's entrypoint (e.g. 0x81300000).
  *
  * GameCube ISO header layout (big-endian):
  *   0x000  console_id (1 B) + game_id (5 B)
  *   0x01C  magic word 0xC2339F3D
  *   0x020  game name (null-terminated, ≤ 0x3E0 bytes)
  *   0x420  bootfile_offset  — byte offset of the boot DOL within the ISO
+ *
+ * Apploader layout (at ISO offset 0x2440, big-endian):
+ *   0x000  version string (null-terminated, padded to 0x10 bytes)
+ *   0x010  entrypoint — guest address of the apploader's entry function
+ *   0x014  size       — byte length of the apploader body
+ *   0x018  trailer_size
+ *   0x01C  padding (4 bytes)
+ *   0x020  body[size]  — loaded at guest 0x81200000
  *
  * @param {ArrayBuffer} arrayBuffer Raw ISO bytes
  * @param {WasmEmulator} emu        Emulator instance
@@ -305,8 +314,34 @@ function parseAndLoadIso(arrayBuffer, emu) {
     emu.load_bytes(0x80000020, new Uint8Array(osGlobBuf, 0x20, 0xE0));
   }
 
-  // Point the CPU at the entry point
-  emu.set_pc(dol.entry);
+  // ── Step 3: load the apploader, mirroring load_apploader() in system.rs.
+  // The apploader sits at ISO offset 0x2440 and has a 0x20-byte header:
+  //   0x00  version string (null-terminated, padded to 0x10 bytes)
+  //   0x10  entrypoint — guest address of the apploader entry function
+  //   0x14  size       — byte length of the apploader body
+  //   0x18  trailer_size
+  //   0x1C  padding (4 bytes)
+  //   0x20  body[size]
+  // The body is placed at guest 0x81200000 (physical 0x01200000) and the
+  // CPU is pointed at the apploader's entrypoint rather than the raw DOL
+  // entrypoint, matching the real IPL boot sequence.
+  const APPLOADER_ISO_OFFSET = 0x2440;
+  const apploaderEntrypoint  = view.getUint32(APPLOADER_ISO_OFFSET + 0x10, false);
+  const apploaderSize        = view.getUint32(APPLOADER_ISO_OFFSET + 0x14, false);
+  const apploaderBodyOffset  = APPLOADER_ISO_OFFSET + 0x20; // header is 0x20 bytes
+  if (apploaderSize === 0 || apploaderBodyOffset + apploaderSize > arrayBuffer.byteLength) {
+    throw new Error(
+      `Invalid apploader in ISO: size=0x${apploaderSize.toString(16)}, ` +
+      `bodyOffset=0x${apploaderBodyOffset.toString(16)}, isoSize=0x${arrayBuffer.byteLength.toString(16)}`
+    );
+  }
+  const apploaderBody = bytes.slice(apploaderBodyOffset, apploaderBodyOffset + apploaderSize);
+  emu.load_bytes(0x81200000, apploaderBody);
+
+  // Point the CPU at the apploader's entrypoint (e.g. 0x81300000), not the
+  // raw DOL entrypoint.  This matches what the real IPL ROM does: it loads
+  // the apploader at 0x81200000 and jumps to its entry function.
+  emu.set_pc(apploaderEntrypoint);
 
   // Initialise the MSR to the state the IPL ROM leaves the CPU in before
   // handing control to the game DOL.  The critical bit to clear is IP
@@ -325,7 +360,7 @@ function parseAndLoadIso(arrayBuffer, emu) {
   // OSInit will configure them before enabling external interrupts.
   emu.set_msr(0);
 
-  return { gameId, gameName, entry: dol.entry };
+  return { gameId, gameName, entry: apploaderEntrypoint };
 }
 
 // ── GameCube button bitmask ───────────────────────────────────────────────────
