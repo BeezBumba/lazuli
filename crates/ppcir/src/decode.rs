@@ -28,8 +28,11 @@ impl Decoder {
         for (pc, ins) in instructions {
             last_pc = pc;
             count += 1;
-            if self.emit_inst(&mut block, ins, pc) {
-                return Some(block);
+            // Err(()) means fatal (e.g. Illegal instruction) — abort compilation.
+            match self.emit_inst(&mut block, ins, pc) {
+                Err(()) => return None,
+                Ok(true) => return Some(block),
+                Ok(false) => {}
             }
         }
         if count == 0 { return None; }
@@ -357,7 +360,7 @@ impl Decoder {
 
     // ── Main dispatch ─────────────────────────────────────────────────────────
 
-    fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> bool {
+    fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> Result<bool, ()> {
         b.instruction_count += 1;
         b.cycles += 1;
         match ins.op {
@@ -1148,7 +1151,7 @@ impl Decoder {
                 let target = if aa { li as u32 } else { pc.wrapping_add_signed(li as i32) };
                 if lk { b.push(IrInst::I32Const((pc+4) as i32)); b.push(IrInst::StoreLr); }
                 b.push(IrInst::ReturnStatic(target));
-                return true;
+                return Ok(true);
             }
             Opcode::Bc => {
                 let bo=ins.field_bo(); let bi=ins.field_bi() as u8; let bd=ins.field_bd(); let lk=ins.field_lk(); let aa=ins.field_aa();
@@ -1156,7 +1159,7 @@ impl Decoder {
                 if lk { b.push(IrInst::I32Const((pc+4) as i32)); b.push(IrInst::StoreLr); }
                 self.emit_branch_cond(b, bo as u8, bi);
                 b.push(IrInst::BranchIf { taken, fallthrough: pc+4 });
-                return true;
+                return Ok(true);
             }
             Opcode::Bclr => {
                 let bo=ins.field_bo(); let bi=ins.field_bi() as u8; let lk=ins.field_lk();
@@ -1169,7 +1172,7 @@ impl Decoder {
                     self.emit_branch_cond(b, bo as u8, bi);
                     b.push(IrInst::BranchRegIf { reg_local: lr, fallthrough: pc+4 });
                 }
-                return true;
+                return Ok(true);
             }
             Opcode::Bcctr => {
                 let bo=ins.field_bo(); let bi=ins.field_bi() as u8; let lk=ins.field_lk();
@@ -1186,7 +1189,7 @@ impl Decoder {
                     self.emit_branch_cond(b, bo as u8 | 4, bi);
                     b.push(IrInst::BranchRegIf { reg_local: ctr, fallthrough: pc+4 });
                 }
-                return true;
+                return Ok(true);
             }
 
             // ── System ────────────────────────────────────────────────────────
@@ -1364,7 +1367,7 @@ impl Decoder {
                 b.push(IrInst::LoadGpr(rs));
                 b.push(IrInst::StoreMsr);
                 b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                return Ok(true);
             }
             Opcode::Rfi => {
                 // Match ppcjit: only copy SRR1_TO_MSR_MASK bits from SRR1 into MSR,
@@ -1383,7 +1386,7 @@ impl Decoder {
                 // new_pc = srr0 & ~0b11
                 b.push(IrInst::LoadSrr0); b.push(IrInst::I32Const(NOT_LOW2)); b.push(IrInst::I32And);
                 b.push(IrInst::ReturnDynamic);
-                return true;
+                return Ok(true);
             }
 
             // ── Cache/sync hints (no-ops) ─────────────────────────────────────
@@ -1397,15 +1400,16 @@ impl Decoder {
                 // Syscall: save return address, then raise syscall exception.
                 b.push(IrInst::I32Const((pc + 4) as i32)); b.push(IrInst::StorePC);
                 b.push(IrInst::RaiseException(0x0C00));
-                return true;
+                return Ok(true);
             }
             Opcode::Illegal => {
-                // Illegal instruction: skip over it (pc+4), matching the native
-                // JIT's stub behaviour (NOP + auto-advance PC). No exception is
-                // raised here; the WASM and native paths stay consistent.
+                // Illegal instruction — fail compilation, matching the native JIT's
+                // strict mode (BuilderError::Illegal). Games should never execute
+                // an illegal encoding; encountering one indicates a corrupted PC or
+                // emulator bug. Returning Err(()) causes decode() to return None,
+                // which surfaces as a JIT compile error in the caller.
                 b.unimplemented_ops.push(format!("Illegal @ 0x{:08X}", pc));
-                b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                return Err(());
             }
 
             // ── Float select ──────────────────────────────────────────────────
@@ -1661,10 +1665,10 @@ impl Decoder {
                 // from the next block rather than crashing the emulator.
                 b.unimplemented_ops.push(format!("{:?} @ 0x{:08X}", ins.op, pc));
                 b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 }
 
