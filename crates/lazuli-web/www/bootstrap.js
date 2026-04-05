@@ -1011,6 +1011,26 @@ function executeOneBlockSync(emu, ram, log) {
   const { mem: regsMem, view: regsView } = getRegsMem(emu);
   regsView.set(emu.get_cpu_bytes(), 0);
 
+  // ── Pre-execution GPR dump for the mtspr CTR / bcctr diagnostic block ─────
+  // Block #205 @ 0x813002EC: "mtspr CTR, rX ; bcctr" — CTR ends up 0 in WASM
+  // but 0x8000522C on native.  Log all 32 GPRs from WASM memory immediately
+  // after the register file copy so we can see which rX the mtspr instruction
+  // reads and why it is wrong.
+  if (pc === 0x813002EC) {
+    const off = emu.get_reg_offsets();
+    const mem32 = new DataView(regsMem.buffer);
+    const gprOffsets = Array.from(off.gpr);
+    const gprVals = gprOffsets.map((o, i) => `r${i}=${hexU32(mem32.getUint32(o, true))}`);
+    const ctrVal  = hexU32(mem32.getUint32(off.ctr, true));
+    const lrVal   = hexU32(mem32.getUint32(off.lr,  true));
+    console.warn(
+      `[lazuli] PRE-EXEC ${pcHex} GPR dump:\n` +
+      gprVals.slice(0, 16).join("  ") + "\n" +
+      gprVals.slice(16).join("  ") + "\n" +
+      `  LR=${lrVal}  CTR=${ctrVal}`,
+    );
+  }
+
   // Reset exception tracking so we can detect whether THIS block raises an
   // exception (vs. a stale value left by a previous block).
   lastRaisedExceptionKind = -1;
@@ -1074,13 +1094,54 @@ function executeOneBlockSync(emu, ram, log) {
       );
     }
 
+    // Warn when a dynamic branch (blr / bcctr / rfi via ReturnDynamic, or a
+    // conditional bcctr/blr via BranchRegIf) resolves to an unexpectedly low
+    // address.  Two sub-cases:
+    //
+    //   • lastNextPc === 0, no exception raised:
+    //       ReturnDynamic stored 0 to CPU::pc and returned 0, OR BranchRegIf
+    //       wrote CTR/LR=0 to CPU::pc and returned 0.  Either way the dynamic
+    //       branch target was 0x00000000, which is almost always a bug
+    //       (CTR=0 before bcctr, or LR=0 before blr).
+    //
+    //   • lastNextPc !== 0 but newPc < 0x80000000:
+    //       ReturnDynamic returned a non-zero target that is below the normal
+    //       GameCube RAM window — likely a corrupted CTR/LR value.
+    //
+    // In both cases we log CTR and LR at the exact moment the branch fires
+    // (CPU state has already been synced back from WASM memory above).
+    const ctrVal = emu.get_ctr();
+    const lrVal  = emu.get_lr();
+    if (lastNextPc === 0 && lastRaisedExceptionKind < 0) {
+      // Dynamic branch resolved to 0x00000000 with no exception — most likely
+      // bcctr/blr with CTR=0 / LR=0.
+      console.warn(
+        `[lazuli] ${pcHex}: dynamic branch → 0x00000000 (no exception) — ` +
+        `CTR=${hexU32(ctrVal)} LR=${hexU32(lrVal)} ` +
+        `(BranchRegIf or ReturnDynamic with target=0; check CTR/LR before bcctr/blr)`,
+      );
+      pushDebugEvent(`⚠ dyn-branch→0 @ ${pcHex} CTR=${hexU32(ctrVal)} LR=${hexU32(lrVal)}`);
+    } else if (lastNextPc !== 0 && newPc < 0x80000000) {
+      // ReturnDynamic returned a non-zero target below the GameCube RAM window.
+      console.warn(
+        `[lazuli] ${pcHex}: dynamic branch → low address ${hexU32(newPc)} — ` +
+        `CTR=${hexU32(ctrVal)} LR=${hexU32(lrVal)} ` +
+        `(possible corrupted CTR/LR; rawNextPc=${hexU32(lastNextPc)})`,
+      );
+      pushDebugEvent(`⚠ dyn-branch→low ${hexU32(newPc)} @ ${pcHex} CTR=${hexU32(ctrVal)}`);
+    }
+
     emu.set_pc(newPc);
   }
 
   if (log) {
     const curPc = emu.get_pc();
+    const ctrVal = emu.get_ctr();
     const newHex = "0x" + (curPc >>> 0).toString(16).toUpperCase().padStart(8, "0");
-    log.push(`[${pcHex}] executed → next PC ${newHex} (rawNextPc=${hexU32(lastNextPc)})`);
+    log.push(
+      `[${pcHex}] executed → next PC ${newHex} ` +
+      `(rawNextPc=${hexU32(lastNextPc)} CTR=${hexU32(ctrVal)})`,
+    );
   }
   return true;
 }
