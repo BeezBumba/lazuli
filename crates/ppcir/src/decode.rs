@@ -1404,16 +1404,15 @@ impl Decoder {
                 return Ok(true);
             }
             Opcode::Illegal => {
-                // Illegal instruction — fail compilation with a diagnostic message.
-                // Games should never execute an illegal encoding; encountering one
-                // indicates a corrupted PC, executing data memory, or an emulator
-                // bug. The error message carries the PC and opcode so the caller
-                // can log it and feed it back for debugging.
-                return Err(format!(
-                    "Illegal instruction {:?} @ pc=0x{:08X} \
-                     (hint: check for corrupted PC, bad branch target, or executing data)",
-                    ins.op, pc,
-                ));
+                // Illegal (unrecognised) encoding — the powerpc crate returns
+                // Opcode::Illegal for instruction words it cannot decode, which
+                // includes some Gekko-specific encodings not yet covered by the
+                // crate.  Treat these the same as unimplemented instructions:
+                // record the PC for diagnostics and skip to pc+4 so the emulator
+                // keeps running rather than halting with a compile error.
+                b.unimplemented_ops.push(format!("Illegal @ 0x{:08X}", pc));
+                b.push(IrInst::ReturnStatic(pc + 4));
+                return Ok(true);
             }
 
             // ── Float select ──────────────────────────────────────────────────
