@@ -454,22 +454,23 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   // the apploader's init/main/close functions before jumping to the game DOL.
   emu.set_pc(iplEntry);
 
-  // Initialise the MSR to the state the IPL ROM leaves the CPU in before
-  // handing control to the game DOL.  The critical bit to clear is IP
-  // (exception_prefix, bit 6):
+  // Initialise the MSR to match the state the real IPL ROM leaves the CPU in
+  // before handing control to the apploader.
   //
-  //   IP = 1 (Cpu::default reset value): exception vectors at 0xFFF0xxxx.
-  //   For a 24 MiB GameCube RAM, the decrementer vector 0xFFF00900 maps to
-  //   physical 0x01F00900 which is beyond RAM — executing there would cause
-  //   a compile error and stop the emulator.
+  //   IP = 0 (bit 6): exception vectors at 0x0000xxxx.  The Cpu::default
+  //     reset value has IP = 1 (vectors at 0xFFF0xxxx), which for 24 MiB
+  //     GameCube RAM would put the decrementer vector 0xFFF00900 at
+  //     physical 0x01F00900 — beyond RAM and therefore unexecutable.
   //
-  //   IP = 0 (set here): exception vectors at 0x0000xxxx.  The decrementer
-  //   vector is 0x00000900 (physical), which is within RAM and is exactly
-  //   where OSInit() installs the Dolphin OS exception handlers.
+  //   EE = 1 (bit 15): decrementer and external interrupts enabled.  The
+  //     real IPL ROM jumps to the apploader with EE = 1 so that the
+  //     apploader's decrementer-based timer loops work correctly.  With
+  //     EE = 0 the decrementer interrupt can never fire and any spin-loop
+  //     that waits for it would stall forever.
   //
-  // All other bits are cleared (EE=0, FP=0, …); the game's own __start /
-  // OSInit will configure them before enabling external interrupts.
-  emu.set_msr(0);
+  // All other bits are cleared (FP=0, …); the game's own __start / OSInit
+  // will configure them as needed.
+  emu.set_msr(0x8000);  // EE=1, IP=0
 
   return { gameId, gameName, entry: iplEntry };
 }
@@ -1666,20 +1667,9 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
         );
 
-        // If EE=0 and the decrementer has already expired (DEC < 0 as signed),
-        // normal advance_decrementer() can never fire the interrupt while the
-        // guest keeps interrupts disabled.  Force-deliver it so the OS
-        // decrementer handler can run and let execution progress.
-        if (!eeEnabled && ((decVal | 0) < 0)) {
-          console.info(`[lazuli] force_decrementer_exception @ ${stuckHex} (EE=0, DEC expired)`);
-          emu.force_decrementer_exception();
-        }
-
-        // Safety net: if the CPU is still stuck after many force-decrementer
-        // cycles AND the PC is in the PowerPC exception-vector area
-        // (0x00000000–0x00001FFF, covering all vectors from Reset to IABR), a
-        // minimal stub is missing or broken.  Halt execution with a diagnostic
-        // message rather than spinning forever.
+        // Safety net: if the CPU is still stuck after many blocks inside the
+        // PowerPC exception-vector area (0x00000000–0x00001FFF), a stub is
+        // missing or broken.  Halt rather than spinning forever.
         if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD * STUCK_EXCEPTION_VECTOR_MULTIPLIER
             && blockPc < 0x00002000) {
           console.error(
