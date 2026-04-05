@@ -1400,16 +1400,11 @@ impl Decoder {
                 return true;
             }
             Opcode::Illegal => {
-                // Illegal/unrecognized instruction: raise a Program Exception
-                // (vector 0x0700), which is the hardware-accurate response.
-                // StorePC saves the faulting address into CPU::pc so that
-                // deliver_exception sets SRR0 correctly; the host's
-                // skipAndRfi stub at 0x00000700 then advances SRR0 past the
-                // faulting instruction (SRR0 += 4) and rfi's back.
+                // Illegal instruction: skip over it (pc+4), matching the native
+                // JIT's stub behaviour (NOP + auto-advance PC). No exception is
+                // raised here; the WASM and native paths stay consistent.
                 b.unimplemented_ops.push(format!("Illegal @ 0x{:08X}", pc));
-                b.push(IrInst::I32Const(pc as i32));
-                b.push(IrInst::StorePC);
-                b.push(IrInst::RaiseException(0x0700));
+                b.push(IrInst::ReturnStatic(pc + 4));
                 return true;
             }
 
