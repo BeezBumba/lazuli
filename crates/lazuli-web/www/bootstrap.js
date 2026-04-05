@@ -1644,9 +1644,17 @@ async function main() {
       console.log(`[lazuli] ipl-hle.dol fetched (${iplHleDol.byteLength} bytes)`);
     } else {
       console.warn(`[lazuli] ipl-hle.dol not found (${resp.status}); ISO boot unavailable`);
+      setStatus(
+        "⚠ ipl-hle.dol not found — run `just ipl-hle build` then `just web-build` before loading an ISO",
+        "status-err"
+      );
     }
   } catch (e) {
     console.warn("[lazuli] Could not fetch ipl-hle.dol:", e);
+    setStatus(
+      "⚠ Could not fetch ipl-hle.dol — ISO boot unavailable",
+      "status-err"
+    );
   }
 
   renderRegisters(emu);
