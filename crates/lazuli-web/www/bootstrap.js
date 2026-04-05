@@ -392,6 +392,62 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   const iplEntry = emu.load_ipl_hle(iplHleDol);
   emu.set_gpr(3, apploaderEntrypoint);
 
+  // ── Step 5: install minimal exception-vector stubs ───────────────────────
+  //
+  // The real GameCube IPL ROM populates the low-memory exception vectors
+  // (0x00000100–0x00001300) before handing control to the apploader.
+  // Because we use ipl-hle, those handlers are never installed.  When the
+  // stuck-PC heuristic force-delivers a decrementer exception the CPU jumps
+  // to 0x00000900, which contains all-zero words (= Illegal instructions).
+  // Each Illegal instruction raises another Program Exception → 0x00000700 →
+  // more Illegal instructions → infinite loop at 0x00000700.
+  //
+  // We install just enough stub code to break that chain:
+  //
+  //   0x00000900 (Decrementer) — rfi
+  //     Returns to the interrupted instruction (SRR0) with the original MSR
+  //     (SRR1).  This lets a force-delivered decrementer interrupt return
+  //     cleanly so the tight CTR-decrement loop at 0x81200DA0 can keep
+  //     running until CTR reaches 0 and the loop exits naturally.
+  //
+  //   0x00000700 (Program Exception) — mfspr r0,SRR0 / addi r0,r0,4 /
+  //                                    mtspr SRR0,r0 / rfi
+  //     Advances SRR0 past the faulting Illegal instruction before returning.
+  //     Prevents the 0x00000700 self-referencing infinite loop that results
+  //     when an exception handler slot itself contains Illegal instructions.
+  //
+  //   0x00000500 (External Interrupt) — rfi
+  //     Returns from the VI-retrace (external) interrupt without servicing it.
+  //     Prevents a crash once the game's OSInit enables EE (bit 15 of MSR)
+  //     before installing its own handler at 0x00000500.
+  //
+  // These stubs are intentionally minimal: OSInit() overwrites them with full
+  // Dolphin OS handlers (written via the normal emu.load_bytes path) during
+  // the game's first-frame initialisation.
+  //
+  // Instruction encodings (all big-endian):
+  //   rfi                = 0x4C000064  (primary=19, xo=50)
+  //   mfspr r0, SRR0     = 0x7C1A02A6  (primary=31, rD=0, SPR=26, xo=339)
+  //   addi  r0, r0, 4    = 0x38000004  (primary=14, rD=rA=0, SIMM=4)
+  //   mtspr SRR0, r0     = 0x7C1A03A6  (primary=31, rS=0, SPR=26, xo=467)
+  {
+    // rfi — return from interrupt, restoring SRR0 → PC and SRR1 → MSR.
+    const rfi = new Uint8Array([0x4C, 0x00, 0x00, 0x64]);
+
+    // mfspr r0,SRR0 / addi r0,r0,4 / mtspr SRR0,r0 / rfi
+    // Advances SRR0 by 4 (skips the faulting instruction) then returns.
+    const skipAndRfi = new Uint8Array([
+      0x7C, 0x1A, 0x02, 0xA6,  // mfspr r0, SRR0
+      0x38, 0x00, 0x00, 0x04,  // addi  r0, r0, 4
+      0x7C, 0x1A, 0x03, 0xA6,  // mtspr SRR0, r0
+      0x4C, 0x00, 0x00, 0x64,  // rfi
+    ]);
+
+    emu.load_bytes(0x00000500, rfi);        // External Interrupt  → rfi
+    emu.load_bytes(0x00000700, skipAndRfi); // Program Exception   → skip + rfi
+    emu.load_bytes(0x00000900, rfi);        // Decrementer         → rfi
+  }
+
   // Point the CPU at the ipl-hle entry (0x81300000), not the raw apploader
   // entrypoint.  This matches what the real IPL ROM does: it loads the
   // apploader at 0x81200000, then hands control to its own stub which calls
@@ -647,6 +703,14 @@ let stuckConsecutiveRuns = 0;
  * Also used to colour the stat row (yellow above this value, red above 4×).
  */
 const STUCK_PC_THRESHOLD = 50;
+/**
+ * Multiplier on top of STUCK_PC_THRESHOLD used to detect a CPU that is
+ * permanently stuck inside a PowerPC exception-vector address range
+ * (0x00000000–0x00001FFF).  After this many consecutive same-PC blocks the
+ * game loop halts with a diagnostic message instead of spinning forever.
+ * Total threshold = STUCK_PC_THRESHOLD × STUCK_EXCEPTION_VECTOR_MULTIPLIER.
+ */
+const STUCK_EXCEPTION_VECTOR_MULTIPLIER = 10;
 /** Ring buffer of the last DEBUG_EVENT_MAX notable emulation events. */
 let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
@@ -1538,6 +1602,26 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         if (!eeEnabled && ((decVal | 0) < 0)) {
           console.info(`[lazuli] force_decrementer_exception @ ${stuckHex} (EE=0, DEC expired)`);
           emu.force_decrementer_exception();
+        }
+
+        // Safety net: if the CPU is still stuck after many force-decrementer
+        // cycles AND the PC is in the PowerPC exception-vector area
+        // (0x00000000–0x00001FFF, covering all vectors from Reset to IABR), a
+        // minimal stub is missing or broken.  Halt execution with a diagnostic
+        // message rather than spinning forever.
+        if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD * STUCK_EXCEPTION_VECTOR_MULTIPLIER
+            && blockPc < 0x00002000) {
+          console.error(
+            `[lazuli] CPU permanently stuck at exception vector ${stuckHex} ` +
+            `(${stuckConsecutiveRuns} consecutive blocks) — no handler installed; halting.`,
+          );
+          pushDebugEvent(`✗ stuck at exception vector ${stuckHex} — halted`);
+          setStatus(
+            `✗ Stuck at exception vector ${stuckHex} — no handler installed (see console)`,
+            "status-err",
+          );
+          loopError = true;
+          break;
         }
       }
     } else {
