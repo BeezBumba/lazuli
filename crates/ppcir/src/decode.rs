@@ -1396,13 +1396,7 @@ impl Decoder {
                 return true;
             }
             Opcode::Illegal => {
-                // Treat illegal/reserved encodings as a graceful skip, matching
-                // the catch-all below.  Raising a Program Exception here causes
-                // an infinite loop when the PC is forced into uninitialized
-                // memory (e.g. zeroed exception vectors) because the handler
-                // vector itself would also decode as Illegal and re-raise 0x0700.
-                b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                panic!("illegal instruction at 0x{:08X}", pc);
             }
 
             // ── Float select ──────────────────────────────────────────────────
@@ -1653,14 +1647,7 @@ impl Decoder {
 
             // ── Unimplemented ─────────────────────────────────────────────────
             _ => {
-                // Record the unimplemented opcode name for diagnostics.
-                b.unimplemented_ops.push(format!("{:?}", ins.op));
-                // Skip the instruction: return PC+4 as the next PC and terminate
-                // the block here.  This avoids an infinite loop (the previous
-                // RaiseException(0) path returned 0 and left the guest PC
-                // unchanged, causing the same block to re-execute forever).
-                b.push(IrInst::ReturnStatic(pc + 4));
-                return true;
+                panic!("unimplemented instruction {:?} at 0x{:08X}", ins.op, pc);
             }
         }
         false
