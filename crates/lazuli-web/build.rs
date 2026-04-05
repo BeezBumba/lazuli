@@ -7,7 +7,9 @@ fn main() {
 
     if !std::fs::exists(&ipl_hle_dol).unwrap_or_default() {
         println!(
-            "cargo::error=\"ipl-hle.dol not found in local resources folder, please build it using 'just ipl-hle build'\""
+            "cargo::warning=ipl-hle.dol not found in local resources folder; \
+             run `just ipl-hle build` then `just web-build` to deploy it. \
+             ISO boot will not work in the browser until the file is present."
         );
     }
 }
