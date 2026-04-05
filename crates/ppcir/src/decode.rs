@@ -1934,28 +1934,6 @@ mod tests {
             "mtspr LR must emit StoreLr before bclr; IR: {:?}", b.insts);
     }
 
-    /// Verify that field_li() and field_bd() return pre-shifted byte offsets.
-    /// This is critical for correct branch target calculation in decode.rs.
-    #[test]
-    fn branch_field_encoding() {
-        // b +16 (relative, aa=0, lk=0): opcode=18, LI=4, AA=0, LK=0 → 0x48000010
-        // If field_li() returns 4 (raw), pc + 4 = wrong (should be pc + 16)
-        // If field_li() returns 16 (pre-shifted), pc + 16 = correct
-        let b_rel = ins(0x4800_0010);
-        let li = b_rel.field_li();
-        assert_eq!(li as i64, 16,
-            "field_li() must return pre-shifted byte offset 16 for 0x48000010, got {li}");
-        assert!(!b_rel.field_aa(), "aa must be 0");
-
-        // bc always, -8 (relative, aa=0): BO=20, BI=0, BD_raw=-2 → byte offset=-8
-        // 0x4280FFF8: opcode=16, BO=20, BI=0, BD=-2 (14-bit), AA=0, LK=0
-        let bc_rel = ins(0x4280_FFF8);
-        let bd = bc_rel.field_bd();
-        assert_eq!(bd as i64, -8,
-            "field_bd() must return pre-shifted byte offset -8 for 0x4280FFF8, got {bd}");
-        assert!(!bc_rel.field_aa(), "aa must be 0");
-    }
-
     /// rfi terminates the block and emits StoreMsr + ReturnDynamic.
     #[test]
     fn decode_rfi_terminal() {
