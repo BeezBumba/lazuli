@@ -249,6 +249,39 @@
     .left-col { display: flex; flex-direction: column; gap: 12px; }
     .right-col { display: flex; flex-direction: column; gap: 12px; }
 
+    /* Breakpoint list */
+    #bp-list {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px;
+      font-family: "Consolas", monospace;
+      font-size: 0.72rem;
+      min-height: 2em;
+      max-height: 140px;
+      overflow-y: auto;
+      color: var(--text);
+    }
+    .bp-entry {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 2px 0;
+      border-bottom: 1px solid #1c2128;
+    }
+    .bp-entry:last-child { border-bottom: none; }
+    .bp-addr { color: var(--accent); }
+    .bp-remove {
+      padding: 1px 7px;
+      font-size: 0.75rem;
+      line-height: 1.4;
+      color: var(--red);
+      background: var(--border);
+      font-weight: 700;
+      border-radius: 3px;
+    }
+    .bp-remove:hover { background: var(--red); color: #fff; }
+
     /* Drag-drop highlight */
     .drop-active { border-color: var(--accent) !important; }
   </style>
@@ -483,6 +516,27 @@
         </div>
         <label>Execution log:</label>
         <div id="exec-log">(no execution yet)</div>
+      </div>
+    </div>
+
+    <!-- Breakpoints -->
+    <div class="card">
+      <div class="card-header">Breakpoints</div>
+      <div class="card-body controls">
+        <label>
+          Enter a guest PC address (hex) to pause emulation when that address is
+          about to be executed.  Use the Step button to continue after a hit.
+        </label>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <span style="color:var(--muted);font-size:0.82rem;">0x</span>
+          <input type="text" id="bp-addr-input" placeholder="80003f00"
+                 style="font-family:monospace;flex:1;" maxlength="8" spellcheck="false" />
+          <button class="btn-primary" id="btn-bp-add">Add</button>
+        </div>
+        <div id="bp-list">(no breakpoints set)</div>
+        <div class="btn-row">
+          <button class="btn-secondary" id="btn-bp-clear">Clear all</button>
+        </div>
       </div>
     </div>
 
