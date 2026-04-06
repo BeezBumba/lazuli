@@ -361,9 +361,41 @@ impl Decoder {
 
     // ── Main dispatch ─────────────────────────────────────────────────────────
 
+    /// Returns the cycle cost for a given opcode, matching the native JIT costs.
+    fn cycles_for(op: Opcode) -> u32 {
+        match op {
+            // 1-cycle logical/register operations
+            Opcode::And | Opcode::Andc | Opcode::Andi_ | Opcode::Andis_
+            | Opcode::Or  | Opcode::Orc  | Opcode::Ori  | Opcode::Oris
+            | Opcode::Xor | Opcode::Xori | Opcode::Xoris
+            | Opcode::Eqv | Opcode::Nand | Opcode::Nor => 1,
+
+            // 1-cycle SPR/MSR/CR/TB operations
+            | Opcode::Mfspr | Opcode::Mtspr
+            | Opcode::Mfmsr | Opcode::Mtmsr
+            | Opcode::Mfcr  | Opcode::Mtcrf
+            | Opcode::Crand | Opcode::Crandc | Opcode::Creqv
+            | Opcode::Crnand | Opcode::Crnor | Opcode::Cror
+            | Opcode::Crorc | Opcode::Crxor
+            | Opcode::Mftb => 1,
+
+            // 3-cycle multiply
+            | Opcode::Mulhw | Opcode::Mulhwu | Opcode::Mullw | Opcode::Mulli => 3,
+
+            // 19-cycle divide
+            | Opcode::Divw | Opcode::Divwu => 19,
+
+            // 10-cycle bulk load/store
+            | Opcode::Lmw | Opcode::Stmw | Opcode::Lswi | Opcode::Stswi => 10,
+
+            // 2 cycles for everything else
+            _ => 2,
+        }
+    }
+
     fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> Result<bool, String> {
         b.instruction_count += 1;
-        b.cycles += 1;
+        b.cycles += Self::cycles_for(ins.op);
         match ins.op {
             // ── Integer arithmetic ────────────────────────────────────────────
             Opcode::Addi => {
