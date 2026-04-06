@@ -724,8 +724,41 @@ impl Decoder {
             Opcode::Nor   => { let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc(); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Or); b.push(IrInst::I32Not); self.int_result(b,ra,rc); }
             Opcode::Nand  => { let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc(); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32And); b.push(IrInst::I32Not); self.int_result(b,ra,rc); }
             Opcode::Eqv   => { let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc(); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Xor); b.push(IrInst::I32Not); self.int_result(b,ra,rc); }
-            Opcode::Slw   => { let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc(); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Shl); self.int_result(b,ra,rc); }
-            Opcode::Srw   => { let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc(); b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32ShrU); self.int_result(b,ra,rc); }
+            Opcode::Slw   => {
+                // PowerPC slw: shift amount = rB & 0x3F (6 bits).  If bit 5 is
+                // set (shift >= 32) the result is 0.  WASM i32.shl only uses the
+                // low 5 bits, so we must zero the result explicitly when bit 5 of
+                // rB is set, matching the native JIT's behaviour.
+                let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc();
+                let rs_val   = b.alloc_local(IrTy::I32);
+                let overflow = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LocalSet(rs_val));
+                // overflow = (rB >> 5) & 1  — 1 when shift amount >= 32
+                b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Const(5)); b.push(IrInst::I32ShrU);
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(overflow));
+                // shifted = rs << (rb & 31)  — WASM uses only bits[4:0] of rb
+                b.push(IrInst::LocalGet(rs_val)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Shl);
+                // keep_mask = ~(0 - overflow): 0xFFFFFFFF when overflow=0, 0 when overflow=1
+                b.push(IrInst::I32Const(0)); b.push(IrInst::LocalGet(overflow)); b.push(IrInst::I32Sub);
+                b.push(IrInst::I32Not);
+                b.push(IrInst::I32And);
+                self.int_result(b, ra, rc);
+            }
+            Opcode::Srw   => {
+                // PowerPC srw: shift amount = rB & 0x3F (6 bits).  If bit 5 is
+                // set (shift >= 32) the result is 0.  Same fix as Slw above.
+                let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc();
+                let rs_val   = b.alloc_local(IrTy::I32);
+                let overflow = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LocalSet(rs_val));
+                b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Const(5)); b.push(IrInst::I32ShrU);
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(overflow));
+                b.push(IrInst::LocalGet(rs_val)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32ShrU);
+                b.push(IrInst::I32Const(0)); b.push(IrInst::LocalGet(overflow)); b.push(IrInst::I32Sub);
+                b.push(IrInst::I32Not);
+                b.push(IrInst::I32And);
+                self.int_result(b, ra, rc);
+            }
             Opcode::Sraw  => {
                 let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc();
                 let rs_val      = b.alloc_local(IrTy::I32);
@@ -1390,16 +1423,58 @@ impl Decoder {
                 return Ok(true);
             }
 
+            // ── dcbz / dcbzl — zero a data-cache line in memory ──────────────
+            //
+            // The native JIT implements `dcbz` as 8 × 4-byte zero-stores (see
+            // ppcjit/builder/others.rs).  Treating it as a no-op prevents BSS
+            // and display-list clearing from working, which breaks game boot.
+            // `dcbzl` is the Gekko-specific 128-byte (L2) variant.
+            Opcode::Dcbz => {
+                let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                // EA aligned to 32-byte (cache-line) boundary.
+                let ea = b.alloc_local(IrTy::I32);
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::I32Const(!31i32)); b.push(IrInst::I32And);
+                b.push(IrInst::LocalSet(ea));
+                // Zero 8 words (32 bytes).
+                for i in 0..8i32 {
+                    b.push(IrInst::LocalGet(ea));
+                    if i > 0 { b.push(IrInst::I32Const(i * 4)); b.push(IrInst::I32Add); }
+                    b.push(IrInst::I32Const(0));
+                    b.push(IrInst::WriteU32);
+                }
+            }
+            Opcode::DcbzL => {
+                // Gekko-specific 128-byte (L2 cache-line) zero.  EA aligned to
+                // 128 bytes.  Same rationale as Dcbz above.
+                let ra = ins.gpr_a() as u8; let rb = ins.gpr_b() as u8;
+                let ea = b.alloc_local(IrTy::I32);
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::I32Const(!127i32)); b.push(IrInst::I32And);
+                b.push(IrInst::LocalSet(ea));
+                // Zero 32 words (128 bytes).
+                for i in 0..32i32 {
+                    b.push(IrInst::LocalGet(ea));
+                    if i > 0 { b.push(IrInst::I32Const(i * 4)); b.push(IrInst::I32Add); }
+                    b.push(IrInst::I32Const(0));
+                    b.push(IrInst::WriteU32);
+                }
+            }
+
             // ── Cache/sync hints (no-ops) ─────────────────────────────────────
-            Opcode::Sync|Opcode::Isync|Opcode::Eieio|Opcode::Dcbst|Opcode::Dcbz|Opcode::Icbi|Opcode::Dcbi|Opcode::Dcbf
-            | Opcode::Dcbt | Opcode::Dcbtst | Opcode::DcbzL | Opcode::Tlbie | Opcode::Tlbsync
+            Opcode::Sync|Opcode::Isync|Opcode::Eieio|Opcode::Dcbst|Opcode::Icbi|Opcode::Dcbi|Opcode::Dcbf
+            | Opcode::Dcbt | Opcode::Dcbtst | Opcode::Tlbie | Opcode::Tlbsync
             // External control instructions — no-ops (no physical device attached)
             | Opcode::Eciwx | Opcode::Ecowx => {}
 
             // ── Exceptions ────────────────────────────────────────────────────
             Opcode::Sc => {
-                // Syscall: save return address, then raise syscall exception.
-                b.push(IrInst::I32Const((pc + 4) as i32)); b.push(IrInst::StorePC);
+                // Syscall: store the PC of the `sc` instruction itself (NOT pc+4)
+                // so that deliver_exception → gekko::Cpu::raise_exception(Syscall)
+                // sets SRR0 = cpu.pc + 4 correctly.  raise_exception adds 4 for
+                // Syscall via srr0_skip() — if we pre-store pc+4 here, SRR0 ends
+                // up as pc+8, which causes rfi to return to the wrong address.
+                b.push(IrInst::I32Const(pc as i32)); b.push(IrInst::StorePC);
                 b.push(IrInst::RaiseException(0x0C00));
                 return Ok(true);
             }
