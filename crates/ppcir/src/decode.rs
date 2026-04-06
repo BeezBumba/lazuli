@@ -730,16 +730,17 @@ impl Decoder {
                 // low 5 bits, so we must zero the result explicitly when bit 5 of
                 // rB is set, matching the native JIT's behaviour.
                 let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc();
-                let rs_val   = b.alloc_local(IrTy::I32);
-                let overflow = b.alloc_local(IrTy::I32);
+                let rs_val         = b.alloc_local(IrTy::I32);
+                let shift_exceeds_31 = b.alloc_local(IrTy::I32);
                 b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LocalSet(rs_val));
-                // overflow = (rB >> 5) & 1  — 1 when shift amount >= 32
+                // shift_exceeds_31 = (rB >> 5) & 1 — 1 when shift amount >= 32
                 b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Const(5)); b.push(IrInst::I32ShrU);
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(overflow));
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(shift_exceeds_31));
                 // shifted = rs << (rb & 31)  — WASM uses only bits[4:0] of rb
                 b.push(IrInst::LocalGet(rs_val)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Shl);
-                // keep_mask = ~(0 - overflow): 0xFFFFFFFF when overflow=0, 0 when overflow=1
-                b.push(IrInst::I32Const(0)); b.push(IrInst::LocalGet(overflow)); b.push(IrInst::I32Sub);
+                // keep_mask: 0xFFFFFFFF when shift_exceeds_31==0, 0x00000000 when shift_exceeds_31==1
+                // computed as ~(0 - shift_exceeds_31) = NOT(0 - flag)
+                b.push(IrInst::I32Const(0)); b.push(IrInst::LocalGet(shift_exceeds_31)); b.push(IrInst::I32Sub);
                 b.push(IrInst::I32Not);
                 b.push(IrInst::I32And);
                 self.int_result(b, ra, rc);
@@ -748,13 +749,14 @@ impl Decoder {
                 // PowerPC srw: shift amount = rB & 0x3F (6 bits).  If bit 5 is
                 // set (shift >= 32) the result is 0.  Same fix as Slw above.
                 let ra=ins.gpr_a() as u8; let rs=ins.gpr_s() as u8; let rb=ins.gpr_b() as u8; let rc=ins.field_rc();
-                let rs_val   = b.alloc_local(IrTy::I32);
-                let overflow = b.alloc_local(IrTy::I32);
+                let rs_val         = b.alloc_local(IrTy::I32);
+                let shift_exceeds_31 = b.alloc_local(IrTy::I32);
                 b.push(IrInst::LoadGpr(rs)); b.push(IrInst::LocalSet(rs_val));
                 b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Const(5)); b.push(IrInst::I32ShrU);
-                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(overflow));
+                b.push(IrInst::I32Const(1)); b.push(IrInst::I32And); b.push(IrInst::LocalSet(shift_exceeds_31));
                 b.push(IrInst::LocalGet(rs_val)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32ShrU);
-                b.push(IrInst::I32Const(0)); b.push(IrInst::LocalGet(overflow)); b.push(IrInst::I32Sub);
+                // keep_mask: 0xFFFFFFFF when shift_exceeds_31==0, 0x00000000 when shift_exceeds_31==1
+                b.push(IrInst::I32Const(0)); b.push(IrInst::LocalGet(shift_exceeds_31)); b.push(IrInst::I32Sub);
                 b.push(IrInst::I32Not);
                 b.push(IrInst::I32And);
                 self.int_result(b, ra, rc);
