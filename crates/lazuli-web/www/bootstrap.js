@@ -716,6 +716,71 @@ const STUCK_EXCEPTION_VECTOR_MULTIPLIER = 10;
 let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
 
+// ── Breakpoint state ──────────────────────────────────────────────────────────
+
+/**
+ * Set of guest PC addresses (as unsigned 32-bit numbers) at which the emulator
+ * should pause.  When `gameLoop` reaches a block whose PC is in this set it
+ * calls `stopLoop()` and reports the hit so the user can inspect CPU state.
+ */
+const breakpoints = new Set();
+
+/**
+ * Add a breakpoint at `pc` and refresh the breakpoint list UI.
+ * @param {number} pc  Guest PC (unsigned 32-bit).
+ */
+function addBreakpoint(pc) {
+  pc = pc >>> 0;
+  breakpoints.add(pc);
+  renderBreakpointList();
+}
+
+/**
+ * Remove the breakpoint at `pc` and refresh the breakpoint list UI.
+ * @param {number} pc  Guest PC (unsigned 32-bit).
+ */
+function removeBreakpoint(pc) {
+  pc = pc >>> 0;
+  breakpoints.delete(pc);
+  renderBreakpointList();
+}
+
+/** Remove all breakpoints and refresh the UI. */
+function clearBreakpoints() {
+  breakpoints.clear();
+  renderBreakpointList();
+}
+
+/**
+ * Re-render the breakpoint list inside #bp-list.
+ * Each entry shows the address and a small × remove button.
+ */
+function renderBreakpointList() {
+  const el = $("bp-list");
+  if (!el) return;
+  if (breakpoints.size === 0) {
+    el.textContent = "(no breakpoints set)";
+    return;
+  }
+  el.textContent = "";
+  const sorted = [...breakpoints].sort((a, b) => a - b);
+  for (const pc of sorted) {
+    const row = document.createElement("div");
+    row.className = "bp-entry";
+    const addr = document.createElement("span");
+    addr.className = "bp-addr";
+    addr.textContent = hexU32(pc);
+    const rmBtn = document.createElement("button");
+    rmBtn.className = "btn-secondary bp-remove";
+    rmBtn.textContent = "×";
+    rmBtn.title = `Remove breakpoint at ${hexU32(pc)}`;
+    rmBtn.addEventListener("click", () => removeBreakpoint(pc));
+    row.appendChild(addr);
+    row.appendChild(rmBtn);
+    el.appendChild(row);
+  }
+}
+
 /**
  * Format a 32-bit unsigned integer as an 8-digit upper-case hex string with
  * the "0x" prefix.  Used throughout the debug/stuck-PC logging paths.
@@ -1576,6 +1641,23 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   let loopError = false;
   for (let i = 0; i < BLOCKS_PER_FRAME; i++) {
     const blockPc = emu.get_pc();
+
+    // ── Breakpoint check ────────────────────────────────────────────────────
+    // Pause the emulator before executing this block if a breakpoint is set at
+    // the current PC.  stopLoop() cancels the animation-frame loop; the user
+    // can inspect CPU state and resume with the Start button or step manually.
+    if (breakpoints.has(blockPc >>> 0)) {
+      const bpHex = hexU32(blockPc);
+      console.info(`[lazuli] breakpoint hit at ${bpHex}`);
+      pushDebugEvent(`⬤ BREAKPOINT hit at ${bpHex}`);
+      setStatus(`⬤ Breakpoint hit at ${bpHex} — emulation paused`, "status-info");
+      updateStats(emu);
+      renderRegisters(emu);
+      renderFprRegisters(emu);
+      stopLoop();
+      return;
+    }
+
     if (!executeOneBlockSync(emu, ram, null)) {
       loopError = true;
       break;
@@ -2086,6 +2168,32 @@ async function main() {
       count > 0 ? "status-ok" : "status-err"
     );
   });
+
+  // ── Breakpoint controls ───────────────────────────────────────────────────
+  function doAddBreakpoint() {
+    const raw      = $("bp-addr-input").value.trim().replace(/^0x/i, "");
+    const parsedPc = parseInt(raw, 16);
+    if (isNaN(parsedPc)) {
+      setStatus("✗ Invalid breakpoint address — enter a hex address (e.g. 80003f00)", "status-err");
+      return;
+    }
+    addBreakpoint(parsedPc);
+    setStatus(`✓ Breakpoint added at ${hexU32(parsedPc)}`, "status-ok");
+  }
+
+  $("btn-bp-add").addEventListener("click", doAddBreakpoint);
+
+  $("bp-addr-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doAddBreakpoint();
+  });
+
+  $("btn-bp-clear").addEventListener("click", () => {
+    clearBreakpoints();
+    setStatus("✓ All breakpoints cleared", "status-ok");
+  });
+
+  // Initialise the (empty) breakpoint list on page load
+  renderBreakpointList();
 
   // ── Clear debug log button ────────────────────────────────────────────────
   $("btn-clear-debug").addEventListener("click", () => {
