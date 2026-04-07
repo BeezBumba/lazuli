@@ -466,9 +466,29 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
       0x4C, 0x00, 0x00, 0x64,  // rfi
     ]);
 
-    emu.load_bytes(0x00000500, rfi);        // External Interrupt  → rfi
-    emu.load_bytes(0x00000700, skipAndRfi); // Program Exception   → skip + rfi
-    emu.load_bytes(0x00000900, rfi);        // Decrementer         → rfi
+    // mfspr r0,SRR1 / ori r0,r0,0x2000 / mtspr SRR1,r0 / rfi
+    // Enables FP (bit 13) in the saved MSR then returns to re-execute the
+    // faulting FP instruction.  Prevents an FP-Unavailable → FP-Unavailable
+    // spin when the OS has not yet enabled FP via mtmsr.
+    const fpEnableAndRetry = new Uint8Array([
+      0x7C, 0x1B, 0x02, 0xA6,  // mfspr r0, SRR1
+      0x60, 0x00, 0x20, 0x00,  // ori   r0, r0, 0x2000
+      0x7C, 0x1B, 0x03, 0xA6,  // mtspr SRR1, r0
+      0x4C, 0x00, 0x00, 0x64,  // rfi
+    ]);
+
+    // These stubs cover the window before OSInit installs the Dolphin OS
+    // exception handlers to low memory, and act as a safety net if a
+    // bcctr/blr with CTR/LR=0 lands at 0x0 and eventually hits one of
+    // these vectors while executing ISO header bytes as instructions.
+    // OSInit will overwrite all of them with proper handlers.
+    emu.load_bytes(0x00000300, skipAndRfi);    // DSI (Data Storage)    → skip + rfi
+    emu.load_bytes(0x00000400, skipAndRfi);    // ISI (Instr Storage)   → skip + rfi
+    emu.load_bytes(0x00000500, rfi);           // External Interrupt     → rfi
+    emu.load_bytes(0x00000600, skipAndRfi);    // Alignment              → skip + rfi
+    emu.load_bytes(0x00000700, skipAndRfi);    // Program Exception      → skip + rfi
+    emu.load_bytes(0x00000800, fpEnableAndRetry); // FP Unavailable      → enable FP + retry
+    emu.load_bytes(0x00000900, rfi);           // Decrementer            → rfi
   }
 
   // Point the CPU at the ipl-hle entry (0x81300000), not the raw apploader
@@ -763,6 +783,39 @@ let apploaderLogLines = [];
 let stdoutLineBuffer = "";
 
 /**
+ * Feed a single byte from any stdout source (the ipl-hle direct
+ * 0xCC007000 write path OR the EXI UART protocol used by OSReport)
+ * through the line buffer and flush completed lines to the log panel.
+ *
+ * @param {number} ch  Byte value (0–255).
+ */
+function feedStdoutByte(ch) {
+  if (ch === 0x0A /* \n */) {
+    appendApploaderLog(stdoutLineBuffer);
+    stdoutLineBuffer = "";
+  } else if (ch !== 0x0D /* strip \r */ && ch !== 0x00 /* strip NUL */) {
+    stdoutLineBuffer += String.fromCharCode(ch);
+  }
+}
+
+/**
+ * Drain any bytes queued in the EXI UART output buffer (OSReport output)
+ * and feed them through the same stdoutLineBuffer pipeline used by the
+ * ipl-hle 0xCC007000 direct-write path.
+ *
+ * Call this after every emulated block so that OSReport lines appear in
+ * the apploader log in real time.
+ *
+ * @param {WasmEmulator} emu
+ */
+function drainUartOutput(emu) {
+  const bytes = emu.take_uart_output();
+  for (const byte of bytes) {
+    feedStdoutByte(byte);
+  }
+}
+
+/**
  * Append a single line of apploader / OS output to the log panel.
  *
  * Lines are colour-coded by source prefix:
@@ -970,12 +1023,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // (same mask used elsewhere: (addr >>> 24 & 0xFE) === 0xCC).
       if ((addr >>> 24 & 0xFE) === 0xCC && (addr & 0x00FFFFFF) === 0x007000) {
         const ch = val & 0xFF;
-        if (ch === 0x0A /* \n */) {
-          appendApploaderLog(stdoutLineBuffer);
-          stdoutLineBuffer = "";
-        } else if (ch !== 0x0D /* strip \r */) {
-          stdoutLineBuffer += String.fromCharCode(ch);
-        }
+        feedStdoutByte(ch);
         return;
       }
       if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are 32-bit only
@@ -1259,6 +1307,11 @@ function executeOneBlockSync(emu, ram, log) {
   emu.set_cpu_bytes(new Uint8Array(regsMem.buffer, 0, cpuSize));
   emu.record_block_executed();
   pcHitMap.set(pc, (pcHitMap.get(pc) ?? 0) + 1);
+
+  // Drain any EXI UART output produced by this block (e.g. OSReport calls).
+  // Must be called after set_cpu_bytes so that any EXI writes made during
+  // execution are already committed to the Rust emulator state.
+  drainUartOutput(emu);
 
   // Record the raw nextPc for stuck-PC diagnostics in the game loop.
   lastNextPc = nextPc >>> 0;
