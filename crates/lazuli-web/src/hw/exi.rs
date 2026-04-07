@@ -159,8 +159,8 @@ impl ExiState {
     fn handle_transfer(&mut self, ch: usize, cr_val: u32) {
         // Decode transfer type: bits 2–3 of CR.
         let rw    = (cr_val >> 2) & 0x3;
-        // Decode byte count: bits 4–5, value+1 bytes (for immediate mode).
-        let bytes = (((cr_val >> 4) & 0x3) + 1) as usize;
+        // Decode byte count: bits 4–7, value+1 bytes (for immediate mode).
+        let bytes = (((cr_val >> 4) & 0xF) + 1) as usize;
         // Bit 1 of CR: DMA mode (0 = immediate, 1 = DMA).
         let dma   = (cr_val >> 1) & 0x1;
 

@@ -793,7 +793,7 @@ function feedStdoutByte(ch) {
   if (ch === 0x0A /* \n */) {
     appendApploaderLog(stdoutLineBuffer);
     stdoutLineBuffer = "";
-  } else if (ch !== 0x0D /* strip \r */ && ch !== 0x00 /* strip NUL */) {
+  } else if (ch !== 0x0D /* strip \r */) {
     stdoutLineBuffer += String.fromCharCode(ch);
   }
 }
