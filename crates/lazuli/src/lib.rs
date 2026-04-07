@@ -112,12 +112,12 @@ impl Lazuli {
             // ── Phase transition detection ──────────────────────────────────
             // Classify the current PC and log exactly once per phase boundary.
             // Milestone timestamps are latched here for the first occurrence of
-            // each phase.  Uses tracing::info! so the output appears in any
-            // subscriber (e.g. the terminal tracing-subscriber used by the app).
+            // each phase.  Uses println! so output appears directly in the
+            // native terminal console.
             let pc = self.sys.cpu.pc.value();
             let phase = system::classify_pc(pc);
             if phase != self.prev_phase {
-                tracing::info!(
+                println!(
                     "→ Phase transition: {} → {} @ 0x{:08X}",
                     self.prev_phase, phase, pc
                 );
@@ -125,17 +125,17 @@ impl Lazuli {
                 if phase == "ipl-hle" && self.milestones.ipl_hle_started.is_none() {
                     self.milestones.ipl_hle_started = Some(Instant::now());
                     let elapsed = self.milestones.elapsed_ms(self.milestones.ipl_hle_started);
-                    tracing::info!("✓ Milestone: ipl-hle started ({elapsed} since boot)");
+                    println!("✓ Milestone: ipl-hle started ({elapsed} since boot)");
                 }
                 if phase == "apploader" && self.milestones.apploader_running.is_none() {
                     self.milestones.apploader_running = Some(Instant::now());
                     let elapsed = self.milestones.elapsed_ms(self.milestones.apploader_running);
-                    tracing::info!("✓ Milestone: apploader running ({elapsed} since boot)");
+                    println!("✓ Milestone: apploader running ({elapsed} since boot)");
                 }
                 if phase == "OS/game RAM" && self.milestones.game_entry.is_none() {
                     self.milestones.game_entry = Some(Instant::now());
                     let elapsed = self.milestones.elapsed_ms(self.milestones.game_entry);
-                    tracing::info!(
+                    println!(
                         "✓ Milestone: game entry @ 0x{:08X} — OS/game RAM first reached \
                          ({elapsed} since boot)",
                         pc
