@@ -5,15 +5,21 @@
 //!
 //! ## Mailbox boot sequence (HLE)
 //!
-//! The OS boots the DSP by writing a boot-code address to the CPU→DSP mailbox
-//! (`0xCC005000`/`0xCC005002`) and then polling bit 15 of that same register
-//! until the DSP clears it (indicating receipt).  The OS may also poll the
-//! DSP→CPU mailbox (`0xCC005004`/`0xCC005006`) for an explicit ACK.
+//! The OS boots the DSP by:
+//! 1. Writing a boot-code address to the CPU→DSP mailbox (`0xCC005000`/`0xCC005002`)
+//!    and polling bit 15 until the DSP clears it (indicating receipt).
+//! 2. Un-halting the DSP (clearing bit 2 of `DSPCONTROL` at `0xCC00500A`).
+//! 3. Polling bit 15 of the DSP→CPU mailbox (`0xCC005004`) until the DSP sets it,
+//!    indicating the boot ROM has completed initialisation.
 //!
-//! HLE stub: reads from `0xCC005000` always return 0 so bit 15 is never set,
-//! causing "poll until bit15 clears" loops to exit immediately.  Writes to
-//! `0xCC005004`/`0xCC005006` (and `0xCC005000`/`0xCC005002`) are echoed to
-//! the DSP→CPU mailbox so any "poll until bit15 is set" loops also terminate.
+//! HLE stubs:
+//! - Reads from `0xCC005000`/`0xCC005002` (CSMAILBOX) always return 0 so "poll
+//!   until bit 15 clears" loops exit immediately.
+//! - Writes to CSMAILBOX are echoed to the DSP→CPU mailbox buffer.
+//! - When `DSPCONTROL` bit 2 (halt) transitions 1→0 (OS un-halts the DSP), bit 15
+//!   of `DSMAILBOX_H` is immediately set to simulate the DSP boot-ready signal.
+//!   This unblocks the `__OSInitAudioSystem` / `OSInitAram` polling loop at
+//!   `0xCC005004`.
 //!
 //! ## Audio DMA (AI DMA via DSP register space)
 //!
@@ -155,12 +161,25 @@ impl DspState {
             0x06 => self.dsp2cpu_lo = val,
             // DSPCONTROL at hardware offset 0x0A (0xCC00500A).
             0x0A => {
+                // Snapshot the halt bit (bit 2) before applying the write so we can
+                // detect the 1→0 transition that un-halts the DSP.
+                let halt_was_set = (self.control & (1 << 2)) != 0;
                 // W1C: bits 3, 5, 7 clear when the guest writes 1 to them.
                 self.control &= !(val & DSPCTRL_W1C);
                 // Normal writable bits.
                 self.control =
                     (self.control & !DSPCTRL_NORMAL_WRITE) | (val & DSPCTRL_NORMAL_WRITE);
                 // Bit 0 (reset) is a self-clearing pulse — never persist it.
+
+                // HLE DSP boot-completion: when the OS clears the halt bit (bit 2),
+                // the real DSP begins executing its boot ROM and shortly thereafter
+                // writes to DSMAILBOX setting bit 15 ("message available") to signal
+                // readiness.  Simulate this instantly so any "poll DSMAILBOX bit 15"
+                // loops (e.g. __OSInitAudioSystem) exit immediately.
+                let halt_now_clear = (self.control & (1 << 2)) == 0;
+                if halt_was_set && halt_now_clear {
+                    self.dsp2cpu_hi |= 0x8000; // DSP→CPU mailbox status = message ready
+                }
             }
             // ARAM DMA control high halfword (0x28 = offset of DspAramDmaControl).
             // Writing this triggers a DMA in hardware; HLE completes it instantly.
