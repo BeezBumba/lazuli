@@ -109,16 +109,11 @@ impl System {
 
         let size = apploader.header.size;
         let entrypoint = apploader.header.entrypoint;
-        let trailer_size = apploader.header.trailer_size;
         let version = apploader.header.version.to_string();
 
-        tracing::info!(
-            version = %version,
-            entrypoint = format_args!("0x{:08X}", entrypoint),
-            size = format_args!("0x{:X}", size),
-            trailer_size = format_args!("0x{:X}", trailer_size),
-            "apploader loaded at 0x81200000"
-        );
+        println!("[IPL-HLE] Apploader version: \"{version}\"");
+        println!("[IPL-HLE] Apploader body:    0x{size:x} bytes loaded at 0x81200000");
+        println!("[IPL-HLE] Apploader entry:   0x{entrypoint:08X}");
 
         self.mem.ram_mut()[0x0120_0000..][..size as usize].copy_from_slice(&apploader.body);
 
@@ -184,24 +179,31 @@ impl System {
             .context(LoadApploaderCtx::Io)
             .unwrap();
 
+        let iso_bytes = self
+            .modules
+            .disk
+            .seek(SeekFrom::End(0))
+            .context(LoadApploaderCtx::Io)
+            .unwrap();
+        let iso_mib = iso_bytes as f64 / (1024.0 * 1024.0);
+
+        self.modules
+            .disk
+            .seek(SeekFrom::Start(0))
+            .context(LoadApploaderCtx::Io)
+            .unwrap();
+
         let header = iso::Header::read(&mut self.modules.disk)
             .context(LoadApploaderCtx::Apploader)
             .unwrap();
 
-        tracing::info!(
-            game_code = header.meta.game_code(),
-            maker_code = header.meta.maker_code,
-            disk_id = header.meta.disk_id,
-            version = header.meta.version,
-            audio_streaming = header.meta.audio_streaming,
-            stream_buffer_size = header.meta.stream_buffer_size,
-            "loading '{}' ({}) using IPL HLE",
-            header.meta.game_name,
-            header
-                .meta
-                .game_code_str()
-                .as_deref()
-                .unwrap_or("<unknown>")
+        let game_id = header
+            .meta
+            .game_code_str()
+            .unwrap_or_else(|| String::from("<unknown>"));
+        println!(
+            "[IPL-HLE] ISO: \"{}\" ({game_id}), {iso_mib:.1} MiB",
+            header.meta.game_name
         );
 
         // load apploader
@@ -217,19 +219,14 @@ impl System {
         self.config.sideload = Some(Executable::Dol(ipl));
         self.load_executable();
 
-        tracing::info!(
-            ipl_hle_entry = format_args!("0x{:08X}", ipl_entry),
-            apploader_entry = format_args!("0x{:08X}", entry.value()),
-            "ipl-hle loaded; PC=ipl_hle_entry, r3=apploader_entry"
-        );
+        println!("[IPL-HLE] ipl-hle entry:     0x{ipl_entry:08X}");
+        println!("[IPL-HLE] r3 (apploader fn): 0x{:08X}", entry.value());
 
         // setup apploader entrypoint for ipl-hle
         self.cpu.user.gpr[3] = entry.value();
 
-        tracing::info!(
-            pc = format_args!("0x{:08X}", self.cpu.pc.value()),
-            r3 = format_args!("0x{:08X}", self.cpu.user.gpr[3]),
-            "boot handoff: jumping to ipl-hle (r3 = apploader entry)"
+        println!(
+            "[IPL-HLE] PC \u{2192} 0x{ipl_entry:08X} (ipl-hle), MSR=0x8000 (EE=1 IP=0)"
         );
 
         // load dolphin-os globals
