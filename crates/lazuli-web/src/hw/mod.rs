@@ -294,6 +294,19 @@ impl WasmEmulator {
         self.vi.xfb_addr()
     }
 
+    /// Return and clear any EXI UART bytes emitted by the game since the last
+    /// call.
+    ///
+    /// The GameCube OS (`OSReport` → `__OSConsoleWrite`) writes console output
+    /// via the EXI UART protocol on channel 0 (command `0xA001_0000` then
+    /// immediate-mode data writes), not via the virtual `0xCC007000` byte port
+    /// used by ipl-hle.  JavaScript should call this after each emulated block
+    /// and pipe the returned bytes through the same `stdoutLineBuffer` →
+    /// `appendApploaderLog` path used for ipl-hle output.
+    pub fn take_uart_output(&mut self) -> Vec<u8> {
+        self.exi.take_uart_output()
+    }
+
     /// Return `true` if a DVD DMA has written new data into guest RAM since the
     /// last call, and reset the flag to `false`.
     pub fn take_dma_dirty(&mut self) -> bool {

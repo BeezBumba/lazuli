@@ -72,6 +72,13 @@ pub(crate) struct ExiState {
     channels: [ExiChannel; 3],
     /// 64-byte stub SRAM (all zeroes; games fall back to defaults when read).
     sram: [u8; 64],
+    /// True after the IPL/UART device (channel 0, device_sel=0b010) receives
+    /// the UART-write command (`0xA001_0000`).  Subsequent writes on that
+    /// channel are treated as UART data bytes rather than new commands.
+    uart_pending: bool,
+    /// Bytes emitted via the EXI UART (channel 0, IPL chip) since the last
+    /// call to [`ExiState::take_uart_output`].
+    uart_output: Vec<u8>,
 }
 
 impl Default for ExiState {
@@ -79,6 +86,8 @@ impl Default for ExiState {
         Self {
             channels: [ExiChannel::default(); 3],
             sram: [0u8; 64],
+            uart_pending: false,
+            uart_output: Vec::new(),
         }
     }
 }
@@ -128,31 +137,69 @@ impl ExiState {
         }
     }
 
+    /// Drain and return all EXI UART output bytes accumulated since the last
+    /// call.  The internal buffer is cleared on each call.
+    ///
+    /// JavaScript should call this after every emulated block and pipe the
+    /// returned bytes through the same `stdoutLineBuffer` → `appendApploaderLog`
+    /// pipeline used for ipl-hle `0xCC007000` writes.
+    pub(crate) fn take_uart_output(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.uart_output)
+    }
+
     /// Handle an EXI transfer request for `channel`.
     ///
-    /// For the SRAM/RTC device (channel 0, device_sel bit 1 = 0b010), the
-    /// first immediate write sets an address then reads from the stub SRAM.
+    /// For the SRAM/RTC device (channel 0, device_sel bit 1 = 0b010):
+    /// - Immediate **read** transfers (rw == 0): return bytes from stub SRAM.
+    /// - Immediate **write** transfers (rw == 1):
+    ///   - Data register == `0xA001_0000` → enter UART write mode.
+    ///   - Subsequent writes while in UART mode → accumulate output bytes.
+    ///
     /// All other devices return zeroes (no card / no device).
     fn handle_transfer(&mut self, ch: usize, cr_val: u32) {
         // Decode transfer type: bits 2–3 of CR.
         let rw    = (cr_val >> 2) & 0x3;
         // Decode byte count: bits 4–7, value+1 bytes (for immediate mode).
         let bytes = (((cr_val >> 4) & 0xF) + 1) as usize;
+        // Bit 1 of CR: DMA mode (0 = immediate, 1 = DMA).
+        let dma   = (cr_val >> 1) & 0x1;
 
-        // For immediate read transfers (rw == 0), return data from stub SRAM
-        // if channel 0 and the SRAM device is selected (device_sel = 0b010).
         let device_sel = (self.channels[ch].param >> 7) & 0x7;
-        if ch == 0 && device_sel == 0b010 && rw == 0 {
-            // The data register's high byte is used as an SRAM address by the OS;
-            // return the byte at that address (all zeroes from the stub SRAM).
-            let sram_addr = ((self.channels[ch].data >> 24) & 0x3F) as usize;
-            let mut result = 0u32;
-            for i in 0..bytes.min(4) {
-                let byte = if sram_addr + i < self.sram.len() { self.sram[sram_addr + i] } else { 0 };
-                result = (result << 8) | byte as u32;
+
+        if ch == 0 && device_sel == 0b010 && dma == 0 {
+            if rw == 0 {
+                // Immediate read — return bytes from stub SRAM.
+                // The data register's high byte is used as an SRAM address by
+                // the OS; return the byte at that address (all zeroes from the
+                // stub SRAM).
+                self.uart_pending = false;
+                let sram_addr = ((self.channels[ch].data >> 24) & 0x3F) as usize;
+                let mut result = 0u32;
+                for i in 0..bytes.min(4) {
+                    let byte = if sram_addr + i < self.sram.len() { self.sram[sram_addr + i] } else { 0 };
+                    result = (result << 8) | byte as u32;
+                }
+                // Left-align the result in the 32-bit data register.
+                self.channels[ch].data = result << (32 - 8 * bytes);
+            } else if rw == 1 {
+                // Immediate write — UART command or data.
+                let data = self.channels[ch].data;
+                if data == 0xA001_0000 {
+                    // UART write command: subsequent transfers are data bytes.
+                    self.uart_pending = true;
+                } else if self.uart_pending {
+                    // UART data bytes: extract up to `bytes` bytes from the
+                    // data register (big-endian, MSB first) and accumulate.
+                    // Filter the ESC character (0x1B) as the native emulator
+                    // does in `uart_transfer_write`.
+                    let data_bytes = data.to_be_bytes();
+                    for &byte in &data_bytes[..bytes.min(4)] {
+                        if byte != 0x1B {
+                            self.uart_output.push(byte);
+                        }
+                    }
+                }
             }
-            // Left-align the result in the 32-bit data register.
-            self.channels[ch].data = result << (32 - 8 * bytes);
         }
 
         // Complete transfer: clear TSTART, set XFER_INT.
