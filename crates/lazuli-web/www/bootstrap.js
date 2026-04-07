@@ -444,6 +444,13 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   //     Prevents a crash once the game's OSInit enables EE (bit 15 of MSR)
   //     before installing its own handler at 0x00000500.
   //
+  //   0x00000C00 (System Call) — rfi
+  //     Returns from a `sc` instruction.  The Syscall exception sets SRR0 to
+  //     pc+4 (the instruction after `sc`), so rfi correctly resumes there with
+  //     the saved MSR restored.  Without this stub the CPU wanders through zero
+  //     memory when `sc` fires before OSInit installs the real handler at
+  //     0x80000C00, eventually getting stuck in game code.
+  //
   // These stubs are intentionally minimal: OSInit() overwrites them with full
   // Dolphin OS handlers (written via the normal emu.load_bytes path) during
   // the game's first-frame initialisation.
@@ -489,6 +496,7 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
     emu.load_bytes(0x00000700, skipAndRfi);    // Program Exception      → skip + rfi
     emu.load_bytes(0x00000800, fpEnableAndRetry); // FP Unavailable      → enable FP + retry
     emu.load_bytes(0x00000900, rfi);           // Decrementer            → rfi
+    emu.load_bytes(0x00000C00, rfi);           // System Call (sc)       → rfi
   }
 
   // Point the CPU at the ipl-hle entry (0x81300000), not the raw apploader
