@@ -32,8 +32,8 @@ pub(crate) use di::{DiState, DI_BASE, DI_SIZE};
 pub(crate) use dsp::{DspState, DSP_BASE, DSP_SIZE};
 pub(crate) use exi::{ExiState, EXI_BASE, EXI_SIZE};
 pub(crate) use pi::{
-    PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_SI as PI_SI, PI_INT_VI, PI_MEMSIZE_VAL,
-    PI_SIZE,
+    PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_DI, PI_INT_SI as PI_SI, PI_INT_VI,
+    PI_MEMSIZE_VAL, PI_SIZE,
 };
 pub(crate) use si::{SiState, SI_BASE, SI_SIZE};
 pub(crate) use vi::{ViState, VI_BASE, VI_SIZE};
@@ -145,6 +145,10 @@ impl WasmEmulator {
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             if self.di.write_reg(addr - DI_BASE, val) {
                 self.process_di_command();
+                // Assert the DI interrupt (PI_INT_DI = bit 2 = 0x0000_0004).
+                // The OS handler will clear this bit by writing 1 to PI_INTSR.
+                self.pi_intsr |= PI_INT_DI;
+                self.maybe_deliver_external_interrupt();
             }
             return;
         }
