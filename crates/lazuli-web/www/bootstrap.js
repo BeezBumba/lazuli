@@ -716,7 +716,83 @@ const STUCK_EXCEPTION_VECTOR_MULTIPLIER = 10;
 let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
 
-// ── Breakpoint state ──────────────────────────────────────────────────────────
+// ── Apploader / OS console stdout state ──────────────────────────────────────
+
+/**
+ * Maximum number of lines retained in the apploader/OS console log.
+ * Older lines are dropped from the top when this limit is reached.
+ */
+const APPLOADER_LOG_MAX = 500;
+
+/**
+ * Ring buffer of lines already appended to the apploader log panel.
+ * Used to enforce APPLOADER_LOG_MAX without re-scanning the DOM.
+ */
+let apploaderLogLines = [];
+
+/**
+ * Accumulates individual characters written to the GC EXI stdout port
+ * (0xCC007000) until a newline is received, at which point the complete
+ * line is flushed to the apploader log panel.
+ */
+let stdoutLineBuffer = "";
+
+/**
+ * Append a single line of apploader / OS output to the log panel.
+ *
+ * Lines are colour-coded by source prefix:
+ *   [IPL-HLE]   — blue (emulator boot glue)
+ *   [APPLOADER] — green (real apploader messages)
+ *   others      — yellow (OS / unknown)
+ *
+ * @param {string} line  Raw line text (no trailing newline).
+ */
+function appendApploaderLog(line) {
+  const logEl = document.getElementById("apploader-log");
+  if (!logEl) return;
+
+  // If this is the first real line, clear the placeholder text.
+  if (apploaderLogLines.length === 0 && logEl.firstChild &&
+      logEl.firstChild.nodeType === Node.TEXT_NODE) {
+    logEl.textContent = "";
+  }
+
+  const entry = document.createElement("div");
+  if (line.startsWith("[IPL-HLE]")) {
+    entry.className = "apploader-ipl";
+  } else if (line.startsWith("[APPLOADER]")) {
+    entry.className = "apploader-app";
+  } else if (line.length > 0) {
+    entry.className = "apploader-os";
+  } else {
+    entry.className = "apploader-text";
+  }
+  entry.textContent = line;
+  logEl.appendChild(entry);
+
+  apploaderLogLines.push(line);
+
+  // Enforce the line-count limit by removing the oldest DOM child.
+  if (apploaderLogLines.length > APPLOADER_LOG_MAX) {
+    apploaderLogLines.shift();
+    if (logEl.firstChild) logEl.removeChild(logEl.firstChild);
+  }
+
+  // Auto-scroll to the newest line.
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/**
+ * Clear the apploader log panel and reset the line buffer.
+ * Called on ISO load and emulator reset.
+ */
+function clearApploaderLog() {
+  apploaderLogLines = [];
+  stdoutLineBuffer  = "";
+  const logEl = document.getElementById("apploader-log");
+  if (logEl) logEl.textContent = "(no output yet — load an ISO to begin)";
+}
+
 
 /**
  * Set of guest PC addresses (as unsigned 32-bit numbers) at which the emulator
@@ -862,6 +938,21 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     write_u8(addr, val) {
       addr = addr >>> 0;
+      // Intercept character writes to the GC EXI stdout port.
+      // The ipl-hle and apploader write to 0xCC007000 (cached) or
+      // 0xCD007000 (uncached) one byte at a time using stb instructions.
+      // Check the high byte with the cached/uncached mirror bit masked out
+      // (same mask used elsewhere: (addr >>> 24 & 0xFE) === 0xCC).
+      if ((addr >>> 24 & 0xFE) === 0xCC && (addr & 0x00FFFFFF) === 0x007000) {
+        const ch = val & 0xFF;
+        if (ch === 0x0A /* \n */) {
+          appendApploaderLog(stdoutLineBuffer);
+          stdoutLineBuffer = "";
+        } else if (ch !== 0x0D /* strip \r */) {
+          stdoutLineBuffer += String.fromCharCode(ch);
+        }
+        return;
+      }
       if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are 32-bit only
       addr &= PHYS_MASK;
       if (addr < ram.length) ram[addr] = val & 0xff;
@@ -991,6 +1082,7 @@ function clearModuleCache() {
   debugEvents             = [];
   const el = $("debug-log");
   if (el) el.textContent = "(no events yet)";
+  clearApploaderLog();
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
@@ -2200,6 +2292,11 @@ async function main() {
     debugEvents = [];
     const el = $("debug-log");
     if (el) el.textContent = "(no events yet)";
+  });
+
+  // ── Clear apploader log button ────────────────────────────────────────────
+  $("btn-clear-apploader").addEventListener("click", () => {
+    clearApploaderLog();
   });
 
   // Enable step/run buttons now that the emulator is ready

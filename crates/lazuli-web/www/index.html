@@ -284,6 +284,24 @@
 
     /* Drag-drop highlight */
     .drop-active { border-color: var(--accent) !important; }
+
+    /* Apploader / OS console log */
+    #apploader-log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px;
+      font-family: "Consolas", "Courier New", monospace;
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      max-height: 320px;
+      overflow-y: auto;
+      color: var(--text);
+    }
+    .apploader-ipl  { color: var(--accent); }
+    .apploader-app  { color: var(--green); }
+    .apploader-os   { color: var(--yellow); }
+    .apploader-text { color: var(--text); }
   </style>
 </head>
 <body>
@@ -331,6 +349,23 @@
         <div class="btn-row">
           <button class="btn-primary" id="btn-load-iso" disabled>Load ISO into RAM</button>
           <button class="btn-secondary" id="btn-load-demo">Load demo program</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Apploader / OS console log -->
+    <div class="card" id="apploader-card">
+      <div class="card-header">Apploader / OS Console</div>
+      <div class="card-body controls">
+        <label>
+          Characters written to the GameCube EXI stdout port
+          (<code>0xCC007000</code>) — IPL-HLE boot log, apploader progress,
+          and early OS messages.  Populated automatically when an ISO is
+          running.
+        </label>
+        <div id="apploader-log">(no output yet — load an ISO to begin)</div>
+        <div class="btn-row">
+          <button class="btn-secondary" id="btn-clear-apploader">Clear</button>
         </div>
       </div>
     </div>
