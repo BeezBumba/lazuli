@@ -82,10 +82,15 @@ impl WasmEmulator {
         let bss_size   = u32be(data, 0x0DC);
         let entry      = u32be(data, 0x0E0);
 
+        console_log!("[lazuli-web] ipl-hle DOL: {} bytes, entry=0x{:08X}, bss=0x{:08X}..+0x{:X}",
+            data.len(), entry, bss_target, bss_size);
+
         for i in 0..7 {
             if text_offsets[i] != 0 && text_sizes[i] != 0 {
                 let start = text_offsets[i] as usize;
                 let size  = text_sizes[i] as usize;
+                console_log!("[lazuli-web] ipl-hle text[{}]: file+0x{:X} → 0x{:08X}, {} bytes",
+                    i, start, text_targets[i], size);
                 self.load_bytes(text_targets[i], &data[start..start + size]);
             }
         }
@@ -93,10 +98,13 @@ impl WasmEmulator {
             if data_offsets[i] != 0 && data_sizes[i] != 0 {
                 let start = data_offsets[i] as usize;
                 let size  = data_sizes[i] as usize;
+                console_log!("[lazuli-web] ipl-hle data[{}]: file+0x{:X} → 0x{:08X}, {} bytes",
+                    i, start, data_targets[i], size);
                 self.load_bytes(data_targets[i], &data[start..start + size]);
             }
         }
         if bss_size > 0 {
+            console_log!("[lazuli-web] ipl-hle BSS: 0x{:08X}..+0x{:X} zeroed", bss_target, bss_size);
             let zeros = vec![0u8; bss_size as usize];
             self.load_bytes(bss_target, &zeros);
         }

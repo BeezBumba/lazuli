@@ -108,9 +108,21 @@ impl System {
             .context(LoadApploaderCtx::Apploader)?;
 
         let size = apploader.header.size;
+        let entrypoint = apploader.header.entrypoint;
+        let trailer_size = apploader.header.trailer_size;
+        let version = apploader.header.version.to_string();
+
+        tracing::info!(
+            version = %version,
+            entrypoint = format_args!("0x{:08X}", entrypoint),
+            size = format_args!("0x{:X}", size),
+            trailer_size = format_args!("0x{:X}", trailer_size),
+            "apploader loaded at 0x81200000"
+        );
+
         self.mem.ram_mut()[0x0120_0000..][..size as usize].copy_from_slice(&apploader.body);
 
-        Ok(Address(apploader.header.entrypoint))
+        Ok(Address(entrypoint))
     }
 
     fn load_executable(&mut self) {
@@ -121,6 +133,10 @@ impl System {
         match &exec {
             Executable::Dol(dol) => {
                 self.cpu.pc = Address(dol.entrypoint());
+                tracing::debug!(
+                    entrypoint = format_args!("0x{:08X}", dol.entrypoint()),
+                    "DOL executable loaded, PC set"
+                );
                 self.cpu.supervisor.memory.setup_default_bats();
                 self.mem.build_bat_lut(&self.cpu.supervisor.memory);
 
@@ -197,11 +213,24 @@ impl System {
             "/../../local/ipl-hle.dol"
         )));
         let ipl = dol::Dol::read(&mut cursor).unwrap();
+        let ipl_entry = ipl.entrypoint();
         self.config.sideload = Some(Executable::Dol(ipl));
         self.load_executable();
 
+        tracing::info!(
+            ipl_hle_entry = format_args!("0x{:08X}", ipl_entry),
+            apploader_entry = format_args!("0x{:08X}", entry.value()),
+            "ipl-hle loaded; PC=ipl_hle_entry, r3=apploader_entry"
+        );
+
         // setup apploader entrypoint for ipl-hle
         self.cpu.user.gpr[3] = entry.value();
+
+        tracing::info!(
+            pc = format_args!("0x{:08X}", self.cpu.pc.value()),
+            r3 = format_args!("0x{:08X}", self.cpu.user.gpr[3]),
+            "boot handoff: jumping to ipl-hle (r3 = apploader entry)"
+        );
 
         // load dolphin-os globals
         self.write_phys_slow::<u32>(Address(0x00), header.meta.game_code());
