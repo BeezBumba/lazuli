@@ -758,6 +758,15 @@ let stuckConsecutiveRuns = 0;
  */
 const STUCK_PC_THRESHOLD = 50;
 /**
+ * Reduces the periodic "STILL STUCK" re-dump rate.
+ *
+ * After the first stuck dump at STUCK_PC_THRESHOLD blocks, subsequent
+ * re-dumps fire every STUCK_PC_THRESHOLD * STUCK_REDUMP_MULTIPLIER blocks
+ * (i.e. 500 instead of 50), cutting console spam by 10× while still
+ * confirming whether any state changes while the CPU is spinning.
+ */
+const STUCK_REDUMP_MULTIPLIER = 10;
+/**
  * Multiplier on top of STUCK_PC_THRESHOLD used to detect a CPU that is
  * permanently stuck inside a PowerPC exception-vector address range
  * (0x00000000–0x00001FFF).  After this many consecutive same-PC blocks the
@@ -768,6 +777,46 @@ const STUCK_EXCEPTION_VECTOR_MULTIPLIER = 10;
 /** Ring buffer of the last DEBUG_EVENT_MAX notable emulation events. */
 let debugEvents = [];
 const DEBUG_EVENT_MAX = 30;
+
+// ── MMIO access ring buffer ───────────────────────────────────────────────────
+
+/**
+ * Ring buffer of the last MMIO_RING_SIZE hardware-register accesses.
+ * Each entry: { dir: "R"|"W", size: 8|16|32, addr: number, subsystem: string, val: number }
+ * Populated by buildHooks() for 16- and 32-bit MMIO reads/writes.
+ * Reset on ISO load / Reset via clearModuleCache().
+ */
+const MMIO_RING_SIZE = 8;
+let recentMmioAccesses = [];
+
+// ── Execution phase tracking ──────────────────────────────────────────────────
+
+/**
+ * PC phase label from the most recently executed block.
+ * Used to detect phase transitions without generating per-block log noise.
+ * Reset to "unknown" on ISO load / Reset.
+ */
+let prevPhase = "unknown";
+
+/**
+ * Wall-clock timestamps (performance.now()) for notable boot milestones.
+ * null = not yet reached.  Reset on ISO load / Reset via clearModuleCache().
+ *
+ *   startedAt        — when startLoop() was first called after ISO load
+ *   iplHleStarted    — first block executed in the ipl-hle address range
+ *   apploaderRunning — ipl-hle printed "[IPL-HLE] Running apploader init"
+ *   apploaderDone    — ipl-hle printed "[IPL-HLE] Apploader closed!"
+ *   gameEntry        — first block executed in OS/game RAM (outside boot stubs)
+ *   firstXfbContent  — first frame with non-zero XFB pixel data
+ */
+let milestones = {
+  startedAt:        null,
+  iplHleStarted:    null,
+  apploaderRunning: null,
+  apploaderDone:    null,
+  gameEntry:        null,
+  firstXfbContent:  null,
+};
 
 // ── Apploader / OS console stdout state ──────────────────────────────────────
 
@@ -834,6 +883,30 @@ function drainUartOutput(emu) {
  * @param {string} line  Raw line text (no trailing newline).
  */
 function appendApploaderLog(line) {
+  // Milestone detection: intercept key ipl-hle stdout lines before rendering.
+  // The strings match what crates/ipl-hle/src/main.rs prints via stdout_write.
+  if (milestones.apploaderRunning === null &&
+      line.includes("Running apploader init")) {
+    milestones.apploaderRunning = performance.now();
+    const elapsed = milestones.startedAt !== null
+      ? ((milestones.apploaderRunning - milestones.startedAt) | 0) + " ms"
+      : "?";
+    console.info(`[lazuli] ✓ Milestone: apploader init started (${elapsed} since boot)`);
+    pushDebugEvent(`✓ Milestone: apploader init (${elapsed})`);
+  }
+  if (milestones.apploaderDone === null &&
+      line.includes("Apploader closed!")) {
+    milestones.apploaderDone = performance.now();
+    const elapsed = milestones.startedAt !== null
+      ? ((milestones.apploaderDone - milestones.startedAt) | 0) + " ms"
+      : "?";
+    console.info(
+      `[lazuli] ✓ Apploader phase complete — exceptions: ${raiseExceptionTotal}, elapsed: ${elapsed}\n` +
+      `         → jumping to OS/game RAM (game entry will be logged on first block there)`
+    );
+    pushDebugEvent(`✓ Apploader done (${elapsed})`);
+  }
+
   const logEl = document.getElementById("apploader-log");
   if (!logEl) return;
 
@@ -953,6 +1026,59 @@ function renderBreakpointList() {
 const hexU32 = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
 
 /**
+ * Classify a guest program-counter value into a named emulator boot phase.
+ *
+ * The ranges mirror the load addresses used by parseAndLoadIso / load_ipl_hle:
+ *   exception vectors — 0x00000000–0x00001FFF  (low-RAM exception handlers)
+ *   ipl-hle           — 0x81300000–0x813FFFFF  (boot-glue DOL)
+ *   apploader         — 0x81200000–0x812FFFFF  (real disc apploader)
+ *   OS/game RAM       — 0x80000000–0x817FFFFF  (main GameCube RAM window)
+ *   unknown           — anything else
+ *
+ * Used to annotate stuck/unstuck log lines and to detect phase transitions
+ * in the game loop without generating per-block noise.
+ *
+ * @param {number} pc  Guest PC (unsigned 32-bit)
+ * @returns {string}   Human-readable phase label
+ */
+function classifyPc(pc) {
+  pc = pc >>> 0;
+  if (pc < 0x00002000) return "exception vectors";
+  if (pc >= 0x81300000 && pc <= 0x813FFFFF) return "ipl-hle";
+  if (pc >= 0x81200000 && pc <= 0x812FFFFF) return "apploader";
+  if (pc >= 0x80000000 && pc <= 0x817FFFFF) return "OS/game RAM";
+  return "unknown";
+}
+
+/**
+ * Map a hardware-register address (0xCCxxxxxx / 0xCDxxxxxx) to a short
+ * subsystem label.  Used by the MMIO ring-buffer logging.
+ *
+ * Ranges match the dispatch table in crates/lazuli-web/src/hw/mod.rs:
+ *   VI  0xCC002000  Video Interface
+ *   PI  0xCC003000  Processor Interface
+ *   DSP 0xCC005000  DSP Interface / ARAM
+ *   DI  0xCC006000  DVD Interface
+ *   SI  0xCC006400  Serial Interface
+ *   EXI 0xCC006800  External Interface
+ *   AI  0xCC006C00  Audio Interface
+ *
+ * @param {number} addr  Raw guest address (before PHYS_MASK)
+ * @returns {string}     Subsystem label
+ */
+function mmioSubsystem(addr) {
+  const off = addr & 0x00FFFFFF;
+  if (off >= 0x002000 && off < 0x003000) return "VI";
+  if (off >= 0x003000 && off < 0x004000) return "PI";
+  if (off >= 0x005000 && off < 0x006000) return "DSP";
+  if (off >= 0x006000 && off < 0x006400) return "DI";
+  if (off >= 0x006400 && off < 0x006800) return "SI";
+  if (off >= 0x006800 && off < 0x006C00) return "EXI";
+  if (off >= 0x006C00 && off < 0x007000) return "AI";
+  return "HW";
+}
+
+/**
  * Append a human-readable event to the debug event ring buffer and refresh
  * the on-screen debug log panel.
  *
@@ -991,8 +1117,10 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       addr = addr >>> 0;
       if ((addr >>> 24 & 0xFE) === 0xCC) {
         // Route to Rust hw_read_u16 for hardware registers (e.g. DSP mailbox).
-        if (emu) return emu.hw_read_u16(addr) & 0xFFFF;
-        return 0;
+        const val = emu ? emu.hw_read_u16(addr) & 0xFFFF : 0;
+        recentMmioAccesses.push({ dir: "R", size: 16, addr, subsystem: mmioSubsystem(addr), val });
+        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
+        return val;
       }
       addr &= PHYS_MASK;
       if (addr + 1 >= ram.length) return 0;
@@ -1004,8 +1132,10 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // 0xCC006000 (DVD Interface) reaches the correct handler instead of
       // aliasing to RAM offset 0x00006000.
       if ((addr >>> 24 & 0xFE) === 0xCC) {
-        if (emu) return emu.hw_read_u32(addr) >>> 0;
-        return 0;
+        const val = emu ? emu.hw_read_u32(addr) >>> 0 : 0;
+        recentMmioAccesses.push({ dir: "R", size: 32, addr, subsystem: mmioSubsystem(addr), val });
+        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
+        return val;
       }
       addr &= PHYS_MASK;
       if (addr + 3 >= ram.length) return 0;
@@ -1042,6 +1172,8 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       addr = addr >>> 0;
       if ((addr >>> 24 & 0xFE) === 0xCC) {
         // Route to Rust hw_write_u16 for hardware registers (e.g. DSP mailbox).
+        recentMmioAccesses.push({ dir: "W", size: 16, addr, subsystem: mmioSubsystem(addr), val: val & 0xFFFF });
+        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
         if (emu) emu.hw_write_u16(addr, val & 0xFFFF);
         return;
       }
@@ -1058,6 +1190,8 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // Writing 0xCC006000-0xCC006027 drives the DVD Interface; bit 0 of
       // DICR (0x1C) triggers a DMA from the stored disc image into guest RAM.
       if ((addr >>> 24 & 0xFE) === 0xCC) {
+        recentMmioAccesses.push({ dir: "W", size: 32, addr, subsystem: mmioSubsystem(addr), val });
+        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
         if (emu) {
           emu.hw_write_u32(addr, val);
           // A DVD Read DMA may have just overwritten guest code in RAM.
@@ -1164,6 +1298,18 @@ function clearModuleCache() {
   const el = $("debug-log");
   if (el) el.textContent = "(no events yet)";
   clearApploaderLog();
+  // Reset phase-tracking, MMIO ring, and milestones so stale data from a
+  // previous ISO session does not pollute the next session's diagnostics.
+  recentMmioAccesses = [];
+  prevPhase          = "unknown";
+  milestones = {
+    startedAt:        null,
+    iplHleStarted:    null,
+    apploaderRunning: null,
+    apploaderDone:    null,
+    gameEntry:        null,
+    firstXfbContent:  null,
+  };
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
@@ -1836,6 +1982,41 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   for (let i = 0; i < BLOCKS_PER_FRAME; i++) {
     const blockPc = emu.get_pc();
 
+    // ── Phase transition detection ────────────────────────────────────────────
+    // Classify the current PC into a named boot phase and emit exactly one log
+    // line per phase boundary — no per-block noise.  Also sets milestone
+    // timestamps for ipl-hle entry and game entry (OS/game RAM first reached).
+    {
+      const blockPhase = classifyPc(blockPc);
+      if (blockPhase !== prevPhase) {
+        const transMsg =
+          `→ Phase transition: ${prevPhase} → ${blockPhase} @ ${hexU32(blockPc)} ` +
+          `(block #${emu.blocks_executed()})`;
+        console.info(`[lazuli] ${transMsg}`);
+        pushDebugEvent(transMsg);
+
+        if (blockPhase === "ipl-hle" && milestones.iplHleStarted === null) {
+          milestones.iplHleStarted = performance.now();
+          const elapsed = milestones.startedAt !== null
+            ? ((milestones.iplHleStarted - milestones.startedAt) | 0) + " ms" : "?";
+          console.info(`[lazuli] ✓ Milestone: ipl-hle started (${elapsed} since boot)`);
+          pushDebugEvent(`✓ Milestone: ipl-hle started (${elapsed})`);
+        }
+        if (blockPhase === "OS/game RAM" && milestones.gameEntry === null) {
+          milestones.gameEntry = performance.now();
+          const elapsed = milestones.startedAt !== null
+            ? ((milestones.gameEntry - milestones.startedAt) | 0) + " ms" : "?";
+          console.info(
+            `[lazuli] ✓ Milestone: game entry @ ${hexU32(blockPc)} — OS/game RAM first reached ` +
+            `(${elapsed} since boot)`
+          );
+          pushDebugEvent(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
+        }
+
+        prevPhase = blockPhase;
+      }
+    }
+
     // ── Breakpoint check ────────────────────────────────────────────────────
     // Pause the emulator before executing this block if a breakpoint is set at
     // the current PC.  stopLoop() cancels the animation-frame loop; the user
@@ -1900,15 +2081,16 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       stuckConsecutiveRuns++;
       if (stuckConsecutiveRuns === STUCK_PC_THRESHOLD) {
         const stuckHex = "0x" + blockPc.toString(16).toUpperCase().padStart(8, "0");
+        const stuckPhase = classifyPc(blockPc);
         const excInfo  = lastRaisedExceptionPc === blockPc
           ? `exception(${lastRaisedExceptionKind}) loop`
           : "branch-to-self or nextPc=0";
         const msg =
-          `PC stuck at ${stuckHex} for ${STUCK_PC_THRESHOLD} consecutive blocks — ${excInfo}` +
+          `PC stuck at ${stuckHex} [${stuckPhase}] for ${STUCK_PC_THRESHOLD} consecutive blocks — ${excInfo}` +
           ` (exceptions raised: ${emu.raise_exception_count()}, compiled: ${emu.blocks_compiled()})`;
         console.warn(`[lazuli] ${msg}`);
-        pushDebugEvent(`⚠ STUCK ${stuckHex} — ${excInfo}`);
-        setStatus(`⚠ PC stuck at ${stuckHex} — ${excInfo}`, "status-info");
+        pushDebugEvent(`⚠ STUCK ${stuckHex} [${stuckPhase}] — ${excInfo}`);
+        setStatus(`⚠ PC stuck at ${stuckHex} [${stuckPhase}] — ${excInfo}`, "status-info");
 
         // ── Full CPU state dump on first stuck detection ──────────────────
         const lrVal   = emu.get_lr();
@@ -1942,19 +2124,43 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `⚠ CPU dump: LR=${hexU32(lrVal)} CTR=${hexU32(ctrVal)} MSR=${hexU32(msrVal)} ` +
           `SRR0=${hexU32(srr0Val)} DEC=${decVal | 0} EE=${eeEnabled}`,
         );
+
+        // ── Enriched context: phase, recent MMIO, and milestone status ────
+        const now = performance.now();
+        const fmtMs = (ts) => ts !== null
+          ? `✓ (${((now - ts) | 0)} ms ago)`
+          : "✗ not reached";
+        const mmioLines = recentMmioAccesses.length === 0
+          ? "    (no recent MMIO accesses)"
+          : recentMmioAccesses.map(e =>
+              `    ${e.dir}${e.size} ${e.subsystem} ${hexU32(e.addr)} = ${hexU32(e.val)}`
+            ).join("\n");
+        console.warn(
+          `[lazuli] STUCK context @ ${stuckHex}:\n` +
+          `  Phase: ${stuckPhase}\n` +
+          `  Last MMIO accesses (oldest→newest):\n${mmioLines}\n` +
+          `  Boot milestones:\n` +
+          `    iplHleStarted:    ${fmtMs(milestones.iplHleStarted)}\n` +
+          `    apploaderRunning: ${fmtMs(milestones.apploaderRunning)}\n` +
+          `    apploaderDone:    ${fmtMs(milestones.apploaderDone)}\n` +
+          `    gameEntry:        ${fmtMs(milestones.gameEntry)}\n` +
+          `    firstXfbContent:  ${fmtMs(milestones.firstXfbContent)}\n` +
+          `  → divergence is likely AFTER the last ✓ milestone above`
+        );
       }
 
-      // Periodic re-dump every additional STUCK_PC_THRESHOLD runs while stuck,
-      // so we can tell whether any state is changing as execution continues.
+      // Periodic re-dump every STUCK_PC_THRESHOLD * STUCK_REDUMP_MULTIPLIER runs
+      // while stuck (10× less frequent than the initial dump), so we can tell
+      // whether any state is changing as execution continues.
       if (stuckConsecutiveRuns > STUCK_PC_THRESHOLD &&
-          (stuckConsecutiveRuns % STUCK_PC_THRESHOLD) === 0) {
+          (stuckConsecutiveRuns % (STUCK_PC_THRESHOLD * STUCK_REDUMP_MULTIPLIER)) === 0) {
         const stuckHex = "0x" + blockPc.toString(16).toUpperCase().padStart(8, "0");
         const lrVal  = emu.get_lr();
         const msrVal = emu.get_msr();
         const decVal = emu.get_dec();
         const eeEnabled = (msrVal >> 15) & 1;
         console.info(
-          `[lazuli] STILL STUCK @ ${stuckHex} (run #${stuckConsecutiveRuns}): ` +
+          `[lazuli] STILL STUCK @ ${stuckHex} [${classifyPc(blockPc)}] (run #${stuckConsecutiveRuns}): ` +
           `nextPc=${hexU32(lastNextPc)} LR=${hexU32(lrVal)} MSR=${hexU32(msrVal)} (EE=${eeEnabled}) ` +
           `DEC=${decVal | 0} exceptions=${emu.raise_exception_count()}`,
         );
@@ -1980,8 +2186,9 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     } else {
       if (stuckConsecutiveRuns >= STUCK_PC_THRESHOLD) {
         const newHex = "0x" + newBlockPc.toString(16).toUpperCase().padStart(8, "0");
-        console.info(`[lazuli] PC unstuck → ${newHex} after ${stuckConsecutiveRuns} same-PC blocks`);
-        pushDebugEvent(`✓ unstuck → ${newHex} (was stuck for ${stuckConsecutiveRuns} blocks)`);
+        const unstuckPhase = classifyPc(newBlockPc);
+        console.info(`[lazuli] PC unstuck → ${newHex} [${unstuckPhase}] after ${stuckConsecutiveRuns} same-PC blocks`);
+        pushDebugEvent(`✓ unstuck → ${newHex} [${unstuckPhase}] (${stuckConsecutiveRuns} blocks)`);
         setStatus("▶ Emulation running…", "status-ok");
       }
       stuckConsecutiveRuns = 0;
@@ -2007,6 +2214,19 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // Render XFB to canvas
   renderXfb(ram, ctx, emu, gameTitle);
 
+  // Milestone: first frame with non-zero XFB pixel data.
+  // renderXfb() sets xfbHasContent=true the first time it finds a non-zero
+  // pixel in any candidate XFB region.  We latch that into milestones here
+  // so the elapsed time is correct (checked once per animation frame).
+  if (xfbHasContent && milestones.firstXfbContent === null) {
+    milestones.firstXfbContent = performance.now();
+    const elapsed = milestones.startedAt !== null
+      ? ((milestones.firstXfbContent - milestones.startedAt) | 0) + " ms"
+      : "?";
+    console.info(`[lazuli] ✓ Milestone: first XFB content (first rendered frame) — ${elapsed} since boot`);
+    pushDebugEvent(`✓ Milestone: first XFB (${elapsed})`);
+  }
+
   // FPS counter (update every second)
   frameCount++;
   if (timestamp - lastFpsTime >= 1000) {
@@ -2031,6 +2251,12 @@ function startLoop(emu, canvas, ctx) {
   running     = true;
   frameCount  = 0;
   lastFpsTime = performance.now();
+  // Record the wall-clock start time for milestone elapsed calculations.
+  // Only set once (not on Resume after pause) so all milestone timestamps
+  // are relative to the very beginning of this ISO session.
+  if (milestones.startedAt === null) {
+    milestones.startedAt = performance.now();
+  }
   animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
   $("btn-start").disabled = true;
   $("btn-stop").disabled  = false;
