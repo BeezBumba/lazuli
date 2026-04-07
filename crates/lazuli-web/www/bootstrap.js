@@ -759,13 +759,13 @@ function appendApploaderLog(line) {
 
   const entry = document.createElement("div");
   if (line.startsWith("[IPL-HLE]")) {
-    entry.className = "aploader-ipl";
+    entry.className = "apploader-ipl";
   } else if (line.startsWith("[APPLOADER]")) {
-    entry.className = "aploader-app";
+    entry.className = "apploader-app";
   } else if (line.length > 0) {
-    entry.className = "aploader-os";
+    entry.className = "apploader-os";
   } else {
-    entry.className = "aploader-text";
+    entry.className = "apploader-text";
   }
   entry.textContent = line;
   logEl.appendChild(entry);
