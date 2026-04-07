@@ -13,6 +13,8 @@ pub use disks;
 pub use gekko::{self, Address, Cycles};
 pub use primitive::Primitive;
 
+use std::time::Instant;
+
 use crate::cores::Cores;
 use crate::system::{Modules, System};
 
@@ -23,6 +25,33 @@ const DSP_STEP: u32 = 64;
 /// How many DSP instructions to execute per step.
 const DSP_INST_PER_STEP: u32 = (DSP_STEP as f64 * DSP_INST_PER_CYCLE) as u32;
 
+/// Wall-clock timestamps for notable emulator boot-phase milestones.
+///
+/// Fields are `None` until that milestone has been reached.  Logged on the
+/// first phase transition that triggers each one, and can be read by callers
+/// (e.g. a UI layer) to report how long each boot stage took.
+#[derive(Default)]
+pub struct DebugMilestones {
+    /// When [`Lazuli::exec`] was first called (start of emulated time).
+    pub started_at: Option<Instant>,
+    /// First block executed in the ipl-hle address range (0x81300000+).
+    pub ipl_hle_started: Option<Instant>,
+    /// First block executed in the apploader address range (0x81200000+).
+    pub apploader_running: Option<Instant>,
+    /// First block executed in OS/game RAM (0x80000000–0x817FFFFF, outside
+    /// the boot stubs).  Approximate equivalent of "game entry" reached.
+    pub game_entry: Option<Instant>,
+}
+
+impl DebugMilestones {
+    fn elapsed_ms(&self, milestone_time: Option<Instant>) -> String {
+        match (self.started_at, milestone_time) {
+            (Some(start), Some(ts)) => format!("{} ms", ts.duration_since(start).as_millis()),
+            _ => "?".into(),
+        }
+    }
+}
+
 /// The Lazuli emulator.
 pub struct Lazuli {
     /// System state.
@@ -31,6 +60,10 @@ pub struct Lazuli {
     cores: Cores,
     /// How many DSP cycles are pending.
     dsp_pending: f64,
+    /// Boot-phase milestones for diagnostic logging.
+    pub milestones: DebugMilestones,
+    /// PC phase label from the most recent exec iteration.
+    prev_phase: &'static str,
 }
 
 impl Lazuli {
@@ -39,11 +72,19 @@ impl Lazuli {
             sys: System::new(modules, config),
             cores,
             dsp_pending: 0.0,
+            milestones: DebugMilestones::default(),
+            prev_phase: "unknown",
         }
     }
 
     /// Advances emulation by the specified number of CPU cycles.
     pub fn exec(&mut self, cycles: Cycles, breakpoints: &[Address]) -> cores::Executed {
+        // Latch the start time on the very first exec() call so all milestone
+        // elapsed values are relative to "when emulation began".
+        if self.milestones.started_at.is_none() {
+            self.milestones.started_at = Some(Instant::now());
+        }
+
         let mut total_executed = cores::Executed::default();
         while total_executed.cycles < cycles {
             // how many CPU cycles can we execute?
@@ -67,6 +108,42 @@ impl Lazuli {
 
             self.sys.scheduler.advance(executed.cycles.0);
             self.sys.process_events();
+
+            // ── Phase transition detection ──────────────────────────────────
+            // Classify the current PC and log exactly once per phase boundary.
+            // Milestone timestamps are latched here for the first occurrence of
+            // each phase.  Uses tracing::info! so the output appears in any
+            // subscriber (e.g. the terminal tracing-subscriber used by the app).
+            let pc = self.sys.cpu.pc.value();
+            let phase = system::classify_pc(pc);
+            if phase != self.prev_phase {
+                tracing::info!(
+                    "→ Phase transition: {} → {} @ 0x{:08X}",
+                    self.prev_phase, phase, pc
+                );
+
+                if phase == "ipl-hle" && self.milestones.ipl_hle_started.is_none() {
+                    self.milestones.ipl_hle_started = Some(Instant::now());
+                    let elapsed = self.milestones.elapsed_ms(self.milestones.ipl_hle_started);
+                    tracing::info!("✓ Milestone: ipl-hle started ({elapsed} since boot)");
+                }
+                if phase == "apploader" && self.milestones.apploader_running.is_none() {
+                    self.milestones.apploader_running = Some(Instant::now());
+                    let elapsed = self.milestones.elapsed_ms(self.milestones.apploader_running);
+                    tracing::info!("✓ Milestone: apploader running ({elapsed} since boot)");
+                }
+                if phase == "OS/game RAM" && self.milestones.game_entry.is_none() {
+                    self.milestones.game_entry = Some(Instant::now());
+                    let elapsed = self.milestones.elapsed_ms(self.milestones.game_entry);
+                    tracing::info!(
+                        "✓ Milestone: game entry @ 0x{:08X} — OS/game RAM first reached \
+                         ({elapsed} since boot)",
+                        pc
+                    );
+                }
+
+                self.prev_phase = phase;
+            }
 
             if executed.hit_breakpoint || breakpoints.contains(&self.sys.cpu.pc) {
                 std::hint::cold_path();

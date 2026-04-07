@@ -39,6 +39,29 @@ use crate::system::lazy::Lazy;
 use crate::system::mem::Memory;
 use crate::system::scheduler::{HandlerCtx, Scheduler};
 
+/// Classify a guest program-counter value into a named emulator boot phase.
+///
+/// The ranges mirror the load addresses used by `System::load_ipl_hle` and
+/// the JavaScript `classifyPc` helper in `bootstrap.js`, so that native and
+/// web emulator log messages use consistent terminology.
+///
+/// | Range                     | Label               |
+/// |---------------------------|---------------------|
+/// | 0x00000000–0x00001FFF     | `"exception vectors"` |
+/// | 0x81300000–0x813FFFFF     | `"ipl-hle"`           |
+/// | 0x81200000–0x812FFFFF     | `"apploader"`         |
+/// | 0x80000000–0x817FFFFF     | `"OS/game RAM"`       |
+/// | anything else             | `"unknown"`           |
+pub fn classify_pc(pc: u32) -> &'static str {
+    match pc {
+        0x0000_0000..=0x0000_1FFF => "exception vectors",
+        0x8130_0000..=0x813F_FFFF => "ipl-hle",
+        0x8120_0000..=0x812F_FFFF => "apploader",
+        0x8000_0000..=0x817F_FFFF => "OS/game RAM",
+        _ => "unknown",
+    }
+}
+
 /// System configuration.
 pub struct Config {
     pub ipl_lle: bool,
