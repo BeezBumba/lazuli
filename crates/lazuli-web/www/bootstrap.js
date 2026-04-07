@@ -1789,6 +1789,20 @@ let xfbHasContent  = false;
 let xfbAddr        = XFB_PHYS_DEFAULT;
 
 /**
+ * Returns the current MSR.EE (External Interrupt Enable) bit as 0 or 1.
+ *
+ * MSR bit 15 is the EE flag.  Used by the game loop's EE edge-detection logic
+ * to determine when the CPU re-enables external interrupts (e.g. after `rfi`
+ * or `mtmsr`), which is the point at which pending PI interrupts should fire.
+ *
+ * @param {WasmEmulator} emu
+ * @returns {0|1}
+ */
+function getMsrEe(emu) {
+  return (emu.get_msr() >>> 15) & 1;
+}
+
+/**
  * Main emulation loop — called by requestAnimationFrame at ~60 Hz.
  *
  * Each frame executes up to BLOCKS_PER_FRAME JIT blocks, renders the XFB to
@@ -1809,14 +1823,16 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // (~60 Hz).  Games and the OS use VIWaitForRetrace() — a spin loop that
   // briefly enables EE so the VI external interrupt can fire.  Without this
   // call the OS retrace counter never increments and VIWaitForRetrace() spins
-  // forever.  advance_decrementer (called after every block below) will
-  // deliver the pending External exception as soon as EE=1.
+  // forever.  The EE edge-detection in the block loop below will deliver the
+  // pending External exception as soon as the OS re-enables EE.
   emu.assert_vi_interrupt();
 
   // Execute blocks for this frame
   const ram = getRamView(emu);
   let blocksThisFrame = 0;
   let loopError = false;
+  // Track EE bit across blocks to detect 0→1 transitions (see EE edge-detection comment below).
+  let prevBlockEe = getMsrEe(emu);
   for (let i = 0; i < BLOCKS_PER_FRAME; i++) {
     const blockPc = emu.get_pc();
 
@@ -1836,11 +1852,28 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       return;
     }
 
+    // Snapshot EE *before* the block so we can detect a 0→1 transition
+    // caused by rfi or mtmsr inside the block.
+    prevBlockEe = getMsrEe(emu);
+
     if (!executeOneBlockSync(emu, ram, null)) {
       loopError = true;
       break;
     }
     blocksThisFrame++;
+
+    // ── EE edge-detection: deliver pending PI external interrupts ─────────────
+    // The native JIT fires pi::check_interrupts only on an MSR-change event
+    // (via the `msr_changed` hook triggered by `rfi` / `mtmsr`), NOT on every
+    // block.  Mirror that here: if the block raised EE from 0 to 1 (e.g. via
+    // `rfi` restoring the pre-exception MSR), call maybe_deliver_external_interrupt
+    // exactly once.  This prevents the infinite interrupt re-delivery loop
+    // that occurred when PI_INTSR VI bit remained set across the `rfi`
+    // that ends the OS interrupt handler.
+    const newEe = getMsrEe(emu);
+    if (newEe && !prevBlockEe) {
+      emu.maybe_deliver_external_interrupt();
+    }
 
     // Advance the decrementer after each block using the block's actual CPU
     // cycle count rather than a fixed per-block constant.  This mirrors the
@@ -1852,9 +1885,8 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     // consumed by this block is floor(cycles / 12).  We clamp to at least 1
     // so a zero-cycle block (should not happen) still makes forward progress.
     //
-    // The Rust `advance_decrementer` is level-sensitive: the exception fires
-    // on the first call after a block enables EE if DEC < 0, and is
-    // de-asserted immediately when the handler writes a non-negative DEC.
+    // advance_decrementer only handles the DEC edge-trigger; PI external
+    // interrupts are delivered separately via the EE edge-detection above.
     const blockMeta   = blockMetaMap.get(blockPc);
     const blockCycles = blockMeta ? blockMeta.cycles : TICKS_PER_BLOCK_FALLBACK * 12;
     emu.add_cpu_cycles(blockCycles);
