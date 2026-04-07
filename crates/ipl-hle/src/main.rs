@@ -157,7 +157,8 @@ pub unsafe extern "C" fn main(entry: ApploaderEntryFn) {
 
     println(c"[IPL-HLE] Finished running main. Closing apploader...");
     let entry = close();
-    println(c"[IPL-HLE] Apploader closed! Jumping to bootfile entrypoint");
+    print(c"[IPL-HLE] Apploader closed! Jumping to bootfile entry: 0x");
+    println_hex(entry as usize as u32);
 
     entry();
 }
