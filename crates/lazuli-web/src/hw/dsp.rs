@@ -170,7 +170,6 @@ impl DspState {
                 self.control =
                     (self.control & !DSPCTRL_NORMAL_WRITE) | (val & DSPCTRL_NORMAL_WRITE);
                 // Bit 0 (reset) is a self-clearing pulse — never persist it.
-
                 // HLE DSP boot-completion: when the OS clears the halt bit (bit 2),
                 // the real DSP begins executing its boot ROM and shortly thereafter
                 // writes to DSMAILBOX setting bit 15 ("message available") to signal
