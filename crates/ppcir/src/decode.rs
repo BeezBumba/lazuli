@@ -1133,7 +1133,30 @@ impl Decoder {
             Opcode::Fneg  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Neg); b.push(IrInst::StoreFprPs0(fd)); }
             Opcode::Fabs  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Abs); b.push(IrInst::StoreFprPs0(fd)); }
             Opcode::Frsp  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fctiw | Opcode::Fctiwz => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::I32TruncF64S); b.push(IrInst::F64FromI32S); b.push(IrInst::StoreFprPs0(fd)); }
+            Opcode::Fctiw => {
+                // Convert to Integer Word, rounding per FPSCR[RN] (default = round to nearest even).
+                // The result integer is stored as a raw bit-pattern in the low 32 bits of the FPR
+                // (upper 32 bits are undefined per the PowerPC spec) so that stfiwx can extract it.
+                // Sequence: f64 → f64.nearest → i32 (sat) → i64 (sign-extend) → f64 (bitcast).
+                let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8;
+                b.push(IrInst::LoadFprPs0(fb));
+                b.push(IrInst::F64Nearest);          // round to nearest even (FPSCR RN=0)
+                b.push(IrInst::I32TruncSatF64S);     // f64 → i32, saturating (no trap on NaN/overflow)
+                b.push(IrInst::I64ExtendI32S);       // i32 → i64 (sign-extend, matching native fcvt_to_sint_sat + sextend)
+                b.push(IrInst::F64ReinterpretI64);   // i64 → f64 bitcast (store integer bits in FPR)
+                b.push(IrInst::StoreFprPs0(fd));
+            }
+            Opcode::Fctiwz => {
+                // Convert to Integer Word with truncation toward Zero.
+                // Same as fctiw but skips the rounding step.
+                // Sequence: f64 → i32 (sat, truncate-toward-zero) → i64 → f64 (bitcast).
+                let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8;
+                b.push(IrInst::LoadFprPs0(fb));
+                b.push(IrInst::I32TruncSatF64S);     // f64 → i32, saturating, truncate toward zero
+                b.push(IrInst::I64ExtendI32S);       // i32 → i64 (sign-extend)
+                b.push(IrInst::F64ReinterpretI64);   // i64 → f64 bitcast
+                b.push(IrInst::StoreFprPs0(fd));
+            }
             Opcode::Fsqrt  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sqrt); b.push(IrInst::StoreFprPs0(fd)); }
             Opcode::Fsqrts => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sqrt); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
             Opcode::Fres    => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; self.emit_recip(b,fd,fb,false,false); }
@@ -2104,5 +2127,48 @@ mod tests {
         assert!(b.unimplemented_ops.is_empty());
         assert!(ir_contains(&b, |i| matches!(i, IrInst::StoreMsr)),
             "rfi must emit StoreMsr");
+    }
+
+    // ── fctiw / fctiwz: integer result stored as raw bits in FPR ────────────
+    //
+    // The PowerPC `fctiw`/`fctiwz` instructions convert an f64 to an i32 and
+    // store the result as the *raw integer bit-pattern* in the low 32 bits of
+    // the target FPR.  The `stfiwx` instruction then extracts those bits.
+    //
+    // The bug was: `F64FromI32S` (numeric conversion, e.g. 3 → 3.0_f64) was
+    // used instead of a bitcast (3 → 0x0000000000000003_u64 → f64), so
+    // `stfiwx` would read the low 32 bits of 3.0_f64 (= 0x00000000) instead
+    // of 0x00000003.  Fixed by using I32TruncSatF64S → I64ExtendI32S →
+    // F64ReinterpretI64.
+
+    /// fctiwz (0xFC20_001E = fctiwz f1, f0) must emit F64ReinterpretI64 and
+    /// must NOT emit F64FromI32S (numeric conversion is wrong for this opcode).
+    #[test]
+    fn fctiwz_emits_reinterpret_not_convert() {
+        // fctiwz f1, f0  = 0xFC20_001E
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0xFC20_001E))].into_iter()).unwrap();
+        assert!(b.unimplemented_ops.is_empty(), "fctiwz unimplemented: {:?}", b.unimplemented_ops);
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::F64ReinterpretI64)),
+            "fctiwz must emit F64ReinterpretI64 (bitcast); IR: {:?}", b.insts);
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::F64FromI32S)),
+            "fctiwz must NOT emit F64FromI32S (numeric conversion is wrong); IR: {:?}", b.insts);
+        // Must also use saturating truncate, not the trapping variant.
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::I32TruncSatF64S)),
+            "fctiwz must emit I32TruncSatF64S (saturating); IR: {:?}", b.insts);
+    }
+
+    /// fctiw (0xFC20_001C = fctiw f1, f0) must emit F64Nearest (round to
+    /// nearest) then F64ReinterpretI64 and must NOT emit F64FromI32S.
+    #[test]
+    fn fctiw_emits_nearest_then_reinterpret() {
+        // fctiw f1, f0  = 0xFC20_001C
+        let b = Decoder::new().decode([(0x8000_0000u32, ins(0xFC20_001C))].into_iter()).unwrap();
+        assert!(b.unimplemented_ops.is_empty(), "fctiw unimplemented: {:?}", b.unimplemented_ops);
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::F64Nearest)),
+            "fctiw must emit F64Nearest (rounding); IR: {:?}", b.insts);
+        assert!(ir_contains(&b, |i| matches!(i, IrInst::F64ReinterpretI64)),
+            "fctiw must emit F64ReinterpretI64 (bitcast); IR: {:?}", b.insts);
+        assert!(!ir_contains(&b, |i| matches!(i, IrInst::F64FromI32S)),
+            "fctiw must NOT emit F64FromI32S (numeric conversion is wrong); IR: {:?}", b.insts);
     }
 }

@@ -100,6 +100,9 @@ pub enum IrInst {
     F64FromI32S,
     /// `(f64) → (i32)` — truncate f64 to i32 (toward zero).
     I32TruncF64S,
+    /// `(f64) → (i32)` — saturating truncate f64 to i32 (toward zero, clamps on overflow/NaN).
+    /// Matches `fcvt_to_sint_sat` used by the native JIT for `fctiw`/`fctiwz`.
+    I32TruncSatF64S,
     /// `(f64) → (f64)` — round f64 to f32 precision and back (`frsp`).
     F64RoundToSingle,
     /// `(i32) → (f64)` — reinterpret u32 bits as f32, promote to f64 (`lfs`).
@@ -108,6 +111,11 @@ pub enum IrInst {
     I32DemoteToSingleBits,
     /// `(f64) → (i32)` — reinterpret f64 bit-pattern as i64, take low 32 bits (`stfiwx`).
     I32FromF64LowBits,
+    /// `(i64) → (f64)` — reinterpret i64 bit-pattern as f64 (bitcast, no numeric conversion).
+    /// Used by `fctiw`/`fctiwz` to store the integer result as raw bits in the FPR.
+    F64ReinterpretI64,
+    /// `(f64) → (f64)` — round f64 to nearest integer (ties to even), used by `fctiw`.
+    F64Nearest,
 
     // ─── Float select ─────────────────────────────────────────────────────────
     /// `(f64, f64, i32) → (f64)` — if cond≠0 return first f64, else second (`fsel`).
