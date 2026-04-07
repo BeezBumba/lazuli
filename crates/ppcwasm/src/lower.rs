@@ -260,6 +260,7 @@ fn emit_inst(
         // ── Float conversions ──────────────────────────────────────────────────
         IrInst::F64FromI32S => b.push(Instruction::F64ConvertI32S),
         IrInst::I32TruncF64S => b.push(Instruction::I32TruncF64S),
+        IrInst::I32TruncSatF64S => b.push(Instruction::I32TruncSatF64S),
         IrInst::F64RoundToSingle => {
             b.push(Instruction::F32DemoteF64);
             b.push(Instruction::F64PromoteF32);
@@ -278,6 +279,17 @@ fn emit_inst(
             // f64 bit-pattern as i64, take low 32 bits  (implements `stfiwx`)
             b.push(Instruction::I64ReinterpretF64);
             b.push(Instruction::I32WrapI64);
+        }
+        IrInst::F64ReinterpretI64 => {
+            // i64 bit-pattern as f64 (bitcast, no numeric conversion).
+            // Used by `fctiw`/`fctiwz` to store the integer result as raw bits in the FPR
+            // so that `stfiwx` can later extract them correctly.
+            b.push(Instruction::F64ReinterpretI64);
+        }
+        IrInst::F64Nearest => {
+            // Round f64 to nearest integer (ties to even), matching FPSCR RN=0.
+            // Used by `fctiw` which rounds per the FPSCR rounding mode (default = nearest).
+            b.push(Instruction::F64Nearest);
         }
 
         // ── Float select ──────────────────────────────────────────────────────
