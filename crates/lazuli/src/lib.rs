@@ -44,8 +44,8 @@ pub struct DebugMilestones {
 }
 
 impl DebugMilestones {
-    fn elapsed_ms(&self, ts: Option<Instant>) -> String {
-        match (self.started_at, ts) {
+    fn elapsed_ms(&self, milestone_time: Option<Instant>) -> String {
+        match (self.started_at, milestone_time) {
             (Some(start), Some(ts)) => format!("{} ms", ts.duration_since(start).as_millis()),
             _ => "?".into(),
         }

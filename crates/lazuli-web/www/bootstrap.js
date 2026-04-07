@@ -889,7 +889,7 @@ function appendApploaderLog(line) {
       line.includes("Running apploader init")) {
     milestones.apploaderRunning = performance.now();
     const elapsed = milestones.startedAt !== null
-      ? ((milestones.apploaderRunning - milestones.startedAt) | 0) + " ms"
+      ? Math.trunc(milestones.apploaderRunning - milestones.startedAt) + " ms"
       : "?";
     console.info(`[lazuli] ✓ Milestone: apploader init started (${elapsed} since boot)`);
     pushDebugEvent(`✓ Milestone: apploader init (${elapsed})`);
@@ -898,7 +898,7 @@ function appendApploaderLog(line) {
       line.includes("Apploader closed!")) {
     milestones.apploaderDone = performance.now();
     const elapsed = milestones.startedAt !== null
-      ? ((milestones.apploaderDone - milestones.startedAt) | 0) + " ms"
+      ? Math.trunc(milestones.apploaderDone - milestones.startedAt) + " ms"
       : "?";
     console.info(
       `[lazuli] ✓ Apploader phase complete — exceptions: ${raiseExceptionTotal}, elapsed: ${elapsed}\n` +
@@ -1998,14 +1998,14 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         if (blockPhase === "ipl-hle" && milestones.iplHleStarted === null) {
           milestones.iplHleStarted = performance.now();
           const elapsed = milestones.startedAt !== null
-            ? ((milestones.iplHleStarted - milestones.startedAt) | 0) + " ms" : "?";
+            ? Math.trunc(milestones.iplHleStarted - milestones.startedAt) + " ms" : "?";
           console.info(`[lazuli] ✓ Milestone: ipl-hle started (${elapsed} since boot)`);
           pushDebugEvent(`✓ Milestone: ipl-hle started (${elapsed})`);
         }
         if (blockPhase === "OS/game RAM" && milestones.gameEntry === null) {
           milestones.gameEntry = performance.now();
           const elapsed = milestones.startedAt !== null
-            ? ((milestones.gameEntry - milestones.startedAt) | 0) + " ms" : "?";
+            ? Math.trunc(milestones.gameEntry - milestones.startedAt) + " ms" : "?";
           console.info(
             `[lazuli] ✓ Milestone: game entry @ ${hexU32(blockPc)} — OS/game RAM first reached ` +
             `(${elapsed} since boot)`
@@ -2128,7 +2128,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
         // ── Enriched context: phase, recent MMIO, and milestone status ────
         const now = performance.now();
         const fmtMs = (ts) => ts !== null
-          ? `✓ (${((now - ts) | 0)} ms ago)`
+          ? `✓ (${Math.trunc(now - ts)} ms ago)`
           : "✗ not reached";
         const mmioLines = recentMmioAccesses.length === 0
           ? "    (no recent MMIO accesses)"
@@ -2221,7 +2221,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   if (xfbHasContent && milestones.firstXfbContent === null) {
     milestones.firstXfbContent = performance.now();
     const elapsed = milestones.startedAt !== null
-      ? ((milestones.firstXfbContent - milestones.startedAt) | 0) + " ms"
+      ? Math.trunc(milestones.firstXfbContent - milestones.startedAt) + " ms"
       : "?";
     console.info(`[lazuli] ✓ Milestone: first XFB content (first rendered frame) — ${elapsed} since boot`);
     pushDebugEvent(`✓ Milestone: first XFB (${elapsed})`);
