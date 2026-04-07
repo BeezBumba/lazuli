@@ -97,6 +97,23 @@ impl ViState {
         }
     }
 
+    /// Returns `true` if any of the four VI DisplayInterrupt sources (DI0–DI3)
+    /// currently has both its status bit (bit 31) and enable bit (bit 28) set.
+    ///
+    /// Mirrors the native `get_active_interrupts` check:
+    ///   `video |= i.enable() && i.status()` for each display interrupt.
+    pub(crate) fn any_display_interrupt_active(&self) -> bool {
+        for idx in [0x30u32, 0x34, 0x38, 0x3C] {
+            let reg = self.read32(idx);
+            let status = (reg >> 31) & 1 != 0;
+            let enable = (reg >> 28) & 1 != 0;
+            if status && enable {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Write a 16-bit value to the VI register at `offset` bytes from `VI_BASE`.
     pub(crate) fn write_u16(&mut self, offset: u32, val: u16) {
         let idx = offset & !3;

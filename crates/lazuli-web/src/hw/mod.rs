@@ -134,6 +134,20 @@ impl WasmEmulator {
         // ── Video Interface ────────────────────────────────────────────────
         if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
             self.vi.write_u32(addr - VI_BASE, val);
+            // DI0–DI3 (VI DisplayInterrupt registers, offsets 0x30–0x3C):
+            // When the OS clears the interrupt status bit (bit 31) in a VI DI
+            // register, sync the PI_INTSR VI bit with the actual hardware state.
+            // This mirrors the native `get_active_interrupts` path which computes
+            // the VI interrupt dynamically from the VI source registers rather
+            // than latching it in a separate PI_INTSR VI bit.
+            let vi_offset = addr - VI_BASE;
+            if (0x30..=0x3C).contains(&(vi_offset & !3)) {
+                if self.vi.any_display_interrupt_active() {
+                    self.pi_intsr |= PI_INT_VI;
+                } else {
+                    self.pi_intsr &= !PI_INT_VI;
+                }
+            }
             return;
         }
 
@@ -145,7 +159,13 @@ impl WasmEmulator {
                 // has handled to acknowledge the interrupt.
                 0x00 => self.pi_intsr &= !val,
                 // PI_INTMSK: interrupt enable mask (normal read/write).
-                0x04 => self.pi_intmsk = val,
+                // Re-check pending interrupts immediately after the mask changes — the OS
+                // may have just unmasked a source that was already pending in PI_INTSR,
+                // mirroring the native bus.rs `schedule_now(pi::check_interrupts)` path.
+                0x04 => {
+                    self.pi_intmsk = val;
+                    self.maybe_deliver_external_interrupt();
+                }
                 _ => {}
             }
             return;
@@ -349,19 +369,28 @@ impl WasmEmulator {
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
+#[wasm_bindgen]
 impl WasmEmulator {
     /// Deliver an external interrupt to the CPU if EE=1 and any enabled
-    /// interrupt is pending in PI_INTSR & PI_INTMSK.
+    /// interrupt is pending in `PI_INTSR & PI_INTMSK`.
     ///
-    /// Called after setting any PI_INTSR bit (VI, SI, AI, EXI, DI, …) so that
-    /// the interrupt reaches the CPU as soon as the OS re-enables EE.
-    pub(crate) fn maybe_deliver_external_interrupt(&mut self) {
+    /// Call this from JavaScript whenever MSR.EE transitions from 0 to 1
+    /// (e.g. after `rfi` or `mtmsr` restores EE).  This mirrors the native
+    /// JIT's `msr_changed` → `schedule_now(pi::check_interrupts)` hook, which
+    /// only re-checks pending interrupts on an actual MSR-change event — not
+    /// on every single JIT block.
+    ///
+    /// Also called internally whenever a PI_INTSR bit is asserted (VI, DI, SI,
+    /// …) so the interrupt fires immediately if EE is already enabled.
+    pub fn maybe_deliver_external_interrupt(&mut self) {
         let pending_and_enabled = self.pi_intsr & self.pi_intmsk;
         if pending_and_enabled != 0 && self.cpu.supervisor.config.msr.interrupts() {
             self.cpu.raise_exception(gekko::Exception::Interrupt);
         }
     }
+}
 
+impl WasmEmulator {
     /// Process a DVD Interface DMA command (called when DICR bit 0 is written 1).
     ///
     /// Decodes the command in `DICMDBUF0` bits 31–24 and acts on it:

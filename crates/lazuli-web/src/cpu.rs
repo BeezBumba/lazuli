@@ -146,9 +146,13 @@ impl WasmEmulator {
     /// interrupt — the guest OS handler is responsible for writing a new
     /// positive value to DEC via `mtspr DEC` to re-arm the timer.
     ///
+    /// PI external interrupts are intentionally **not** delivered here.
+    /// JavaScript must call [`maybe_deliver_external_interrupt`] whenever MSR.EE
+    /// transitions from 0 to 1 (e.g. after `rfi` or `mtmsr`), mirroring the
+    /// native JIT's `msr_changed` → `schedule_now(pi::check_interrupts)` hook.
+    ///
     /// Call this once per JIT block (not just once per animation frame) so that
-    /// the exception fires as soon as the guest enables `EE` inside a spin-wait
-    /// loop.
+    /// the decrementer exception fires promptly inside spin-wait loops.
     pub fn advance_decrementer(&mut self, delta: u32) {
         let old_dec = self.cpu.supervisor.misc.dec;
         let new_dec = old_dec.wrapping_sub(delta);
@@ -165,16 +169,6 @@ impl WasmEmulator {
         if self.decrementer_pending && ee {
             self.decrementer_pending = false;
             self.cpu.raise_exception(gekko::Exception::Decrementer);
-            return;
-        }
-
-        // Deliver any pending PI external interrupt (e.g. VI retrace) if EE=1
-        // and the interrupt source is unmasked in PI_INTMSK.
-        if ee {
-            let pending = self.pi_intsr & self.pi_intmsk;
-            if pending != 0 {
-                self.cpu.raise_exception(gekko::Exception::Interrupt);
-            }
         }
     }
 
