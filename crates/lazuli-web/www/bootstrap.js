@@ -304,6 +304,9 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
     gameName += String.fromCharCode(bytes[i]);
   }
 
+  console.log(`[lazuli] parseAndLoadIso: game="${gameName}" id=${gameId} iso=${arrayBuffer.byteLength} bytes`);
+  appendApploaderLog(`[IPL-HLE] ISO: "${gameName}" (${gameId}), ${(arrayBuffer.byteLength / (1024*1024)).toFixed(1)} MiB`);
+
   // Boot DOL offset lives at 0x420 in the ISO header
   const dolOffset = view.getUint32(0x420, false);
   if (dolOffset === 0 || dolOffset >= arrayBuffer.byteLength) {
@@ -366,16 +369,29 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   //   0x1C  padding (4 bytes)
   //   0x20  body[size]
   // The body is placed at guest 0x81200000 (physical 0x01200000).
-  const APPLOADER_ISO_OFFSET = 0x2440;
-  const apploaderEntrypoint  = view.getUint32(APPLOADER_ISO_OFFSET + 0x10, false);
-  const apploaderSize        = view.getUint32(APPLOADER_ISO_OFFSET + 0x14, false);
-  const apploaderBodyOffset  = APPLOADER_ISO_OFFSET + 0x20; // header is 0x20 bytes
+  const APPLOADER_ISO_OFFSET  = 0x2440;
+  const apploaderVersionEnd   = bytes.indexOf(0, APPLOADER_ISO_OFFSET);
+  const apploaderVersion      = String.fromCharCode(
+    ...bytes.slice(APPLOADER_ISO_OFFSET, apploaderVersionEnd < APPLOADER_ISO_OFFSET + 0x10
+      ? apploaderVersionEnd : APPLOADER_ISO_OFFSET + 0x10).filter(b => b > 0)
+  );
+  const apploaderEntrypoint   = view.getUint32(APPLOADER_ISO_OFFSET + 0x10, false);
+  const apploaderSize         = view.getUint32(APPLOADER_ISO_OFFSET + 0x14, false);
+  const apploaderTrailerSize  = view.getUint32(APPLOADER_ISO_OFFSET + 0x18, false);
+  const apploaderBodyOffset   = APPLOADER_ISO_OFFSET + 0x20; // header is 0x20 bytes
   if (apploaderSize === 0 || apploaderBodyOffset + apploaderSize > arrayBuffer.byteLength) {
     throw new Error(
       `Invalid apploader in ISO: size=0x${apploaderSize.toString(16)}, ` +
       `bodyOffset=0x${apploaderBodyOffset.toString(16)}, isoSize=0x${arrayBuffer.byteLength.toString(16)}`
     );
   }
+  console.log(
+    `[lazuli] apploader: version="${apploaderVersion}" entrypoint=0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}` +
+    ` size=0x${apploaderSize.toString(16)} trailer=0x${apploaderTrailerSize.toString(16)}`
+  );
+  appendApploaderLog(`[IPL-HLE] Apploader version: "${apploaderVersion}"`);
+  appendApploaderLog(`[IPL-HLE] Apploader body:    0x${apploaderSize.toString(16)} bytes loaded at 0x81200000`);
+  appendApploaderLog(`[IPL-HLE] Apploader entry:   0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}`);
   const apploaderBody = bytes.slice(apploaderBodyOffset, apploaderBodyOffset + apploaderSize);
   emu.load_bytes(0x81200000, apploaderBody);
 
@@ -391,6 +407,12 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   }
   const iplEntry = emu.load_ipl_hle(iplHleDol);
   emu.set_gpr(3, apploaderEntrypoint);
+  console.log(
+    `[lazuli] ipl-hle entry=0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')}` +
+    ` r3=apploader_entry=0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}`
+  );
+  appendApploaderLog(`[IPL-HLE] ipl-hle entry:     0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')}`);
+  appendApploaderLog(`[IPL-HLE] r3 (apploader fn): 0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}`);
 
   // ── Step 5: install minimal exception-vector stubs ───────────────────────
   //
@@ -453,6 +475,8 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   // apploader at 0x81200000, then hands control to its own stub which calls
   // the apploader's init/main/close functions before jumping to the game DOL.
   emu.set_pc(iplEntry);
+  console.log(`[lazuli] PC set to 0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')} (ipl-hle entry), MSR=0x8000`);
+  appendApploaderLog(`[IPL-HLE] PC → 0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')} (ipl-hle), MSR=0x8000 (EE=1 IP=0)`);
 
   // Initialise the MSR to match the state the real IPL ROM leaves the CPU in
   // before handing control to the apploader.
