@@ -84,7 +84,12 @@ impl DiState {
     /// that a disc command should be processed immediately.
     pub(crate) fn write_reg(&mut self, offset: u32, val: u32) -> bool {
         match offset {
-            0x00 => self.status = val,
+            // DISTATUS: interrupt-status bits (1–3: DEINT, TCINT, BRKINT) are
+            // write-1-to-clear; all other bits (mask enables, etc.) are R/W.
+            0x00 => {
+                const W1C: u32 = (1 << 1) | (1 << 2) | (1 << 3); // DEINT | TCINT | BRKINT
+                self.status = (self.status & !(val & W1C)) | (val & !W1C);
+            }
             0x04 => self.cover = val,
             0x08 => self.cmd_buf0 = val,
             0x0C => self.cmd_buf1 = val,
