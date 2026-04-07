@@ -371,9 +371,10 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   // The body is placed at guest 0x81200000 (physical 0x01200000).
   const APPLOADER_ISO_OFFSET  = 0x2440;
   const apploaderVersionEnd   = bytes.indexOf(0, APPLOADER_ISO_OFFSET);
+  const apploaderVersionSliceEnd = (apploaderVersionEnd >= 0 && apploaderVersionEnd < APPLOADER_ISO_OFFSET + 0x10)
+    ? apploaderVersionEnd : APPLOADER_ISO_OFFSET + 0x10;
   const apploaderVersion      = String.fromCharCode(
-    ...bytes.slice(APPLOADER_ISO_OFFSET, apploaderVersionEnd < APPLOADER_ISO_OFFSET + 0x10
-      ? apploaderVersionEnd : APPLOADER_ISO_OFFSET + 0x10).filter(b => b > 0)
+    ...bytes.slice(APPLOADER_ISO_OFFSET, apploaderVersionSliceEnd).filter(b => b > 0)
   );
   const apploaderEntrypoint   = view.getUint32(APPLOADER_ISO_OFFSET + 0x10, false);
   const apploaderSize         = view.getUint32(APPLOADER_ISO_OFFSET + 0x14, false);
@@ -387,7 +388,7 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   }
   console.log(
     `[lazuli] apploader: version="${apploaderVersion}" entrypoint=0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}` +
-    ` size=0x${apploaderSize.toString(16)} trailer=0x${apploaderTrailerSize.toString(16)}`
+    ` size=0x${apploaderSize.toString(16).toUpperCase().padStart(8,'0')} trailer=0x${apploaderTrailerSize.toString(16).toUpperCase().padStart(8,'0')}`
   );
   appendApploaderLog(`[IPL-HLE] Apploader version: "${apploaderVersion}"`);
   appendApploaderLog(`[IPL-HLE] Apploader body:    0x${apploaderSize.toString(16)} bytes loaded at 0x81200000`);
