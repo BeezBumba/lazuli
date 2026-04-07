@@ -39,10 +39,10 @@
 //!
 //! | Offset | Width | Name              | Description                          |
 //! |--------|-------|-------------------|--------------------------------------|
-//! | 0x00   | 16    | DSMAILBOX_H       | DSP→CPU mailbox hi (R/W; HLE echo)   |
-//! | 0x02   | 16    | DSMAILBOX_L       | DSP→CPU mailbox lo (R/W; HLE echo)   |
-//! | 0x04   | 16    | CSMAILBOX_H       | CPU→DSP mailbox hi (W; HLE echo)     |
-//! | 0x06   | 16    | CSMAILBOX_L       | CPU→DSP mailbox lo (W; HLE echo)     |
+//! | 0x00   | 16    | CSMAILBOX_H       | CPU→DSP mailbox hi (W; HLE echo→0x04)|
+//! | 0x02   | 16    | CSMAILBOX_L       | CPU→DSP mailbox lo (W; HLE echo→0x06)|
+//! | 0x04   | 16    | DSMAILBOX_H       | DSP→CPU mailbox hi (R; HLE echo)     |
+//! | 0x06   | 16    | DSMAILBOX_L       | DSP→CPU mailbox lo (R; HLE echo)     |
 //! | 0x0A   | 16    | DSPCONTROL        | Control/status register (R/W)        |
 //! | 0x12   | 16    | DspAramSize       | ARAM size (R/W; always 0 = no ARAM)  |
 //! | 0x20   | 32    | DspAramDmaRamBase | ARAM DMA RAM base address (W)        |
@@ -85,8 +85,9 @@ const DSPCTRL_DEFAULT: u16 = 1 << 11;
 
 /// DSP Interface hardware register file (HLE stub).
 pub(crate) struct DspState {
-    /// DSP→CPU mailbox high/low — read from `0xCC005000`/`0xCC005002`.
-    /// Writes to either mailbox direction are echoed here so boot-ACK polls pass.
+    /// DSP→CPU mailbox high/low — read from `0xCC005004`/`0xCC005006` (DSMAILBOX).
+    /// Populated by echoing CPU→DSP writes so that any "poll for DSP ACK" loops
+    /// at `0xCC005004` terminate without real DSP microcode.
     pub(crate) dsp2cpu_hi: u16,
     pub(crate) dsp2cpu_lo: u16,
     /// DSPCONTROL at offset **0x0A** (`0xCC00500A`).
@@ -142,10 +143,14 @@ impl DspState {
     ///   `ai_dma_interrupt` (bit 3) in DSPCONTROL.
     pub(crate) fn write_u16(&mut self, offset: u32, val: u16) {
         match offset {
-            // CPU→DSP mailbox (hardware offset 0x00/0x02): echo to DSP→CPU.
+            // CPU→DSP mailbox (hardware offset 0x00/0x02, CSMAILBOX): echo the
+            // written value into the DSP→CPU mailbox (dsp2cpu_hi/lo) so that
+            // any "poll bit15 of 0xCC005004 for DSP ACK" loop exits immediately.
             0x00 => self.dsp2cpu_hi = val,
             0x02 => self.dsp2cpu_lo = val,
-            // CPU→DSP mailbox alternative path (0x04/0x06): also echo.
+            // DSP→CPU mailbox (hardware offset 0x04/0x06, DSMAILBOX): normally
+            // only the DSP writes here, but accept writes to the same echo buffer
+            // as a broad HLE stub for alternative boot sequences.
             0x04 => self.dsp2cpu_hi = val,
             0x06 => self.dsp2cpu_lo = val,
             // DSPCONTROL at hardware offset 0x0A (0xCC00500A).
