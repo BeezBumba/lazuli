@@ -40,6 +40,23 @@ impl Meta {
         String::from_utf8(self.game_code().to_be_bytes().into()).ok()
     }
 
+    pub fn full_game_id_str(&self) -> Option<String> {
+        let game = self.game_id.to_be_bytes();
+        let maker = self.maker_code.to_be_bytes();
+        String::from_utf8(
+            vec![
+                self.console_id,
+                game[0],
+                game[1],
+                self.country_code,
+                maker[0],
+                maker[1],
+            ]
+            .into(),
+        )
+        .ok()
+    }
+
     pub fn console(&self) -> Option<Console> {
         Some(match self.console_id {
             b'G' => Console::GameCube,

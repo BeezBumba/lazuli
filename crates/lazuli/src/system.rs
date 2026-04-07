@@ -199,7 +199,7 @@ impl System {
 
         let game_id = header
             .meta
-            .game_code_str()
+            .full_game_id_str()
             .unwrap_or_else(|| String::from("<unknown>"));
         println!(
             "[IPL-HLE] ISO: \"{}\" ({game_id}), {iso_mib:.1} MiB",
