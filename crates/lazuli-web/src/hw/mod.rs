@@ -106,6 +106,16 @@ impl WasmEmulator {
             return self.exi.read_u32(addr - EXI_BASE);
         }
 
+        // ── DSP Interface (32-bit reads) ───────────────────────────────────
+        if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
+            let offset = addr - DSP_BASE;
+            // Reconstruct a 32-bit value from two 16-bit register halves
+            // (big-endian: high halfword at the lower address).
+            let hi = self.dsp.read_u16(offset) as u32;
+            let lo = self.dsp.read_u16(offset + 2) as u32;
+            return (hi << 16) | lo;
+        }
+
         // ── Audio Interface ────────────────────────────────────────────────
         if addr >= AI_BASE && addr < AI_BASE + AI_SIZE {
             return self.ai.read_u32(addr - AI_BASE);
@@ -138,6 +148,16 @@ impl WasmEmulator {
                 0x04 => self.pi_intmsk = val,
                 _ => {}
             }
+            return;
+        }
+
+        // ── DSP Interface (32-bit writes) ──────────────────────────────────
+        // Handles ARAM DMA control (0x5028) and AudioDmaBase (0x5030) which
+        // the OS writes with `stw`.  The HLE stub in DspState::write_u32
+        // immediately completes ARAM DMA so the OS doesn't hang polling
+        // aram_dma_interrupt.
+        if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
+            self.dsp.write_u32(addr - DSP_BASE, val);
             return;
         }
 
