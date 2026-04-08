@@ -1993,14 +1993,14 @@ function gameLoop(emu, canvas, ctx, timestamp) {
           `→ Phase transition: ${prevPhase} → ${blockPhase} @ ${hexU32(blockPc)} ` +
           `(block #${emu.blocks_executed()})`;
         console.info(`[lazuli] ${transMsg}`);
-        pushDebugEvent(transMsg);
+        appendApploaderLog(transMsg);
 
         if (blockPhase === "ipl-hle" && milestones.iplHleStarted === null) {
           milestones.iplHleStarted = performance.now();
           const elapsed = milestones.startedAt !== null
             ? Math.trunc(milestones.iplHleStarted - milestones.startedAt) + " ms" : "?";
           console.info(`[lazuli] ✓ Milestone: ipl-hle started (${elapsed} since boot)`);
-          pushDebugEvent(`✓ Milestone: ipl-hle started (${elapsed})`);
+          appendApploaderLog(`✓ Milestone: ipl-hle started (${elapsed})`);
         }
         if (blockPhase === "OS/game RAM" && milestones.gameEntry === null) {
           milestones.gameEntry = performance.now();
@@ -2010,7 +2010,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
             `[lazuli] ✓ Milestone: game entry @ ${hexU32(blockPc)} — OS/game RAM first reached ` +
             `(${elapsed} since boot)`
           );
-          pushDebugEvent(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
+          appendApploaderLog(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
         }
 
         prevPhase = blockPhase;
