@@ -1414,8 +1414,8 @@ function executeOneBlockSync(emu, ram, log) {
   // ── Pre-execution GPR dump for ipl-hle diagnostics ──────────────────────────
   //
   // 0x813002E0: apploader's close() returns here; r3 should hold the game entry
-  // point (e.g. 0x803439F4 for SMS).  If r3 is wrong at this point the WASM JIT
-  // misexecuted something inside close() itself.
+  // point.  If r3 is wrong at this point the WASM JIT misexecuted something
+  // inside close() itself.
   //
   // 0x813002EC: "mtspr CTR, rX ; bcctr" — loads the game entry from a register
   // into CTR and branches to it.  If rX is wrong here the entry was already bad
