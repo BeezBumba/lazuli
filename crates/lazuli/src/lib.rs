@@ -122,6 +122,19 @@ impl Lazuli {
                     self.prev_phase, phase, pc
                 );
 
+                // When leaving ipl-hle, dump key registers so the entry-point
+                // and calling-convention state is always diagnosable — mirrors
+                // the `[debug] ipl-hle exit` line emitted by bootstrap.js.
+                if self.prev_phase == "ipl-hle" {
+                    println!(
+                        "[debug] ipl-hle exit: PC=0x{:08X} r3=0x{:08X} LR=0x{:08X} CTR=0x{:08X}",
+                        pc,
+                        self.sys.cpu.user.gpr[3],
+                        self.sys.cpu.user.lr,
+                        self.sys.cpu.user.ctr,
+                    );
+                }
+
                 if phase == "ipl-hle" && self.milestones.ipl_hle_started.is_none() {
                     self.milestones.ipl_hle_started = Some(Instant::now());
                     let elapsed = self.milestones.elapsed_ms(self.milestones.ipl_hle_started);
