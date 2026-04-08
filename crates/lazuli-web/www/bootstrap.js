@@ -321,18 +321,23 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   // so 0x80000000 maps to physical offset 0.
   emu.load_bytes(0x80000000, bytes.slice(0, 0x440));
 
-  // Parse the DOL and load sections into emulator RAM.
-  // load_bytes() on the Rust side masks the target address with 0x01FFFFFF
-  // to convert GameCube virtual addresses (0x8xxxxxxx) to physical offsets.
+  // Parse the DOL header for informational logging only.
+  // NOTE: We intentionally do NOT pre-load the game DOL sections here.
+  // The native load_ipl_hle() never pre-loads them either — the real apploader
+  // loads every section into RAM via DI DMA during the ipl-hle boot sequence.
+  // Pre-loading them would be redundant and inconsistent with native behaviour,
+  // though the underlying boot sequence is unaffected since the apploader DMA
+  // writes the same bytes to the same physical addresses regardless.
   const dol = parseDol(view, bytes, dolOffset);
-  for (const { target, data } of dol.sections) {
-    emu.load_bytes(target, data);
-  }
-
-  // Zero the BSS region
-  if (dol.bssSize > 0) {
-    emu.load_bytes(dol.bssTarget, new Uint8Array(dol.bssSize));
-  }
+  console.log(
+    `[lazuli] DOL header: entry=0x${dol.entry.toString(16).toUpperCase().padStart(8, '0')}` +
+    ` bss=0x${dol.bssTarget.toString(16).toUpperCase().padStart(8, '0')}..+0x${dol.bssSize.toString(16).toUpperCase()}` +
+    ` sections=${dol.sections.length}`
+  );
+  appendApploaderLog(
+    `[IPL-HLE] DOL entry:     0x${dol.entry.toString(16).toUpperCase().padStart(8, '0')}` +
+    ` (${dol.sections.length} sections, bss +0x${dol.bssSize.toString(16).toUpperCase()})`
+  );
 
   // ── Step 2: write synthetic Dolphin OS globals, mirroring load_ipl_hle().
   // The disc-header copy above already covers 0x00–0x1F (game code, magic,
@@ -1406,20 +1411,26 @@ function executeOneBlockSync(emu, ram, log) {
   const { mem: regsMem, view: regsView } = getRegsMem(emu);
   regsView.set(emu.get_cpu_bytes(), 0);
 
-  // ── Pre-execution GPR dump for the mtspr CTR / bcctr diagnostic block ─────
-  // Block #205 @ 0x813002EC: "mtspr CTR, rX ; bcctr" — CTR ends up 0 in WASM
-  // but 0x8000522C on native.  Log all 32 GPRs from WASM memory immediately
-  // after the register file copy so we can see which rX the mtspr instruction
-  // reads and why it is wrong.
-  if (pc === 0x813002EC) {
+  // ── Pre-execution GPR dump for ipl-hle diagnostics ──────────────────────────
+  //
+  // 0x813002E0: apploader's close() returns here; r3 should hold the game entry
+  // point.  If r3 is wrong at this point the WASM JIT misexecuted something
+  // inside close() itself.
+  //
+  // 0x813002EC: "mtspr CTR, rX ; bcctr" — loads the game entry from a register
+  // into CTR and branches to it.  If rX is wrong here the entry was already bad
+  // when close() returned OR a callee-saved register was corrupted during the
+  // println() call that happens between these two points.
+  if (pc === 0x813002E0 || pc === 0x813002EC) {
     const off = emu.get_reg_offsets();
     const mem32 = new DataView(regsMem.buffer);
     const gprOffsets = Array.from(off.gpr);
     const gprVals = gprOffsets.map((o, i) => `r${i}=${hexU32(mem32.getUint32(o, true))}`);
     const ctrVal  = hexU32(mem32.getUint32(off.ctr, true));
     const lrVal   = hexU32(mem32.getUint32(off.lr,  true));
+    const label   = pc === 0x813002E0 ? "close() RETURN — r3=game entry?" : "mtspr CTR,rX ; bcctr";
     console.warn(
-      `[lazuli] PRE-EXEC ${pcHex} GPR dump:\n` +
+      `[lazuli] PRE-EXEC ${pcHex} (${label}) GPR dump:\n` +
       gprVals.slice(0, 16).join("  ") + "\n" +
       gprVals.slice(16).join("  ") + "\n" +
       `  LR=${lrVal}  CTR=${ctrVal}`,
