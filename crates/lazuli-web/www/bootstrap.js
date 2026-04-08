@@ -334,11 +334,6 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
     ` bss=0x${dol.bssTarget.toString(16).toUpperCase().padStart(8, '0')}..+0x${dol.bssSize.toString(16).toUpperCase()}` +
     ` sections=${dol.sections.length}`
   );
-  appendApploaderLog(
-    `[IPL-HLE] DOL entry:     0x${dol.entry.toString(16).toUpperCase().padStart(8, '0')}` +
-    ` (${dol.sections.length} sections, bss +0x${dol.bssSize.toString(16).toUpperCase()})`
-  );
-
   // ── Step 2: write synthetic Dolphin OS globals, mirroring load_ipl_hle().
   // The disc-header copy above already covers 0x00–0x1F (game code, magic,
   // etc.).  Here we fill in the fields the real IPL ROM synthesises itself.
@@ -509,26 +504,15 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
   // apploader at 0x81200000, then hands control to its own stub which calls
   // the apploader's init/main/close functions before jumping to the game DOL.
   emu.set_pc(iplEntry);
-  console.log(`[lazuli] PC set to 0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')} (ipl-hle entry), MSR=0x8000`);
+  console.log(`[lazuli] PC set to 0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')} (ipl-hle entry), MSR=0x0000`);
   appendApploaderLog(`[IPL-HLE] PC → 0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')} (ipl-hle), MSR=0x8000 (EE=1 IP=0)`);
 
-  // Initialise the MSR to match the state the real IPL ROM leaves the CPU in
-  // before handing control to the apploader.
-  //
-  //   IP = 0 (bit 6): exception vectors at 0x0000xxxx.  The Cpu::default
-  //     reset value has IP = 1 (vectors at 0xFFF0xxxx), which for 24 MiB
-  //     GameCube RAM would put the decrementer vector 0xFFF00900 at
-  //     physical 0x01F00900 — beyond RAM and therefore unexecutable.
-  //
-  //   EE = 1 (bit 15): decrementer and external interrupts enabled.  The
-  //     real IPL ROM jumps to the apploader with EE = 1 so that the
-  //     apploader's decrementer-based timer loops work correctly.  With
-  //     EE = 0 the decrementer interrupt can never fire and any spin-loop
-  //     that waits for it would stall forever.
-  //
-  // All other bits are cleared (FP=0, …); the game's own __start / OSInit
-  // will configure them as needed.
-  emu.set_msr(0x8000);  // EE=1, IP=0
+  // Initialise the MSR to match what native load_ipl_hle() leaves the CPU in.
+  // Native only calls set_exception_prefix(false) (IP=0); EE stays at the
+  // Cpu::default value of 0 (interrupts disabled).  The printed string
+  // "MSR=0x8000 (EE=1 IP=0)" is a hardcoded label in the native source that
+  // does not reflect the actual register value — the real boot MSR is 0x0000.
+  emu.set_msr(0x0000);  // EE=0, IP=0 — mirrors native load_ipl_hle()
 
   return { gameId, gameName, entry: iplEntry };
 }
