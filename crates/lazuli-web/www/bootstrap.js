@@ -1411,31 +1411,7 @@ function executeOneBlockSync(emu, ram, log) {
   const { mem: regsMem, view: regsView } = getRegsMem(emu);
   regsView.set(emu.get_cpu_bytes(), 0);
 
-  // ── Pre-execution GPR dump for ipl-hle diagnostics ──────────────────────────
-  //
-  // 0x813002E0: apploader's close() returns here; r3 should hold the game entry
-  // point.  If r3 is wrong at this point the WASM JIT misexecuted something
-  // inside close() itself.
-  //
-  // 0x813002EC: "mtspr CTR, rX ; bcctr" — loads the game entry from a register
-  // into CTR and branches to it.  If rX is wrong here the entry was already bad
-  // when close() returned OR a callee-saved register was corrupted during the
-  // println() call that happens between these two points.
-  if (pc === 0x813002E0 || pc === 0x813002EC) {
-    const off = emu.get_reg_offsets();
-    const mem32 = new DataView(regsMem.buffer);
-    const gprOffsets = Array.from(off.gpr);
-    const gprVals = gprOffsets.map((o, i) => `r${i}=${hexU32(mem32.getUint32(o, true))}`);
-    const ctrVal  = hexU32(mem32.getUint32(off.ctr, true));
-    const lrVal   = hexU32(mem32.getUint32(off.lr,  true));
-    const label   = pc === 0x813002E0 ? "close() RETURN — r3=game entry?" : "mtspr CTR,rX ; bcctr";
-    console.warn(
-      `[lazuli] PRE-EXEC ${pcHex} (${label}) GPR dump:\n` +
-      gprVals.slice(0, 16).join("  ") + "\n" +
-      gprVals.slice(16).join("  ") + "\n" +
-      `  LR=${lrVal}  CTR=${ctrVal}`,
-    );
-  }
+
 
   // Reset exception tracking so we can detect whether THIS block raises an
   // exception (vs. a stale value left by a previous block).
@@ -2022,6 +1998,27 @@ function gameLoop(emu, canvas, ctx, timestamp) {
             `(${elapsed} since boot)`
           );
           appendApploaderLog(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
+        }
+
+        // When ipl-hle exits (to OS/game RAM or any other region), dump all
+        // GPRs so the wrong-entry-point bug is always diagnosable regardless
+        // of which ipl-hle binary layout is in use.  At this point the CPU
+        // state reflects the last ipl-hle block that branched to blockPc, so
+        // r3 holds whatever close() returned and CTR/LR hold the branch target.
+        if (prevPhase === "ipl-hle") {
+          const gprVals = Array.from({ length: 32 }, (_, i) => `r${i}=${hexU32(emu.get_gpr(i))}`);
+          const lrVal  = hexU32(emu.get_lr());
+          const ctrVal = hexU32(emu.get_ctr());
+          const crVal  = hexU32(emu.get_cr());
+          const dumpMsg =
+            `[lazuli] ipl-hle exit → ${blockPhase} @ ${hexU32(blockPc)} GPR dump:\n` +
+            gprVals.slice(0, 16).join("  ") + "\n" +
+            gprVals.slice(16).join("  ") + "\n" +
+            `  LR=${lrVal}  CTR=${ctrVal}  CR=${crVal}`;
+          console.warn(dumpMsg);
+          appendApploaderLog(
+            `[debug] ipl-hle exit: PC=${hexU32(blockPc)} r3=${hexU32(emu.get_gpr(3))} LR=${lrVal} CTR=${ctrVal}`
+          );
         }
 
         prevPhase = blockPhase;
