@@ -1148,6 +1148,14 @@ function pushDebugEvent(msg) {
  * @param {string}     [pcContext]  Human-readable PC string for console messages
  */
 function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
+  // Mutable local view of guest RAM.  A DVD DMA (triggered via write_u32 to
+  // DICR) calls into Rust's process_di_command, which may allocate heap memory
+  // for console_log! formatting.  If that allocation triggers WASM linear-
+  // memory growth, the original Uint8Array buffer is detached and all reads
+  // from the old view return 0.  Using a `let` variable lets us refresh the
+  // view inside write_u32 (after the DMA completes) so that any subsequent
+  // hook calls in the same block execution see the correctly written data.
+  let r = ram;
   return {
     read_u8(addr) {
       addr = addr >>> 0;
@@ -1155,7 +1163,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // sub-word reads to HW space are not meaningful, return 0.
       if ((addr >>> 24 & 0xFE) === 0xCC) return 0;
       addr &= PHYS_MASK;
-      return addr < ram.length ? ram[addr] : 0;
+      return addr < r.length ? r[addr] : 0;
     },
     read_u16(addr) {
       addr = addr >>> 0;
@@ -1167,8 +1175,8 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
         return val;
       }
       addr &= PHYS_MASK;
-      if (addr + 1 >= ram.length) return 0;
-      return (ram[addr] << 8) | ram[addr + 1];
+      if (addr + 1 >= r.length) return 0;
+      return (r[addr] << 8) | r[addr + 1];
     },
     read_u32(addr) {
       addr = addr >>> 0;
@@ -1182,9 +1190,9 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
         return val;
       }
       addr &= PHYS_MASK;
-      if (addr + 3 >= ram.length) return 0;
-      return (((ram[addr] << 24) | (ram[addr + 1] << 16) |
-               (ram[addr + 2] << 8) | ram[addr + 3]) >>> 0);
+      if (addr + 3 >= r.length) return 0;
+      return (((r[addr] << 24) | (r[addr + 1] << 16) |
+               (r[addr + 2] << 8) | r[addr + 3]) >>> 0);
     },
     read_f64(addr) {
       // Read a big-endian IEEE-754 double from guest address.
@@ -1192,8 +1200,8 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       addr = addr >>> 0;
       if ((addr >>> 24 & 0xFE) === 0xCC) return 0.0;
       addr &= PHYS_MASK;
-      if (addr + 7 >= ram.length) return 0.0;
-      const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
+      if (addr + 7 >= r.length) return 0.0;
+      const view = new DataView(r.buffer, r.byteOffset + addr, 8);
       return view.getFloat64(0, false /* big-endian */);
     },
     write_u8(addr, val) {
@@ -1210,7 +1218,7 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       }
       if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are 32-bit only
       addr &= PHYS_MASK;
-      if (addr < ram.length) ram[addr] = val & 0xff;
+      if (addr < r.length) r[addr] = val & 0xff;
     },
     write_u16(addr, val) {
       addr = addr >>> 0;
@@ -1222,9 +1230,9 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
         return;
       }
       addr &= PHYS_MASK;
-      if (addr + 1 < ram.length) {
-        ram[addr]     = (val >> 8) & 0xff;
-        ram[addr + 1] = val & 0xff;
+      if (addr + 1 < r.length) {
+        r[addr]     = (val >> 8) & 0xff;
+        r[addr + 1] = val & 0xff;
       }
     },
     write_u32(addr, val) {
@@ -1257,16 +1265,21 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
                 blockMetaMap.delete(vpc);
               }
             }
+            // Refresh the local RAM view: the Rust console_log! inside
+            // process_di_command may have caused WASM linear-memory growth,
+            // detaching the old Uint8Array.  getRamView detects the buffer
+            // change and returns a fresh view over the new memory.
+            r = getRamView(emu);
           }
         }
         return;
       }
       addr &= PHYS_MASK;
-      if (addr + 3 < ram.length) {
-        ram[addr]     = (val >>> 24) & 0xff;
-        ram[addr + 1] = (val >>> 16) & 0xff;
-        ram[addr + 2] = (val >>>  8) & 0xff;
-        ram[addr + 3] =  val         & 0xff;
+      if (addr + 3 < r.length) {
+        r[addr]     = (val >>> 24) & 0xff;
+        r[addr + 1] = (val >>> 16) & 0xff;
+        r[addr + 2] = (val >>>  8) & 0xff;
+        r[addr + 3] =  val         & 0xff;
       }
     },
     write_f64(addr, val) {
@@ -1274,8 +1287,8 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       addr = addr >>> 0;
       if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are not doubles
       addr &= PHYS_MASK;
-      if (addr + 7 >= ram.length) return;
-      const view = new DataView(ram.buffer, ram.byteOffset + addr, 8);
+      if (addr + 7 >= r.length) return;
+      const view = new DataView(r.buffer, r.byteOffset + addr, 8);
       view.setFloat64(0, val, false /* big-endian */);
     },
     raise_exception(kind) {
@@ -2000,7 +2013,7 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   emu.assert_vi_interrupt();
 
   // Execute blocks for this frame
-  const ram = getRamView(emu);
+  let ram = getRamView(emu);
   let blocksThisFrame = 0;
   let loopError = false;
   // Track EE bit across blocks to detect 0→1 transitions (see EE edge-detection comment below).
@@ -2104,6 +2117,9 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       break;
     }
     blocksThisFrame++;
+    // Refresh the RAM view after each block in case a DVD DMA triggered
+    // WASM linear-memory growth, detaching the previous Uint8Array buffer.
+    ram = getRamView(emu);
 
     // ── EE edge-detection: deliver pending PI external interrupts ─────────────
     // The native JIT fires pi::check_interrupts only on an MSR-change event
@@ -2646,7 +2662,7 @@ async function main() {
 
   // ── Run 10 blocks button ───────────────────────────────────────────────────
   $("btn-run10").addEventListener("click", () => {
-    const ram = getRamView(emu);
+    let ram = getRamView(emu);
     let count = 0;
     for (let i = 0; i < 10; i++) {
       const log = [];
@@ -2655,6 +2671,8 @@ async function main() {
         break;
       }
       count++;
+      // Refresh in case a DMA caused WASM linear-memory growth this block.
+      ram = getRamView(emu);
     }
     renderRegisters(emu);
     renderFprRegisters(emu);
