@@ -1270,6 +1270,24 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
             // detaching the old Uint8Array.  getRamView detects the buffer
             // change and returns a fresh view over the new memory.
             r = getRamView(emu);
+            // Mirror the Rust-side "[lazuli] DI: DVD Read" console_log! to the
+            // apploader-log panel so DI activity is visible in the UI without
+            // needing to open the browser developer console.
+            const discOff = emu.last_di_disc_offset() >>> 0;
+            const preview = [];
+            const previewLen = Math.min(dmaPhysLen, 8);
+            for (let i = 0; i < previewLen; i++) {
+              preview.push(r[dmaPhysStart + i].toString(16).padStart(2, "0"));
+            }
+            for (let i = previewLen; i < 8; i++) {
+              preview.push("00");
+            }
+            appendApploaderLog(
+              `[lazuli] DI: DVD Read disc_off=0x${discOff.toString(16).padStart(8, "0")}` +
+              ` len=0x${dmaPhysLen.toString(16)}` +
+              ` ram_dest=0x${dmaPhysStart.toString(16).padStart(8, "0")}` +
+              ` data=[${preview.join(" ")}]`
+            );
           }
         }
         return;
