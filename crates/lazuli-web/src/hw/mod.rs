@@ -265,6 +265,16 @@ impl WasmEmulator {
         // ── Video Interface ────────────────────────────────────────────────
         if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
             self.vi.write_u16(addr - VI_BASE, val);
+            // Sync PI_INTSR VI bit after DI register half-word writes, mirroring
+            // the full-word path so that the rare sth case is handled correctly.
+            let vi_offset = addr - VI_BASE;
+            if (0x30..=0x3C).contains(&(vi_offset & !3)) {
+                if self.vi.any_display_interrupt_active() {
+                    self.pi_intsr |= PI_INT_VI;
+                } else {
+                    self.pi_intsr &= !PI_INT_VI;
+                }
+            }
             return;
         }
 
@@ -307,15 +317,32 @@ impl WasmEmulator {
     /// Assert a Video Interface (VI) vertical-retrace interrupt.
     ///
     /// Call this **once per animation frame** (~60 Hz) from the JavaScript
-    /// game loop.  The function sets the VI bit in `PI_INTSR` and, if the
-    /// guest CPU currently has external interrupts enabled (`MSR.EE = 1`) and
-    /// the OS has unmasked the VI interrupt in `PI_INTMSK`, delivers an
-    /// `Exception::Interrupt` (vector `0x00000500`) to the CPU.
+    /// game loop.  The function advances the vertical counter, fires any
+    /// enabled VI DisplayInterrupt sources (setting their status bits so the
+    /// OS handler can identify which source fired), sets the VI bit in
+    /// `PI_INTSR`, and — if the guest CPU has external interrupts enabled
+    /// (`MSR.EE = 1`) and the OS has unmasked the VI interrupt in `PI_INTMSK`
+    /// — delivers an `Exception::Interrupt` (vector `0x00000500`) to the CPU.
     pub fn assert_vi_interrupt(&mut self) {
         // Advance the VI vertical counter by one field (called each RAF frame).
         self.vi.advance_vcount();
 
-        // Set the VI pending bit in PI_INTSR.
+        // Assert the status bit (bit 31) in every VI DisplayInterrupt register
+        // that has its enable bit (bit 28) set.  On real hardware the VI
+        // hardware sets these status bits when VCOUNT reaches the configured
+        // scan line.  The OS interrupt handler reads them to dispatch to the
+        // per-source retrace callback and increment VRetraceCnt — which is what
+        // VIWaitForRetrace() polls.  Without this, the handler sees no active
+        // DI source, never calls the callback, and VIWaitForRetrace() spins
+        // forever with EE=1, producing an endless 0x00000500 interrupt loop.
+        self.vi.fire_display_interrupts();
+
+        // Sync PI_INTSR to reflect the current DI status.  If any DI source is
+        // now active (enable AND status both set) the VI bit is set;  if none
+        // is active (OS hasn't configured DI registers yet, or all status bits
+        // are still clear from a previous clear) set it unconditionally anyway
+        // so the OS can still service the retrace on the first few frames
+        // before it has fully configured the VI.
         self.pi_intsr |= PI_INT_VI;
 
         // Deliver the external interrupt immediately if EE=1 and the OS has

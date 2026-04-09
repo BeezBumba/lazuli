@@ -160,4 +160,29 @@ impl ViState {
         // Write back upper halfword of the VCOUNT word at offset 0x2C.
         self.write_u16(0x2C, next as u16);
     }
+
+    /// Fire any enabled VI DisplayInterrupt sources by setting their status bit
+    /// (bit 31).
+    ///
+    /// On real hardware the VI asserts the display interrupt (and sets the
+    /// per-source status bit) when VCOUNT reaches the line configured in each
+    /// DI register.  The OS interrupt handler reads the DI status bits to
+    /// determine which source fired, calls the registered retrace callback, and
+    /// increments `VRetraceCnt` — which is what `VIWaitForRetrace()` polls.
+    ///
+    /// The emulator calls this once per animation frame (from
+    /// `assert_vi_interrupt`) so the status bits are visible to the handler
+    /// even though we don't simulate per-scanline timing.  Only DI registers
+    /// with their enable bit (bit 28) already set are touched; unconfigured
+    /// sources are left alone.
+    pub(crate) fn fire_display_interrupts(&mut self) {
+        for idx in [0x30u32, 0x34, 0x38, 0x3C] {
+            let reg = self.read32(idx);
+            if (reg >> 28) & 1 != 0 {
+                // Enable bit is set — assert status (bit 31) to simulate the
+                // hardware firing the interrupt at the configured scan line.
+                self.write32(idx, reg | 0x8000_0000);
+            }
+        }
+    }
 }
