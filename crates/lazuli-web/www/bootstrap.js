@@ -896,6 +896,61 @@ function appendApploaderLog(line) {
     pushDebugEvent(`✓ Apploader done (${elapsed})`);
   }
 
+  // Log the init/main/close function pointers reported by ipl-hle so we can
+  // immediately spot if the apploader's entry() wrote a wrong close address
+  // (e.g. 0x8000522C instead of a valid 0x812xxxxx apploader function).
+  // These lines match what crates/ipl-hle/src/main.rs prints in main():
+  //   "  Init: 0x{hex}"  "  Main: 0x{hex}"  "  Close: 0x{hex}"
+  if (line.startsWith("  Init: 0x") || line.startsWith("  Main: 0x") ||
+      line.startsWith("  Close: 0x")) {
+    // Expect values in the apploader range (0x81200000–0x812FFFFF); warn
+    // if the address looks wrong so the divergence is immediately visible.
+    const match = line.match(/0x([0-9a-fA-F]+)\s*$/);
+    if (match) {
+      const ptr = parseInt(match[1], 16) >>> 0;
+      const inApploader = ptr >= 0x81200000 && ptr <= 0x812FFFFF;
+      const label = line.trim().split(":")[0]; // "Init", "Main", or "Close"
+      if (!inApploader) {
+        console.warn(
+          `[lazuli] ⚠ ipl-hle ${label} fn ptr 0x${ptr.toString(16).padStart(8, "0")} ` +
+          `is OUTSIDE the apploader range (0x81200000–0x812FFFFF) — ` +
+          `this indicates the apploader's entry() wrote an incorrect function pointer`
+        );
+      } else {
+        console.info(
+          `[lazuli] ipl-hle ${label} fn ptr 0x${ptr.toString(16).padStart(8, "0")} ✓ (in apploader range)`
+        );
+      }
+    }
+  }
+
+  // Log the game entry point printed by ipl-hle just before calling entry().
+  // This is the value returned by the apploader's close() function and is the
+  // address the CPU will jump to next.  In native it is the real DOL entry
+  // (e.g. 0x803439F4); a mismatch here is the root symptom of the divergence.
+  if (line.includes("Jumping to bootfile entry: 0x")) {
+    const match = line.match(/0x([0-9a-fA-F]+)\s*$/);
+    if (match) {
+      const entry = parseInt(match[1], 16) >>> 0;
+      const inGameRam = entry >= 0x80000000 && entry <= 0x817FFFFF;
+      const inApploader = entry >= 0x81200000 && entry <= 0x812FFFFF;
+      const inIplHle   = entry >= 0x81300000 && entry <= 0x813FFFFF;
+      let region = inIplHle ? "ipl-hle ⚠" : inApploader ? "apploader ⚠" : inGameRam ? "OS/game RAM" : "unknown ⚠";
+      const expected = (entry >= 0x80000000 && entry < 0x81200000);
+      if (!expected) {
+        console.warn(
+          `[lazuli] ⚠ ipl-hle bootfile entry 0x${entry.toString(16).padStart(8, "0")} ` +
+          `is in ${region} — expected a game DOL entry in 0x80000000–0x811FFFFF`
+        );
+      } else {
+        console.info(
+          `[lazuli] ipl-hle bootfile entry 0x${entry.toString(16).padStart(8, "0")} ` +
+          `(${region}) — looks correct`
+        );
+      }
+    }
+  }
+
   const logEl = document.getElementById("apploader-log");
   if (!logEl) return;
 
@@ -2000,6 +2055,21 @@ function gameLoop(emu, canvas, ctx, timestamp) {
             gprVals.slice(16).join("  ") + "\n" +
             `  LR=${lrVal}  CTR=${ctrVal}  CR=${crVal}`;
           console.warn(dumpMsg);
+          // Diagnose the entry-point divergence: blockPc is where ipl-hle
+          // jumped to via entry().  If it matches CTR the call was via bctrl/bctr;
+          // the expected range for the real game DOL is 0x80000000–0x811FFFFF.
+          const entryPc = blockPc >>> 0;
+          const inApploader = entryPc >= 0x81200000 && entryPc <= 0x812FFFFF;
+          const inIplHle    = entryPc >= 0x81300000 && entryPc <= 0x813FFFFF;
+          if (inApploader || inIplHle) {
+            const region = inIplHle ? "ipl-hle" : "apploader";
+            console.warn(
+              `[lazuli] ⚠ Entry point ${hexU32(entryPc)} is in ${region} range, not game RAM.\n` +
+              `         This means the apploader's close() returned a wrong address.\n` +
+              `         Check the "  Close: 0x..." line in the apploader log above;\n` +
+              `         compare all DI DVD Read log lines with the native disc-read sequence.`
+            );
+          }
           appendApploaderLog(
             `[debug] ipl-hle exit: PC=${hexU32(blockPc)} r3=${hexU32(emu.get_gpr(3))} LR=${lrVal} CTR=${ctrVal}`
           );

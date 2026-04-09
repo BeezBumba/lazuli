@@ -424,6 +424,23 @@ impl WasmEmulator {
                     if src_end <= disc.len() && dma_dest + dma_len <= self.ram.len() {
                         self.ram[dma_dest..dma_dest + dma_len]
                             .copy_from_slice(&disc[disc_offset..src_end]);
+                        // Log each successful DVD Read so we can compare the disc-read
+                        // sequence between native and emulated and pinpoint any divergence
+                        // in what data the apploader loads (e.g. wrong DOL entry point).
+                        // The first 8 bytes of loaded data are included for cross-checking.
+                        let preview: [u8; 8] = core::array::from_fn(|i| {
+                            self.ram.get(dma_dest + i).copied().unwrap_or(0)
+                        });
+                        console_log!(
+                            "[lazuli] DI: DVD Read disc_off={:#010x} len={:#x} \
+                             ram_dest={:#010x} data=[{:02x} {:02x} {:02x} {:02x} \
+                             {:02x} {:02x} {:02x} {:02x}]",
+                            disc_offset,
+                            dma_len,
+                            self.di.dma_addr,
+                            preview[0], preview[1], preview[2], preview[3],
+                            preview[4], preview[5], preview[6], preview[7],
+                        );
                         // New code may have been written into guest RAM; signal JS
                         // to perform selective JIT cache invalidation for the
                         // affected address range.
@@ -433,8 +450,8 @@ impl WasmEmulator {
                     } else {
                         console_log!(
                             "[lazuli] DI: DVD Read out of bounds \
-                             (disc_off={:#010x}, len={}, disc_len={}, \
-                             ram_dest={:#010x}, ram_len={})",
+                             (disc_off={:#010x}, len={:#x}, disc_len={:#x}, \
+                             ram_dest={:#010x}, ram_len={:#x})",
                             disc_offset,
                             dma_len,
                             disc.len(),
@@ -444,7 +461,11 @@ impl WasmEmulator {
                     }
                 } else {
                     console_log!(
-                        "[lazuli] DI: DVD Read with no disc loaded — call load_disc_image() first"
+                        "[lazuli] DI: DVD Read disc_off={:#010x} len={:#x} ram_dest={:#010x} \
+                         — NO DISC LOADED (call load_disc_image() first)",
+                        disc_offset,
+                        dma_len,
+                        self.di.dma_addr,
                     );
                 }
             }
