@@ -151,6 +151,10 @@ pub struct WasmEmulator {
     pub(crate) last_dma_addr: u32,
     /// Byte length of the most recent successful DVD DMA transfer.
     pub(crate) last_dma_len: u32,
+    /// Byte offset into the disc image of the most recent successful DVD Read
+    /// (0xA8) command.  JavaScript reads this after `take_dma_dirty()` to
+    /// format the `[lazuli] DI: DVD Read` log entry in the apploader-log panel.
+    pub(crate) last_di_disc_offset: u32,
 }
 
 #[wasm_bindgen]
@@ -190,6 +194,7 @@ impl WasmEmulator {
             cpu_cycles: 0,
             last_dma_addr: 0,
             last_dma_len: 0,
+            last_di_disc_offset: 0,
         }
     }
 }

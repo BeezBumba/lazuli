@@ -365,6 +365,16 @@ impl WasmEmulator {
     pub fn last_dma_len(&self) -> u32 {
         self.last_dma_len
     }
+
+    /// Disc byte offset of the most recent successful DVD Read (0xA8) DMA.
+    ///
+    /// JavaScript reads this after [`take_dma_dirty`] returns `true` to
+    /// format the `[lazuli] DI: DVD Read` diagnostic line in the apploader-log
+    /// panel, mirroring the same message logged to the browser console by
+    /// `process_di_command`.
+    pub fn last_di_disc_offset(&self) -> u32 {
+        self.last_di_disc_offset
+    }
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
@@ -447,6 +457,7 @@ impl WasmEmulator {
                         self.dma_dirty = true;
                         self.last_dma_addr = dma_dest as u32;
                         self.last_dma_len  = dma_len  as u32;
+                        self.last_di_disc_offset = disc_offset as u32;
                     } else {
                         console_log!(
                             "[lazuli] DI: DVD Read out of bounds \
