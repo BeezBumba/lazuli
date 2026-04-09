@@ -422,16 +422,13 @@ impl WasmEmulator {
                 if let Some(disc) = self.disc.as_deref() {
                     let src_end = disc_offset.saturating_add(dma_len);
                     if src_end <= disc.len() && dma_dest + dma_len <= self.ram.len() {
-                        self.ram[dma_dest..dma_dest + dma_len]
-                            .copy_from_slice(&disc[disc_offset..src_end]);
-                        // Log each successful DVD Read so we can compare the disc-read
-                        // sequence between native and emulated and pinpoint any divergence
-                        // in what data the apploader loads (e.g. wrong DOL entry point).
-                        // The first 8 bytes of loaded data are included for cross-checking.
-                        // Bounds are already verified above, so slicing is safe.
+                        // Log BEFORE the copy so that any format!() heap allocation
+                        // (which may trigger WASM linear-memory growth and detach the
+                        // JS RAM Uint8Array) happens before the disc data is written.
+                        // Preview bytes are taken from the disc image, not self.ram.
                         let preview_len = dma_len.min(8);
                         let mut preview = [0u8; 8];
-                        preview[..preview_len].copy_from_slice(&self.ram[dma_dest..dma_dest + preview_len]);
+                        preview[..preview_len].copy_from_slice(&disc[disc_offset..disc_offset + preview_len]);
                         console_log!(
                             "[lazuli] DI: DVD Read disc_off={:#010x} len={:#x} \
                              ram_dest={:#010x} data=[{:02x} {:02x} {:02x} {:02x} \
@@ -442,6 +439,8 @@ impl WasmEmulator {
                             preview[0], preview[1], preview[2], preview[3],
                             preview[4], preview[5], preview[6], preview[7],
                         );
+                        self.ram[dma_dest..dma_dest + dma_len]
+                            .copy_from_slice(&disc[disc_offset..src_end]);
                         // New code may have been written into guest RAM; signal JS
                         // to perform selective JIT cache invalidation for the
                         // affected address range.
