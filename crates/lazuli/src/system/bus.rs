@@ -13,6 +13,75 @@ use crate::system::{System, ai, di, dspi, exi, gx, pi, si, vi};
 #[rustfmt::skip]
 pub use mmio::Mmio;
 
+/// Inspect a single line of ipl-hle stdout output for key diagnostic markers.
+///
+/// Called by the FakeStdout MMIO write handler after each newline; the line
+/// is the complete text up to (but not including) the `\n`.  Mirrors the
+/// milestone detection in `bootstrap.js` so native and emulated logs can be
+/// compared directly:
+///
+/// - `"  Init: 0x…"`, `"  Main: 0x…"`, `"  Close: 0x…"` — the function
+///   pointers written by the apploader's entry function.  A value outside the
+///   apploader range (0x81200000–0x812FFFFF) indicates the apploader wrote
+///   a wrong address and is printed as a warning.
+/// - `"Jumping to bootfile entry: 0x…"` — what the apploader's `close()`
+///   returned as the game entry point.  Values outside 0x80000000–0x811FFFFF
+///   indicate a wrong entry and are highlighted.
+fn detect_ipl_hle_stdout_line(line: &str) {
+    // Init / Main / Close function pointers set by the apploader's entry().
+    // Expected to be in the apploader code range (0x81200000–0x812FFFFF).
+    let is_fn_ptr_line = line.starts_with("  Init: 0x")
+        || line.starts_with("  Main: 0x")
+        || line.starts_with("  Close: 0x");
+
+    if is_fn_ptr_line {
+        if let Some(hex) = line.trim().split("0x").nth(1) {
+            if let Ok(ptr) = u32::from_str_radix(hex.trim(), 16) {
+                let in_apploader = (0x8120_0000..=0x812F_FFFF).contains(&ptr);
+                let label = line.trim().split(':').next().unwrap_or("?");
+                if !in_apploader {
+                    println!(
+                        "[lazuli] ⚠ ipl-hle {label} fn ptr 0x{ptr:08X} is OUTSIDE \
+                         the apploader range (0x81200000–0x812FFFFF) — \
+                         the apploader's entry() wrote an incorrect function pointer"
+                    );
+                } else {
+                    println!("[lazuli] ipl-hle {label} fn ptr 0x{ptr:08X} ✓ (in apploader range)");
+                }
+            }
+        }
+    }
+
+    // Bootfile entry point returned by the apploader's close() function.
+    // Expected to be in the game DOL range (0x80000000–0x811FFFFF).
+    if line.contains("Jumping to bootfile entry: 0x") {
+        if let Some(hex) = line.split("0x").nth(1) {
+            if let Ok(entry) = u32::from_str_radix(hex.trim(), 16) {
+                let expected = (0x8000_0000..=0x811F_FFFF).contains(&entry);
+                let region = if (0x8130_0000..=0x813F_FFFF).contains(&entry) {
+                    "ipl-hle ⚠"
+                } else if (0x8120_0000..=0x812F_FFFF).contains(&entry) {
+                    "apploader ⚠"
+                } else if (0x8000_0000..=0x817F_FFFF).contains(&entry) {
+                    "OS/game RAM"
+                } else {
+                    "unknown ⚠"
+                };
+                if !expected {
+                    println!(
+                        "[lazuli] ⚠ ipl-hle bootfile entry 0x{entry:08X} is in {region} \
+                         — expected a game DOL entry in 0x80000000–0x811FFFFF"
+                    );
+                } else {
+                    println!(
+                        "[lazuli] ipl-hle bootfile entry 0x{entry:08X} ({region}) — looks correct"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn range_overlap(a: Range<usize>, b: Range<usize>) -> bool {
     (a.start < b.end) && (b.start < a.end)
 }
@@ -685,7 +754,18 @@ impl System {
             Mmio::FakeStdout => {
                 let mut written = 0u8;
                 ne!(written.as_mut_bytes());
-                print!("{}", written as char);
+                let ch = written as char;
+                print!("{ch}");
+                // Buffer characters into lines and inspect each completed line for
+                // key ipl-hle diagnostic output.  This mirrors the milestone
+                // detection in bootstrap.js so native and emulated logs can be
+                // compared side by side.
+                if ch == '\n' {
+                    let line = std::mem::take(&mut self.stdout_line_buf);
+                    detect_ipl_hle_stdout_line(&line);
+                } else if ch != '\r' {
+                    self.stdout_line_buf.push(ch);
+                }
             }
 
             // === PI FIFO ===

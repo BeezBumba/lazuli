@@ -110,6 +110,11 @@ pub struct System {
     pub disk: di::Interface,
     /// The serial interface.
     pub serial: si::Interface,
+    /// Line buffer for characters written to the FakeStdout MMIO port
+    /// (0xCC007000).  Used to detect key ipl-hle diagnostic lines and emit
+    /// structured log output that mirrors the emulated version's milestone
+    /// detection, so native and emulated runs can be compared directly.
+    pub stdout_line_buf: String,
 }
 
 #[derive(Debug, Error)]
@@ -248,9 +253,7 @@ impl System {
         // setup apploader entrypoint for ipl-hle
         self.cpu.user.gpr[3] = entry.value();
 
-        println!(
-            "[IPL-HLE] PC \u{2192} 0x{ipl_entry:08X} (ipl-hle), MSR=0x8000 (EE=1 IP=0)"
-        );
+        println!("[IPL-HLE] PC \u{2192} 0x{ipl_entry:08X} (ipl-hle), MSR=0x8000 (EE=1 IP=0)");
 
         // load dolphin-os globals
         self.write_phys_slow::<u32>(Address(0x00), header.meta.game_code());
@@ -309,6 +312,7 @@ impl System {
             audio: ai::Interface::default(),
             disk: di::Interface::default(),
             serial: si::Interface::default(),
+            stdout_line_buf: String::new(),
 
             config,
             modules,

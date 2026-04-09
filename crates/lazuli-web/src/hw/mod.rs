@@ -428,9 +428,10 @@ impl WasmEmulator {
                         // sequence between native and emulated and pinpoint any divergence
                         // in what data the apploader loads (e.g. wrong DOL entry point).
                         // The first 8 bytes of loaded data are included for cross-checking.
-                        let preview: [u8; 8] = core::array::from_fn(|i| {
-                            self.ram.get(dma_dest + i).copied().unwrap_or(0)
-                        });
+                        // Bounds are already verified above, so slicing is safe.
+                        let preview_len = dma_len.min(8);
+                        let mut preview = [0u8; 8];
+                        preview[..preview_len].copy_from_slice(&self.ram[dma_dest..dma_dest + preview_len]);
                         console_log!(
                             "[lazuli] DI: DVD Read disc_off={:#010x} len={:#x} \
                              ram_dest={:#010x} data=[{:02x} {:02x} {:02x} {:02x} \

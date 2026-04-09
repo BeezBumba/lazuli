@@ -253,6 +253,13 @@ pub fn write_control(sys: &mut System, value: Control) {
 
                 if !sys.modules.disk.has_disk() {
                     tracing::error!("tried to read from disk but no disk is inserted");
+                    // Log a no-disc warning matching the emulated format so the two
+                    // outputs can be compared line-by-line.
+                    println!(
+                        "[lazuli] DI: DVD Read disc_off={:#010x} len={:#x} ram_dest={:#010x} \
+                         — NO DISC LOADED",
+                        offset, length, target,
+                    );
                     slice.fill(0);
                 } else {
                     let new = sys
@@ -264,6 +271,29 @@ pub fn write_control(sys: &mut System, value: Control) {
                     assert_eq!(new, offset as u64);
 
                     sys.modules.disk.read_exact(slice).unwrap();
+
+                    // Log the DVD Read in the same format used by the emulated
+                    // process_di_command so native and emulated outputs can be
+                    // compared directly to pinpoint disc-read divergences.
+                    let preview_len = (length as usize).min(8);
+                    let mut preview = [0u8; 8];
+                    preview[..preview_len].copy_from_slice(&slice[..preview_len]);
+                    println!(
+                        "[lazuli] DI: DVD Read disc_off={:#010x} len={:#x} \
+                         ram_dest={:#010x} data=[{:02x} {:02x} {:02x} {:02x} \
+                         {:02x} {:02x} {:02x} {:02x}]",
+                        offset,
+                        length,
+                        target,
+                        preview[0],
+                        preview[1],
+                        preview[2],
+                        preview[3],
+                        preview[4],
+                        preview[5],
+                        preview[6],
+                        preview[7],
+                    );
                 }
 
                 sys.scheduler.schedule(10000, complete_transfer);

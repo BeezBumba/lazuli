@@ -936,7 +936,7 @@ function appendApploaderLog(line) {
       const inApploader = entry >= 0x81200000 && entry <= 0x812FFFFF;
       const inIplHle   = entry >= 0x81300000 && entry <= 0x813FFFFF;
       let region = inIplHle ? "ipl-hle ⚠" : inApploader ? "apploader ⚠" : inGameRam ? "OS/game RAM" : "unknown ⚠";
-      const expected = (entry >= 0x80000000 && entry < 0x81200000);
+      const expected = (entry >= 0x80000000 && entry <= 0x811FFFFF);
       if (!expected) {
         console.warn(
           `[lazuli] ⚠ ipl-hle bootfile entry 0x${entry.toString(16).padStart(8, "0")} ` +
