@@ -248,7 +248,7 @@ impl System {
         self.load_executable();
 
         println!("[IPL-HLE] ipl-hle entry:     0x{ipl_entry:08X}");
-        println!("[IPL-HLE] r3 (apploader fn): 0x{:08X}", entry.value());
+        println!("[IPL-HLE] r3: 0x{:08X}  (apploader entry fn — compare with WASM)", entry.value());
 
         // setup apploader entrypoint for ipl-hle
         self.cpu.user.gpr[3] = entry.value();
