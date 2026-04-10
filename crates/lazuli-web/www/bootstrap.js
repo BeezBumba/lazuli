@@ -911,15 +911,15 @@ function appendApploaderLog(line) {
       const inApploader = ptr >= 0x81200000 && ptr <= 0x812FFFFF;
       const label = line.trim().split(":")[0]; // "Init", "Main", or "Close"
       if (!inApploader) {
-        console.warn(
-          `[lazuli] ⚠ ipl-hle ${label} fn ptr 0x${ptr.toString(16).padStart(8, "0")} ` +
+        const msg = `[lazuli] ⚠ ipl-hle ${label} fn ptr 0x${ptr.toString(16).padStart(8, "0")} ` +
           `is OUTSIDE the apploader range (0x81200000–0x812FFFFF) — ` +
-          `this indicates the apploader's entry() wrote an incorrect function pointer`
-        );
+          `this indicates the apploader's entry() wrote an incorrect function pointer`;
+        console.warn(msg);
+        appendApploaderLog(msg);
       } else {
-        console.info(
-          `[lazuli] ipl-hle ${label} fn ptr 0x${ptr.toString(16).padStart(8, "0")} ✓ (in apploader range)`
-        );
+        const msg = `[lazuli] ipl-hle ${label} fn ptr 0x${ptr.toString(16).padStart(8, "0")} ✓ (in apploader range)`;
+        console.info(msg);
+        appendApploaderLog(msg);
       }
     }
   }

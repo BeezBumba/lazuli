@@ -160,18 +160,11 @@ pub unsafe extern "C" fn main(entry: ApploaderEntryFn) {
     print(c"[IPL-HLE] Apploader closed! Jumping to bootfile entry: 0x");
     println_hex(entry as usize as u32);
 
-    // Jump to the game entry point the way the real IPL does: place the address
-    // in CTR, pre-load LR with 0x80000004 (the real hardware convention), then
-    // branch via `bctr` (no-link) so LR is never clobbered by a `bl`.
     unsafe {
         core::arch::asm!(
             "mtctr {entry}",
-            "lis {tmp}, 0x8000",
-            "ori {tmp}, {tmp}, 0x0004",
-            "mtlr {tmp}",
             "bctr",
             entry = in(reg) entry as usize,
-            tmp = out(reg) _,
             options(noreturn),
         );
     }
