@@ -807,6 +807,38 @@ let milestones = {
   firstXfbContent:  null,
 };
 
+// ── OS banner / OSInit diagnostic state ──────────────────────────────────────
+
+/**
+ * Physical ArenaLo (RAM offset 0x30 = virtual 0x80000030) as recorded at the
+ * game-entry milestone.  Used to detect when OSInit updates the heap bounds.
+ */
+let osInitArenaLo = 0;
+
+/**
+ * True once the post-game-entry OS-banner watch has produced its final log
+ * entry (either from OSInit activity or from the 300-frame timeout).
+ */
+let osInitBannerDone = false;
+
+/**
+ * Animation frames elapsed since milestones.gameEntry fired.
+ * Incremented once per frame in the per-frame OS-banner watch.
+ */
+let osPostEntryFrames = 0;
+
+/**
+ * Running total of EXI UART bytes produced by emu.take_uart_output() since
+ * emulator creation.  Updated by drainUartOutput on every call.
+ */
+let totalEximUartBytes = 0;
+
+/**
+ * Snapshot of totalEximUartBytes at the moment milestones.gameEntry fired.
+ * Any increase after that point means OSReport (EXI UART) is active.
+ */
+let uartBytesAtGameEntry = 0;
+
 // ── Apploader / OS console stdout state ──────────────────────────────────────
 
 /**
@@ -865,6 +897,7 @@ function feedStdoutByte(ch) {
 function drainUartOutput(emu) {
   currentEmu = emu;
   const bytes = emu.take_uart_output();
+  totalEximUartBytes += bytes.length;
   for (const byte of bytes) {
     feedStdoutByte(byte);
   }
@@ -1085,6 +1118,67 @@ function renderBreakpointList() {
  * @returns {string}
  */
 const hexU32 = (v) => "0x" + (v >>> 0).toString(16).toUpperCase().padStart(8, "0");
+
+/**
+ * Read a big-endian 32-bit word from a guest RAM view at a physical address.
+ *
+ * @param {Uint8Array} ram       Zero-copy RAM view (from getRamView).
+ * @param {number}     physAddr  Physical address (no segment bits).
+ * @returns {number} Unsigned 32-bit integer.
+ */
+function readRamU32(ram, physAddr) {
+  const a = physAddr >>> 0;
+  if (a + 3 >= ram.length) return 0;
+  return ((ram[a] << 24) | (ram[a + 1] << 16) | (ram[a + 2] << 8) | ram[a + 3]) >>> 0;
+}
+
+/**
+ * Convert a GC OS console-type code to the same string that OSInit prints via
+ * OSReport (e.g. "Development HW1" for 0x10000001).
+ *
+ * The high nibble of the 32-bit value encodes the hardware class:
+ *   0x0xxxxxxx — retail hardware
+ *   0x1xxxxxxx — development hardware
+ * The low 28 bits encode the variant number (1-based).
+ *
+ * @param {number} type  Value of the OS global at 0x8000002C.
+ * @returns {string}
+ */
+function osConsoleTypeString(type) {
+  type = type >>> 0;
+  const high = (type >>> 28) & 0xF;
+  const low  = type & 0x0FFFFFFF;
+  if (high === 0x1) return low === 0 ? 'TDEV' : `Development HW${low}`;
+  if (high === 0x0) return low === 0 ? 'Retail' : `Retail HW${low}`;
+  return `Unknown (${hexU32(type)})`;
+}
+
+/**
+ * Log a synthetic OS-banner snapshot by reading OS globals directly from guest
+ * RAM.  This mirrors the OSReport output that GC OSInit emits on development
+ * hardware, but works regardless of whether OSReport is a NOP (retail binary).
+ *
+ * Physical addresses (= virtual - 0x80000000):
+ *   0x28  RAM size (bytes)     → 0x8000_0028
+ *   0x2C  Console type         → 0x8000_002C
+ *   0x30  Arena Lo             → 0x8000_0030
+ *   0x34  Arena Hi             → 0x8000_0034
+ *
+ * @param {Uint8Array} ram  Zero-copy guest RAM view.
+ * @returns {{ arenaLo: number, arenaHi: number }}
+ */
+function logOsBannerFromRam(ram) {
+  const consoleType = readRamU32(ram, 0x2C);
+  const memSize     = readRamU32(ram, 0x28);
+  const arenaLo     = readRamU32(ram, 0x30);
+  const arenaHi     = readRamU32(ram, 0x34);
+  const memMB       = memSize ? (memSize >>> 20) : 24;
+  const typeStr     = osConsoleTypeString(consoleType);
+  appendApploaderLog(`[OS] Console Type : ${typeStr}`);
+  appendApploaderLog(`[OS] Memory ${memMB} MB`);
+  appendApploaderLog(`[OS] Arena : ${hexU32(arenaLo)} - ${hexU32(arenaHi)}`);
+  return { arenaLo, arenaHi };
+}
 
 /**
  * Classify a guest program-counter value into a named emulator boot phase.
@@ -1402,6 +1496,12 @@ function clearModuleCache() {
     gameEntry:        null,
     firstXfbContent:  null,
   };
+  // Reset OS-banner / OSInit diagnostic state.
+  osInitArenaLo      = 0;
+  osInitBannerDone   = false;
+  osPostEntryFrames  = 0;
+  totalEximUartBytes = 0;
+  uartBytesAtGameEntry = 0;
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
@@ -2085,6 +2185,13 @@ function gameLoop(emu, canvas, ctx, timestamp) {
             `(${elapsed} since boot)`
           );
           appendApploaderLog(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
+          // Log a synthetic OS-banner snapshot from the current RAM globals.
+          // These values were written by parseAndLoadIso at load time; OSInit
+          // may update ArenaLo/Hi shortly after — the per-frame watch below
+          // will detect and log any changes within the next ~5 seconds.
+          const snap = logOsBannerFromRam(ram);
+          osInitArenaLo    = snap.arenaLo;
+          uartBytesAtGameEntry = totalEximUartBytes;
         }
 
         // When ipl-hle exits (to OS/game RAM or any other region), dump all
@@ -2340,6 +2447,41 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       : "?";
     console.info(`[lazuli] ✓ Milestone: first XFB content (first rendered frame) — ${elapsed} since boot`);
     pushDebugEvent(`✓ Milestone: first XFB (${elapsed})`);
+  }
+
+  // ── OS-banner post-entry watch ─────────────────────────────────────────────
+  // After the game-entry milestone fires, watch for two signs that OSInit ran:
+  //   1. ArenaLo (physical 0x30) changes from the value we wrote at load time.
+  //   2. EXI UART output appears (= OSReport is functional in this binary).
+  // After 300 frames (~5 s) with neither signal, emit a one-time timeout note.
+  // All three branches set osInitBannerDone=true to suppress further checks.
+  if (milestones.gameEntry !== null && !osInitBannerDone) {
+    osPostEntryFrames++;
+    const currentArenaLo = readRamU32(ram, 0x30);
+    const currentArenaHi = readRamU32(ram, 0x34);
+    const newUartBytes   = totalEximUartBytes - uartBytesAtGameEntry;
+    if (newUartBytes > 0) {
+      // EXI UART produced output after game entry — OSReport is active.
+      appendApploaderLog(
+        `[OS] EXI UART active — OSReport is functional (${newUartBytes} bytes)`
+      );
+      // Re-log arena in case OSInit has already updated it.
+      appendApploaderLog(`[OS] Arena : ${hexU32(currentArenaLo)} - ${hexU32(currentArenaHi)}`);
+      osInitBannerDone = true;
+    } else if (currentArenaLo !== osInitArenaLo && currentArenaLo !== 0) {
+      // OSInit updated ArenaLo — heap init ran even if OSReport was silent.
+      appendApploaderLog(
+        `[OS] OSInit updated Arena : ${hexU32(currentArenaLo)} - ${hexU32(currentArenaHi)}`
+      );
+      osInitBannerDone = true;
+    } else if (osPostEntryFrames >= 300) {
+      // 300 frames (~5 s) with no observable OS-init activity.
+      appendApploaderLog(
+        `[OS] Note: no EXI UART output and ArenaLo unchanged after 300 frames — ` +
+        `OSReport may be a NOP in this binary`
+      );
+      osInitBannerDone = true;
+    }
   }
 
   // FPS counter (update every second)
