@@ -413,7 +413,7 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
     ` r3=apploader_entry=0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}`
   );
   appendApploaderLog(`[IPL-HLE] ipl-hle entry:     0x${iplEntry.toString(16).toUpperCase().padStart(8,'0')}`);
-  appendApploaderLog(`[IPL-HLE] r3 (apploader fn): 0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}`);
+  appendApploaderLog(`[IPL-HLE] r3: 0x${apploaderEntrypoint.toString(16).toUpperCase().padStart(8,'0')}  (apploader entry fn — compare with native)`);
 
   // ── Step 5: install minimal exception-vector stubs ───────────────────────
   //
@@ -829,6 +829,14 @@ let apploaderLogLines = [];
 let stdoutLineBuffer = "";
 
 /**
+ * Reference to the active WasmEmulator instance, updated by drainUartOutput
+ * so that appendApploaderLog can read CPU registers (e.g. r3) at the exact
+ * moment a key ipl-hle stdout line is emitted.
+ * @type {WasmEmulator|null}
+ */
+let currentEmu = null;
+
+/**
  * Feed a single byte from any stdout source (the ipl-hle direct
  * 0xCC007000 write path OR the EXI UART protocol used by OSReport)
  * through the line buffer and flush completed lines to the log panel.
@@ -855,6 +863,7 @@ function feedStdoutByte(ch) {
  * @param {WasmEmulator} emu
  */
 function drainUartOutput(emu) {
+  currentEmu = emu;
   const bytes = emu.take_uart_output();
   for (const byte of bytes) {
     feedStdoutByte(byte);
@@ -947,6 +956,14 @@ function appendApploaderLog(line) {
           `[lazuli] ipl-hle bootfile entry 0x${entry.toString(16).padStart(8, "0")} ` +
           `(${region}) — looks correct`
         );
+      }
+      // Log r3 at the exact moment ipl-hle is about to jump to the game.
+      // currentEmu is set by drainUartOutput so this is the live CPU state.
+      if (currentEmu) {
+        const r3Val = currentEmu.get_gpr(3) >>> 0;
+        const r3Hex = "0x" + r3Val.toString(16).toUpperCase().padStart(8, "0");
+        appendApploaderLog(`[lazuli] r3: ${r3Hex}  (at apploader close — compare with native)`);
+        console.info(`[lazuli] r3: ${r3Hex}  (at apploader close)`);
       }
     }
   }
@@ -2101,9 +2118,11 @@ function gameLoop(emu, canvas, ctx, timestamp) {
               `         compare all DI DVD Read log lines with the native disc-read sequence.`
             );
           }
+          const r3Exit = hexU32(emu.get_gpr(3));
           appendApploaderLog(
-            `[debug] ipl-hle exit: PC=${hexU32(blockPc)} r3=${hexU32(emu.get_gpr(3))} LR=${lrVal} CTR=${ctrVal}`
+            `[debug] ipl-hle exit: PC=${hexU32(blockPc)} LR=${lrVal} CTR=${ctrVal}`
           );
+          appendApploaderLog(`[debug] r3: ${r3Exit}  (at ipl-hle exit — compare with native)`);
         }
 
         prevPhase = blockPhase;
