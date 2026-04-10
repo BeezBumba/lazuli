@@ -344,7 +344,7 @@ function parseAndLoadIso(arrayBuffer, emu, iplHleDol) {
     osGlobView.setUint32(0x20, 0x0D15EA5E, false); // Boot kind (normal)
     osGlobView.setUint32(0x24, 0x00000001, false); // IPL version
     osGlobView.setUint32(0x28, 0x01800000, false); // Physical RAM size (24 MiB)
-    osGlobView.setUint32(0x2C, 0x10000001, false); // Console type (Development HW1)
+    osGlobView.setUint32(0x2C, 0x10000005, false); // Console type
     osGlobView.setUint32(0x30, 0x8042E260, false); // Arena Low
     osGlobView.setUint32(0x34, 0x817FE8C0, false); // Arena High
     osGlobView.setUint32(0x38, 0x817FE8C0, false); // FST location
@@ -1133,13 +1133,18 @@ function readRamU32(ram, physAddr) {
 }
 
 /**
- * Convert a GC OS console-type code to the same string that OSInit prints via
- * OSReport (e.g. "Development HW1" for 0x10000001).
+ * Convert a GC OS console-type code to a display string.
  *
- * The high nibble of the 32-bit value encodes the hardware class:
+ * The high nibble encodes the hardware class:
  *   0x0xxxxxxx — retail hardware
  *   0x1xxxxxxx — development hardware
- * The low 28 bits encode the variant number (1-based).
+ *
+ * The hardware-revision label (e.g. "HW1", "HW2") that the real OS prints via
+ * OSReport is game/OS-version-specific and cannot be reliably derived from the
+ * stored value alone — it may come from a separate hardware register.  We
+ * therefore report only the class and the raw hex value so the display is
+ * always accurate.  The authoritative string (including "HW1", "HW2", kernel
+ * date, etc.) arrives via EXI UART / OSReport once the game's OS runs.
  *
  * @param {number} type  Value of the OS global at 0x8000002C.
  * @returns {string}
@@ -1147,10 +1152,10 @@ function readRamU32(ram, physAddr) {
 function osConsoleTypeString(type) {
   type = type >>> 0;
   const high = (type >>> 28) & 0xF;
-  const low  = type & 0x0FFFFFFF;
-  if (high === 0x1) return low === 0 ? 'TDEV' : `Development HW${low}`;
-  if (high === 0x0) return low === 0 ? 'Retail' : `Retail HW${low}`;
-  return `Unknown (${hexU32(type)})`;
+  const hex  = type.toString(16).toUpperCase().padStart(8, '0');
+  if (high === 0x1) return `Development (${hex})`;
+  if (high === 0x0) return `Retail (${hex})`;
+  return `Unknown (${hex})`;
 }
 
 /**
