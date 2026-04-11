@@ -199,7 +199,7 @@ impl WasmEmulator {
                 // PI_FIFO_BASE / PI_FIFO_END / PI_FIFO_WPTR: writable state
                 // mirroring the CP FIFO shadow registers.
                 0x0C => self.pi_fifo_base = val,
-                0x10 => self.pi_fifo_end  = val,
+                0x10 => self.pi_fifo_end = val,
                 0x14 => self.pi_fifo_wptr = val,
                 _ => {}
             }
@@ -795,6 +795,6 @@ impl WasmEmulator {
         // Mark transfer complete: clear TSTART (bit 0), set TCINT (bit 1).
         // Mirrors di::complete_transfer in the native build.
         self.di.control &= !0x1; // clear TSTART
-        self.di.status  |=  0x2; // set   TCINT
+        self.di.status |= 0x2;   // set   TCINT
     }
 }

@@ -248,7 +248,7 @@ impl GxState {
     /// in the native build.
     pub(crate) fn pe_token_active(&self) -> bool {
         // bit 2 (token_pending) AND bit 0 (token_enable)
-        (self.pe_int_status & 0x0005) == 0x0005
+        (self.pe_int_status & ((1 << 2) | (1 << 0))) == ((1 << 2) | (1 << 0))
     }
 
     /// Whether a PE finish interrupt is currently active (pending AND enabled).
@@ -257,6 +257,6 @@ impl GxState {
     /// in the native build.
     pub(crate) fn pe_finish_active(&self) -> bool {
         // bit 3 (finish_pending) AND bit 1 (finish_enable)
-        (self.pe_int_status & 0x000A) == 0x000A
+        (self.pe_int_status & ((1 << 3) | (1 << 1))) == ((1 << 3) | (1 << 1))
     }
 }
