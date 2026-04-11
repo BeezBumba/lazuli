@@ -178,10 +178,10 @@ impl ViState {
         // VTR: upper 16-bit halfword of the word at offset 0x00.
         let word0 = self.read32(0x00);
         let vtr = (word0 >> 16) as u16;
-        let eq_pulse    = (vtr & 0xF) as u32;           // bits 0..4
-        let active_lines = ((vtr >> 4) & 0x3FF) as u32; // bits 4..14
+        let eq_pulse       = (vtr & 0xF) as u32;           // bits 0..4
+        let active_video_lines = ((vtr >> 4) & 0x3FF) as u32; // bits 4..14
 
-        if active_lines == 0 {
+        if active_video_lines == 0 {
             // VI not yet programmed; fall back to NTSC 525.
             return 525;
         }
@@ -200,8 +200,8 @@ impl ViState {
         let pre_even  = (vte & 0x3FF) as u32;         // bits 0..10
         let post_even = ((vte >> 16) & 0x3FF) as u32; // bits 16..26
 
-        let halflines_top    = 3 * eq_pulse + pre_odd  + 2 * active_lines + post_odd;
-        let halflines_bottom = 3 * eq_pulse + pre_even + 2 * active_lines + post_even;
+        let halflines_top    = 3 * eq_pulse + pre_odd  + 2 * active_video_lines + post_odd;
+        let halflines_bottom = 3 * eq_pulse + pre_even + 2 * active_video_lines + post_even;
         let halflines_frame  = halflines_top + if field_single { 0 } else { halflines_bottom };
 
         halflines_frame / 2

@@ -160,7 +160,7 @@ impl ExiState {
     /// contains valid data; computing them here ensures those checks pass even
     /// when the rest of the SRAM is all-zero.
     fn update_sram_checksum(&mut self) {
-        self.sram[0x13] = 0b0110_1100; // 0x6C, same as native
+        self.sram[0x13] = 0b0110_1100; // fixed value required by the native checksum algorithm
 
         let mut c1: u16 = 0;
         let mut c2: u16 = 0;
