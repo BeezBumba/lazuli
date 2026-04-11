@@ -36,7 +36,7 @@ mod loader;
 use ppcwasm::WasmJit;
 use wasm_bindgen::prelude::*;
 
-use hw::{AiState, DiState, DspState, ExiState, SiState, ViState};
+use hw::{AiState, DiState, DspState, ExiState, GxState, SiState, ViState};
 use jit::WasmBlockCache;
 
 // Re-export the block type for JavaScript inspection.
@@ -125,10 +125,24 @@ pub struct WasmEmulator {
     pub(crate) exi: ExiState,
     /// Audio Interface (AI) hardware register state.
     pub(crate) ai: AiState,
+    /// GX Command Processor (CP) and Pixel Engine (PE) register state.
+    pub(crate) gx: GxState,
+    /// 16 MiB Audio RAM (ARAM) buffer.
+    ///
+    /// Matches the native `dspi::Dsp::aram` field.  ARAM DMA transfers between
+    /// this buffer and main [`WasmEmulator::ram`] are executed in `hw_write_u32`
+    /// (which has access to both) rather than inside `DspState::write_u32`.
+    pub(crate) aram: Vec<u8>,
     /// Processor Interface interrupt status register.
     pub(crate) pi_intsr: u32,
     /// Processor Interface interrupt mask register (PI_INTMSK at 0xCC003004).
     pub(crate) pi_intmsk: u32,
+    /// PI FIFO start address (PI_FIFO_BASE at PI+0x0C, `0xCC00300C`).
+    pub(crate) pi_fifo_base: u32,
+    /// PI FIFO end address (PI_FIFO_END at PI+0x10, `0xCC003010`).
+    pub(crate) pi_fifo_end: u32,
+    /// PI FIFO write pointer (PI_FIFO_WPTR at PI+0x14, `0xCC003014`).
+    pub(crate) pi_fifo_wptr: u32,
     /// True when the decrementer has transitioned negative but the exception
     /// has not yet been delivered because MSR.EE was clear at the time.
     pub(crate) decrementer_pending: bool,
@@ -145,6 +159,13 @@ pub struct WasmEmulator {
     /// this to implement the same cycle-counting that `Lazuli::exec` performs
     /// internally via its `Scheduler`.
     pub(crate) cpu_cycles: u64,
+    /// Accumulated CPU cycles for the AI sample-counter tick.
+    ///
+    /// The AI sample counter increments at the audio sample rate (48 kHz or
+    /// 32 kHz depending on `AICR.AISFR`).  Since one audio sample corresponds
+    /// to many CPU cycles (10 125 at 48 kHz), this accumulator avoids losing
+    /// fractional samples across consecutive JIT blocks.
+    pub(crate) ai_cpu_cycles: u64,
     /// Physical start address of the most recent successful DVD DMA transfer.
     /// JavaScript reads this (alongside `last_dma_len`) to perform selective
     /// per-address JIT cache invalidation instead of a full `moduleCache.clear()`.
@@ -186,12 +207,18 @@ impl WasmEmulator {
             si: SiState::default(),
             exi: ExiState::default(),
             ai: AiState::default(),
+            gx: GxState::default(),
+            aram: vec![0u8; 16 * 1024 * 1024],
             pi_intsr: 0,
             pi_intmsk: 0,
+            pi_fifo_base: 0,
+            pi_fifo_end: 0,
+            pi_fifo_wptr: 0,
             decrementer_pending: false,
             dma_dirty: false,
             last_compiled_cycles: 0,
             cpu_cycles: 0,
+            ai_cpu_cycles: 0,
             last_dma_addr: 0,
             last_dma_len: 0,
             last_di_disc_offset: 0,

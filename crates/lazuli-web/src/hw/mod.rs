@@ -9,20 +9,22 @@
 //!
 //! ## Dispatch table
 //!
-//! | Base address  | Module | Description                    |
-//! |---------------|--------|--------------------------------|
-//! | `0xCC002000`  | `vi`   | Video Interface                |
-//! | `0xCC003000`  | `pi`   | Processor Interface            |
-//! | `0xCC005000`  | `dsp`  | DSP Interface / ARAM           |
-//! | `0xCC006000`  | `di`   | DVD Interface                  |
-//! | `0xCC006400`  | `si`   | Serial Interface (controllers) |
-//! | `0xCC006800`  | `exi`  | External Interface             |
-//! | `0xCC006C00`  | `ai`   | Audio Interface                |
+//! | Base address  | Module | Description                         |
+//! |---------------|--------|-------------------------------------|
+//! | `0xCC000000`  | `gx`   | GX Command Processor + Pixel Engine |
+//! | `0xCC002000`  | `vi`   | Video Interface                     |
+//! | `0xCC003000`  | `pi`   | Processor Interface                 |
+//! | `0xCC005000`  | `dsp`  | DSP Interface / ARAM                |
+//! | `0xCC006000`  | `di`   | DVD Interface                       |
+//! | `0xCC006400`  | `si`   | Serial Interface (controllers)      |
+//! | `0xCC006800`  | `exi`  | External Interface                  |
+//! | `0xCC006C00`  | `ai`   | Audio Interface                     |
 
 pub(crate) mod ai;
 pub(crate) mod di;
 pub(crate) mod dsp;
 pub(crate) mod exi;
+pub(crate) mod gx;
 pub(crate) mod pi;
 pub(crate) mod si;
 pub(crate) mod vi;
@@ -31,9 +33,10 @@ pub(crate) use ai::{AiState, AI_BASE, AI_SIZE};
 pub(crate) use di::{DiState, DI_BASE, DI_SIZE};
 pub(crate) use dsp::{DspState, DSP_BASE, DSP_SIZE};
 pub(crate) use exi::{ExiState, EXI_BASE, EXI_SIZE};
+pub(crate) use gx::{GxState, GX_BASE, GX_SIZE};
 pub(crate) use pi::{
-    PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_DI, PI_INT_SI as PI_SI, PI_INT_VI,
-    PI_MEMSIZE_VAL, PI_SIZE,
+    PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_AI, PI_INT_DI, PI_INT_DSP, PI_INT_PE_FINISH,
+    PI_INT_PE_TOKEN, PI_INT_SI as PI_SI, PI_INT_VI, PI_MEMSIZE_VAL, PI_SIZE,
 };
 pub(crate) use si::{SiState, SI_BASE, SI_SIZE};
 pub(crate) use vi::{ViState, VI_BASE, VI_SIZE};
@@ -72,6 +75,16 @@ impl WasmEmulator {
         // mirror so a single set of base-address constants covers both aliases.
         let addr = addr & !UNCACHED_MIRROR_BIT;
 
+        // ── GX: Command Processor + Pixel Engine (16-bit registers) ───────
+        // GX registers are 16-bit wide; reconstruct a 32-bit value from two
+        // consecutive halfwords (big-endian: high halfword at the lower address).
+        if addr >= GX_BASE && addr < GX_BASE + GX_SIZE {
+            let offset = addr - GX_BASE;
+            let hi = self.gx.read_u16(offset) as u32;
+            let lo = self.gx.read_u16(offset + 2) as u32;
+            return (hi << 16) | lo;
+        }
+
         // ── Video Interface ────────────────────────────────────────────────
         if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
             return self.vi.read_u32(addr - VI_BASE);
@@ -83,7 +96,10 @@ impl WasmEmulator {
             return match offset {
                 0x00 => self.pi_intsr,
                 0x04 => self.pi_intmsk,
-                // PI_FIFO_BASE / PI_FIFO_END / PI_FIFO_WPTR (0x0C/0x10/0x14): return 0
+                // PI_FIFO_BASE / PI_FIFO_END / PI_FIFO_WPTR — readable state.
+                0x0C => self.pi_fifo_base,
+                0x10 => self.pi_fifo_end,
+                0x14 => self.pi_fifo_wptr,
                 0x28 => PI_MEMSIZE_VAL,
                 0x2C => PI_BUSCLK_VAL,
                 0x30 => PI_CPUCLK_VAL,
@@ -131,6 +147,20 @@ impl WasmEmulator {
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
         let addr = addr & !UNCACHED_MIRROR_BIT;
 
+        // ── GX: Command Processor + Pixel Engine ──────────────────────────
+        // GX registers are 16-bit wide; split the 32-bit write into two
+        // consecutive halfword writes (high halfword at the lower address).
+        if addr >= GX_BASE && addr < GX_BASE + GX_SIZE {
+            let offset = addr - GX_BASE;
+            let changed_hi = self.gx.write_u16(offset, (val >> 16) as u16);
+            let changed_lo = self.gx.write_u16(offset + 2, val as u16);
+            if changed_hi || changed_lo {
+                self.sync_pi_pe_interrupts();
+                self.maybe_deliver_external_interrupt();
+            }
+            return;
+        }
+
         // ── Video Interface ────────────────────────────────────────────────
         if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
             self.vi.write_u32(addr - VI_BASE, val);
@@ -166,18 +196,36 @@ impl WasmEmulator {
                     self.pi_intmsk = val;
                     self.maybe_deliver_external_interrupt();
                 }
+                // PI_FIFO_BASE / PI_FIFO_END / PI_FIFO_WPTR: writable state
+                // mirroring the CP FIFO shadow registers.
+                0x0C => self.pi_fifo_base = val,
+                0x10 => self.pi_fifo_end = val,
+                0x14 => self.pi_fifo_wptr = val,
                 _ => {}
             }
             return;
         }
 
         // ── DSP Interface (32-bit writes) ──────────────────────────────────
-        // Handles ARAM DMA control (0x5028) and AudioDmaBase (0x5030) which
-        // the OS writes with `stw`.  The HLE stub in DspState::write_u32
-        // immediately completes ARAM DMA so the OS doesn't hang polling
-        // aram_dma_interrupt.
+        // Handles ARAM DMA base/control (0x5020/0x5024/0x5028) and AudioDmaBase
+        // (0x5030) which the OS writes with `stw`.
+        //
+        // DspState::write_u32 stores the DMA parameters and marks
+        // `aram_dma_pending = true` when the control register (0x28) is written.
+        // The actual byte copy is executed here where both `self.ram` and
+        // `self.aram` are accessible.
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             self.dsp.write_u32(addr - DSP_BASE, val);
+            // Execute pending ARAM DMA (triggered by write to DspAramDmaControl).
+            if core::mem::replace(&mut self.dsp.aram_dma_pending, false) {
+                self.execute_aram_dma();
+            }
+            // Sync PI_INT_DSP: set the bit if any DSP interrupt source is both
+            // pending and enabled; clear it otherwise.  Mirrors the native
+            // `get_active_interrupts` → `sources.set_dsp_interface(control.any_interrupt())`
+            // path in pi.rs.
+            self.sync_pi_dsp();
+            self.maybe_deliver_external_interrupt();
             return;
         }
 
@@ -224,6 +272,11 @@ impl WasmEmulator {
     pub fn hw_read_u16(&self, addr: u32) -> u16 {
         let addr = addr & !UNCACHED_MIRROR_BIT;
 
+        // ── GX: Command Processor + Pixel Engine ──────────────────────────
+        if addr >= GX_BASE && addr < GX_BASE + GX_SIZE {
+            return self.gx.read_u16(addr - GX_BASE);
+        }
+
         // ── Video Interface (16-bit registers VTR, DCR, VCOUNT, HCOUNT, HSR, VICLK) ──
         if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
             return self.vi.read_u16(addr - VI_BASE);
@@ -262,6 +315,16 @@ impl WasmEmulator {
     pub fn hw_write_u16(&mut self, addr: u32, val: u16) {
         let addr = addr & !UNCACHED_MIRROR_BIT;
 
+        // ── GX: Command Processor + Pixel Engine ──────────────────────────
+        if addr >= GX_BASE && addr < GX_BASE + GX_SIZE {
+            let changed = self.gx.write_u16(addr - GX_BASE, val);
+            if changed {
+                self.sync_pi_pe_interrupts();
+                self.maybe_deliver_external_interrupt();
+            }
+            return;
+        }
+
         // ── Video Interface ────────────────────────────────────────────────
         if addr >= VI_BASE && addr < VI_BASE + VI_SIZE {
             self.vi.write_u16(addr - VI_BASE, val);
@@ -281,6 +344,10 @@ impl WasmEmulator {
         // ── DSP Interface ──────────────────────────────────────────────────
         if addr >= DSP_BASE && addr < DSP_BASE + DSP_SIZE {
             self.dsp.write_u16(addr - DSP_BASE, val);
+            // Sync PI_INT_DSP after any DSPCONTROL change (enable-mask bits may
+            // have changed, or interrupt pending bits may have been W1C'd).
+            self.sync_pi_dsp();
+            self.maybe_deliver_external_interrupt();
         }
     }
 
@@ -323,6 +390,12 @@ impl WasmEmulator {
     /// `PI_INTSR`, and — if the guest CPU has external interrupts enabled
     /// (`MSR.EE = 1`) and the OS has unmasked the VI interrupt in `PI_INTMSK`
     /// — delivers an `Exception::Interrupt` (vector `0x00000500`) to the CPU.
+    ///
+    /// Additionally fires the PE_FINISH interrupt once per frame.  On real
+    /// hardware PE_FINISH is generated by the GPU when it finishes processing
+    /// a draw-done command from the GX FIFO.  Without a full GX pipeline the
+    /// browser build fires it alongside the VI retrace to unblock games that
+    /// call `GXWaitForDrawDone()` as a frame-sync primitive.
     pub fn assert_vi_interrupt(&mut self) {
         // Advance the VI vertical counter by one field (called each RAF frame).
         self.vi.advance_vcount();
@@ -345,10 +418,63 @@ impl WasmEmulator {
         // before it has fully configured the VI.
         self.pi_intsr |= PI_INT_VI;
 
+        // Fire PE_FINISH once per frame to unblock GXWaitForDrawDone().
+        // The native build generates this via gx::cmd::consume when the CP
+        // processes a DrawDone (0x61) GX command.  Without a full FIFO decoder
+        // we simulate it here at VI-retrace rate.  `fire_pe_finish()` sets
+        // bit 3 (finish_pending) and returns true only when bit 1
+        // (finish_enable) is also set — i.e. the game has enabled the interrupt.
+        if self.gx.fire_pe_finish() {
+            self.pi_intsr |= PI_INT_PE_FINISH;
+        }
+        // Sync any other PE interrupt changes resulting from the frame tick.
+        self.sync_pi_pe_interrupts();
+
         // Deliver the external interrupt immediately if EE=1 and the OS has
-        // unmasked the VI interrupt in PI_INTMSK.  Do not pre-clear PI_INTSR:
-        // the ISR must be able to read the bit to know which interrupt fired.
+        // unmasked any pending interrupt in PI_INTMSK.  Do not pre-clear
+        // PI_INTSR: the ISR must be able to read the bit to know which
+        // interrupt fired.
         self.maybe_deliver_external_interrupt();
+    }
+
+    /// Advance the Audio Interface (AI) sample counter by `cpu_cycles`.
+    ///
+    /// Call this from the JavaScript game loop after every executed block,
+    /// passing the block's CPU cycle count (`blockMeta.cycles`).  Internally
+    /// the method accumulates cycles across blocks and increments the AI sample
+    /// counter (`AISCNT`) once per audio sample period (10 125 CPU cycles at
+    /// 48 kHz; 15 187 at 32 kHz, selected by `AICR.AISFR`).
+    ///
+    /// When `AISCNT` crosses `AIIT` (the interrupt threshold), the AI
+    /// interrupt fires: `PI_INT_AI` is set in `PI_INTSR` and
+    /// [`maybe_deliver_external_interrupt`] is called immediately.
+    ///
+    /// Returns `true` when the AI interrupt fires (informational only —
+    /// interrupt delivery is handled automatically).
+    ///
+    /// Mirrors the native `ai::push_streaming_frame` scheduler event which
+    /// increments `sample_counter` and calls `pi::check_interrupts` at the
+    /// audio sample rate.
+    pub fn advance_ai(&mut self, cpu_cycles: u32) -> bool {
+        self.ai_cpu_cycles += cpu_cycles as u64;
+        // Determine the sample rate from AICR bit 1 (AISFR):
+        // 0 = 48 kHz (486_000_000 / 48_000 = 10_125 cycles/sample)
+        // 1 = 32 kHz (486_000_000 / 32_000 ≈ 15_187 cycles/sample)
+        let sample_rate_32k = (self.ai.control & (1 << 1)) != 0;
+        let cycles_per_sample: u64 = if sample_rate_32k { 15_187 } else { 10_125 };
+
+        let samples = self.ai_cpu_cycles / cycles_per_sample;
+        if samples == 0 {
+            return false;
+        }
+        self.ai_cpu_cycles -= samples * cycles_per_sample;
+
+        if self.ai.tick_sample_counter(samples as u32) {
+            self.pi_intsr |= PI_INT_AI;
+            self.maybe_deliver_external_interrupt();
+            return true;
+        }
+        false
     }
 
     /// Physical RAM address of the External Frame Buffer as programmed by the
@@ -428,31 +554,145 @@ impl WasmEmulator {
 }
 
 impl WasmEmulator {
+    /// Synchronise `PI_INT_DSP` in `PI_INTSR` with the current DSPCONTROL state.
+    ///
+    /// Sets the DSP bit when any interrupt source is both pending and masked-on,
+    /// and clears it when none are active.  Mirrors the native
+    /// `get_active_interrupts` → `sources.set_dsp_interface(control.any_interrupt())`
+    /// path in `pi.rs`.
+    ///
+    /// Must be called after every write to a DSPCONTROL-related register so that
+    /// the OS can observe the correct PI_INTSR state via `__OSInitAudioSystem`
+    /// and related polling loops.
+    fn sync_pi_dsp(&mut self) {
+        if self.dsp.any_interrupt() {
+            self.pi_intsr |= PI_INT_DSP;
+        } else {
+            self.pi_intsr &= !PI_INT_DSP;
+        }
+    }
+
+    /// Synchronise `PI_INT_PE_TOKEN` and `PI_INT_PE_FINISH` in `PI_INTSR` with
+    /// the current GX Pixel Engine interrupt state.
+    ///
+    /// Mirrors the native `get_active_interrupts` path:
+    /// ```text
+    /// sources.set_pe_token (pix.interrupt.token()  && pix.interrupt.token_enabled());
+    /// sources.set_pe_finish(pix.interrupt.finish() && pix.interrupt.finish_enabled());
+    /// ```
+    fn sync_pi_pe_interrupts(&mut self) {
+        if self.gx.pe_token_active() {
+            self.pi_intsr |= PI_INT_PE_TOKEN;
+        } else {
+            self.pi_intsr &= !PI_INT_PE_TOKEN;
+        }
+        if self.gx.pe_finish_active() {
+            self.pi_intsr |= PI_INT_PE_FINISH;
+        } else {
+            self.pi_intsr &= !PI_INT_PE_FINISH;
+        }
+    }
+
+    /// Execute a pending ARAM DMA transfer between main RAM and the ARAM buffer.
+    ///
+    /// Called from `hw_write_u32` after [`DspState::write_u32`] sets
+    /// `aram_dma_pending = true` (triggered by a write to `DspAramDmaControl`
+    /// at offset 0x28).  Having access to both `self.ram` and `self.aram` here
+    /// allows the actual byte copy that `DspState::write_u32` cannot perform.
+    ///
+    /// Mirrors `dspi::aram_dma()` in the native build:
+    /// - Reads `aram_dma_ram_base` (main RAM address, segment bits stripped).
+    /// - Reads `aram_dma_aram_base` (ARAM byte offset).
+    /// - Reads `aram_dma_control` (bit 31 = direction, bits 0–30 = length).
+    /// - If `aram_base >= ARAM_LEN`, the transfer is silently dropped (the OS
+    ///   uses out-of-bounds DMA to probe ARAM size; the interrupt is already set
+    ///   by `DspState::write_u32`).
+    /// - Otherwise performs the byte copy in the requested direction.
+    fn execute_aram_dma(&mut self) {
+        const ARAM_LEN: usize = 16 * 1024 * 1024;
+
+        let aram_base = self.dsp.aram_dma_aram_base as usize;
+        let ram_base  = crate::phys_addr(self.dsp.aram_dma_ram_base);
+        let ctrl      = self.dsp.aram_dma_control;
+        let len       = (ctrl & 0x7FFF_FFFF) as usize;
+        let to_aram   = (ctrl >> 31) == 0; // 0 = RAM→ARAM, 1 = ARAM→RAM
+
+        // Out-of-bounds ARAM address: interrupt already set; nothing to copy.
+        // Mirrors native dspi::aram_dma() early-return for aram_base >= ARAM_LEN.
+        if aram_base >= ARAM_LEN || len == 0 {
+            return;
+        }
+
+        let eff_len = len.min(ARAM_LEN - aram_base);
+
+        if to_aram {
+            // RAM → ARAM
+            if ram_base + eff_len <= self.ram.len() {
+                self.aram[aram_base..aram_base + eff_len]
+                    .copy_from_slice(&self.ram[ram_base..ram_base + eff_len]);
+            }
+        } else {
+            // ARAM → RAM
+            if ram_base + eff_len <= self.ram.len() {
+                self.ram[ram_base..ram_base + eff_len]
+                    .copy_from_slice(&self.aram[aram_base..aram_base + eff_len]);
+            }
+        }
+    }
+
     /// Process a DVD Interface DMA command (called when DICR bit 0 is written 1).
     ///
-    /// Decodes the command in `DICMDBUF0` bits 31–24 and acts on it:
+    /// Decodes the command opcode in `DICMDBUF0` bits 31–24 and acts on it.
+    /// Supported opcodes match the native `di::Command` set:
     ///
-    /// - **`0xA8` — DVD Read**: copies `DILENGTH` bytes from the stored disc
-    ///   image at byte offset `DICMDBUF1` into guest RAM at `DIMAR`.
-    /// - **`0xAB` — Seek**: no-op (block device, seek has no physical effect).
-    /// - **`0xE0` — Request Error**: zeroes `DIIMMBUF` and completes.
-    /// - **`0xE3` — Stop Motor**: no-op.
-    /// - Any other command: logged and completed without action.
+    /// | Opcode | Name            | Behaviour                                       |
+    /// |--------|-----------------|-------------------------------------------------|
+    /// | `0x12` | Identify        | Write 32 bytes of stub disc-ID data to DMA buf  |
+    /// | `0xA8` | DVD Read        | Copy `DILENGTH` bytes from disc into RAM         |
+    /// | `0xAB` | Seek            | No-op (block device)                            |
+    /// | `0xE0` | Request Error   | Clear `DIIMMBUF` and complete                   |
+    /// | `0xE1` | AudioStream     | No-op stub (native also stubs this)             |
+    /// | `0xE2` | AudioStatus     | Clear `DIIMMBUF` and complete                   |
+    /// | `0xE3` | Stop Motor      | No-op                                           |
+    /// | `0xE4` | AudioConfig     | No-op stub                                      |
+    /// | `0xFE` | Debug           | No-op                                           |
+    /// | `0xFF` | DebugEnable     | No-op                                           |
     ///
     /// On completion, `DICR` bit 0 (TSTART) is cleared and `DISTATUS` bit 1
-    /// (TCINT — transfer complete) is set.
+    /// (TCINT — transfer complete) is set, mirroring `di::complete_transfer`.
     fn process_di_command(&mut self) {
-        let cmd = (self.di.cmd_buf0 >> 24) as u8;
+        let cmd     = (self.di.cmd_buf0 >> 24) as u8;
+        let sub_cmd = ((self.di.cmd_buf0 >> 16) & 0xFF) as u8;
         // DICMDBUF1 stores the disc address in 4-byte units, not bytes.
         // ipl-hle (and the real apploader) write `byte_offset >> 2` to this
         // register, so we must shift left by 2 to recover the byte offset.
         let disc_offset = (self.di.cmd_buf1 as usize) << 2;
-        let dma_len = self.di.dma_len as usize;
+        let dma_len  = self.di.dma_len as usize;
         let dma_dest = crate::phys_addr(self.di.dma_addr);
 
         match cmd {
+            // ── 0x12: Identify ────────────────────────────────────────────
+            // Write a 32-byte disc identification structure into the DMA
+            // destination.  Mirrors native di.rs Command::Identify handling.
+            0x12 => {
+                if dma_dest + 32 <= self.ram.len() {
+                    // Date / version bytes matching native stub output.
+                    let stub: [u8; 32] = [
+                        0x00, 0x00, 0x00, 0x00, // zeros
+                        0x20, 0x02, 0x04, 0x02, // date
+                        0x61, 0x00, 0x00, 0x00, // version
+                        0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                    ];
+                    self.ram[dma_dest..dma_dest + 32].copy_from_slice(&stub);
+                }
+            }
+
+            // ── 0xA8: DVD Read ────────────────────────────────────────────
             0xA8 => {
-                // DVD Read: copy `dma_len` bytes from disc at `disc_offset` to RAM.
                 // `self.disc` and `self.ram` are separate fields with disjoint heap
                 // allocations; `as_deref()` borrows only the former, so Rust allows
                 // a simultaneous mutable borrow of the latter.
@@ -462,7 +702,6 @@ impl WasmEmulator {
                         // Log BEFORE the copy so that any format!() heap allocation
                         // (which may trigger WASM linear-memory growth and detach the
                         // JS RAM Uint8Array) happens before the disc data is written.
-                        // Preview bytes are taken from the disc image, not self.ram.
                         let preview_len = dma_len.min(8);
                         let mut preview = [0u8; 8];
                         preview[..preview_len].copy_from_slice(&disc[disc_offset..disc_offset + preview_len]);
@@ -507,19 +746,55 @@ impl WasmEmulator {
                     );
                 }
             }
-            0xAB => { /* Seek — no-op on a block device */ }
+
+            // ── 0xAB: Seek — no-op on a block device ─────────────────────
+            0xAB => {}
+
+            // ── 0xE0: Request Error / Status ──────────────────────────────
             0xE0 => {
-                // Request Error — return 0 via DIIMMBUF
+                // Return 0 via DIIMMBUF (no error).
                 self.di.imm_buf = 0;
             }
-            0xE3 => { /* Stop Motor — no-op in emulation */ }
+
+            // ── 0xE1: AudioStream — start/stop/status ─────────────────────
+            // Mirrors native Command::StartAudioStream / StopAudioStream /
+            // AudioStreamStatus stubs (all set transfer_interrupt and complete).
+            0xE1 => {
+                let sub_name = match sub_cmd {
+                    0x00 => "StartAudioStream",
+                    0x01 => "StopAudioStream",
+                    _    => "AudioStreamStatus",
+                };
+                console_log!("[lazuli] DI: {} (0xE1/{:#04x}) — stub", sub_name, sub_cmd);
+                self.di.imm_buf = 0;
+            }
+
+            // ── 0xE2: AudioStatus ─────────────────────────────────────────
+            0xE2 => {
+                console_log!("[lazuli] DI: AudioStatus (0xE2/{:#04x}) — stub", sub_cmd);
+                self.di.imm_buf = 0;
+            }
+
+            // ── 0xE3: Stop Motor — no-op ──────────────────────────────────
+            0xE3 => {}
+
+            // ── 0xE4: AudioConfig (enable/disable audio stream) ───────────
+            0xE4 => {
+                console_log!("[lazuli] DI: AudioConfig (0xE4/{:#04x}) — stub", sub_cmd);
+                self.di.imm_buf = 0;
+            }
+
+            // ── 0xFE / 0xFF: Debug / DebugEnable — no-op ─────────────────
+            0xFE | 0xFF => {}
+
             other => {
                 console_log!("[lazuli] DI: unrecognised command {:#04x}", other);
             }
         }
 
-        // Mark transfer complete: clear TSTART, set TCINT.
+        // Mark transfer complete: clear TSTART (bit 0), set TCINT (bit 1).
+        // Mirrors di::complete_transfer in the native build.
         self.di.control &= !0x1; // clear TSTART
-        self.di.status |= 0x2; // set   TCINT
+        self.di.status |= 0x2;   // set   TCINT
     }
 }

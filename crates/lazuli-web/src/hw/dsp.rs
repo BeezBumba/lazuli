@@ -101,6 +101,22 @@ pub(crate) struct DspState {
     /// AudioDmaControl at offset 0x36 (`0xCC005036`).
     /// Bit 15 = playing; bits 0–14 = length in 32-byte blocks.
     pub(crate) audio_dma_control: u16,
+
+    // ── ARAM DMA register state ────────────────────────────────────────────
+    /// `DspAramDmaRamBase` (offset 0x20, 4 bytes) — main-RAM byte address for
+    /// the ARAM DMA transfer.  Stored here so the actual copy can be performed
+    /// in `hw_write_u32` where the full emulator state (RAM + ARAM) is visible.
+    pub(crate) aram_dma_ram_base: u32,
+    /// `DspAramDmaAramBase` (offset 0x24, 4 bytes) — ARAM byte address for the
+    /// DMA transfer.
+    pub(crate) aram_dma_aram_base: u32,
+    /// `DspAramDmaControl` (offset 0x28, 4 bytes) — DMA length + direction.
+    /// bit 31 = direction (0 = RAM→ARAM, 1 = ARAM→RAM); bits 0–30 = byte count.
+    pub(crate) aram_dma_control: u32,
+    /// Set to `true` when offset 0x28 is written.  `hw_write_u32` reads this
+    /// flag and executes the actual byte copy (with RAM access) before clearing
+    /// it.  Mirrors the native `dspi::aram_dma()` call path.
+    pub(crate) aram_dma_pending: bool,
 }
 
 impl Default for DspState {
@@ -110,7 +126,27 @@ impl Default for DspState {
             dsp2cpu_lo: 0,
             control: DSPCTRL_DEFAULT,
             audio_dma_control: 0,
+            aram_dma_ram_base: 0,
+            aram_dma_aram_base: 0,
+            aram_dma_control: 0,
+            aram_dma_pending: false,
         }
+    }
+}
+
+impl DspState {
+    /// Returns `true` if any DSP interrupt source is currently both pending and
+    /// enabled in `DSPCONTROL`.
+    ///
+    /// Mirrors `dspi::Control::any_interrupt()` in the native build:
+    /// - bit 3 (ai_dma_interrupt) && bit 4 (ai_dma_interrupt_mask)
+    /// - bit 5 (aram_dma_interrupt) && bit 6 (aram_dma_interrupt_mask)
+    /// - bit 7 (dsp_interrupt) && bit 8 (dsp_interrupt_mask)
+    pub(crate) fn any_interrupt(&self) -> bool {
+        let ai   = (self.control & (1 << 3)) != 0 && (self.control & (1 << 4)) != 0;
+        let aram = (self.control & (1 << 5)) != 0 && (self.control & (1 << 6)) != 0;
+        let dsp  = (self.control & (1 << 7)) != 0 && (self.control & (1 << 8)) != 0;
+        ai || aram || dsp
     }
 }
 
@@ -204,18 +240,33 @@ impl DspState {
     /// Several DSP registers (ARAM DMA base/control, AudioDmaBase) are 32-bit
     /// and written with `stw`.  The 32-bit dispatch path in `hw_write_u32`
     /// delegates here for the DSP address range.
-    pub(crate) fn write_u32(&mut self, offset: u32, _val: u32) {
+    ///
+    /// **ARAM DMA**: This method stores the DMA parameters and sets
+    /// [`DspState::aram_dma_pending`] = `true` when offset 0x28 is written.
+    /// The actual byte copy between main RAM and the ARAM buffer is performed
+    /// in `hw_write_u32` (which has access to both `WasmEmulator::ram` and
+    /// `WasmEmulator::aram`).
+    pub(crate) fn write_u32(&mut self, offset: u32, val: u32) {
         match offset {
+            // DspAramDmaRamBase (0x20, 4 bytes): store the main-RAM address for the
+            // pending ARAM DMA transfer.  Mirroring native dspi.rs field `aram_dma.ram_base`.
+            0x20 => self.aram_dma_ram_base = val,
+            // DspAramDmaAramBase (0x24, 4 bytes): store the ARAM-side address.
+            0x24 => self.aram_dma_aram_base = val,
             // DspAramDmaControl (0x28, 4 bytes): write triggers ARAM DMA.
-            // HLE: immediately complete — set aram_dma_interrupt (bit 5),
-            // clear aram_dma_ongoing (bit 9).
+            // Store the control word (bit 31 = direction, bits 0-30 = length),
+            // mark the DMA as pending so hw_write_u32 can execute it with RAM
+            // access, and immediately set the interrupt / clear the ongoing flag
+            // to match the HLE "instant completion" behaviour that the OS polls.
             0x28 => {
-                self.control |= 1 << 5; // aram_dma_interrupt = 1
+                self.aram_dma_control = val;
+                self.aram_dma_pending = true;
+                self.control |= 1 << 5;  // aram_dma_interrupt = 1
                 self.control &= !(1 << 9); // aram_dma_ongoing = 0
             }
-            // AudioDmaBase (0x30, 4 bytes): store address for DMA source.
-            // HLE doesn't need the actual base; ignore the write.
-            // DspAramDmaRamBase (0x20) / DspAramDmaAramBase (0x24): ignored.
+            // AudioDmaBase (0x30, 4 bytes): address of the audio DMA source in
+            // main RAM.  HLE does not stream audio, so the write is accepted but
+            // ignored.  DspAramDmaRamBase / DspAramDmaAramBase are handled above.
             _ => {}
         }
     }
