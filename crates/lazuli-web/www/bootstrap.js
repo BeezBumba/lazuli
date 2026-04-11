@@ -873,13 +873,13 @@ let currentEmu = null;
  * 0xCC007000 write path OR the EXI UART protocol used by OSReport)
  * through the line buffer and flush completed lines to the log panel.
  *
- * @param {number} ch  Byte value (0–255).
+ * @param {number} ch  Byte value (0–255); 0x0D and 0x00 are silently dropped.
  */
 function feedStdoutByte(ch) {
   if (ch === 0x0A /* \n */) {
     appendApploaderLog(stdoutLineBuffer);
     stdoutLineBuffer = "";
-  } else if (ch !== 0x0D /* strip \r */) {
+  } else if (ch !== 0x0D /* strip \r */ && ch !== 0x00 /* strip null padding */) {
     stdoutLineBuffer += String.fromCharCode(ch);
   }
 }
