@@ -147,6 +147,38 @@ impl ExiState {
         core::mem::take(&mut self.uart_output)
     }
 
+    /// Recompute the SRAM integrity checksums, mirroring `update_sram_checksum`
+    /// in the native `exi.rs`.
+    ///
+    /// The native IPL ROM writes a pair of 16-bit checksums to SRAM bytes
+    /// 0x00–0x01 (c1) and 0x02–0x03 (c2) before handing control to the OS.
+    /// `c1` is the wrapping sum of the four 16-bit words at SRAM offsets
+    /// 0x0C–0x13; `c2` is the wrapping sum of their bitwise complements.
+    /// Byte 0x13 is forced to `0x6C` first, as the native does.
+    ///
+    /// Games / the Dolphin OS check these checksums to decide whether SRAM
+    /// contains valid data; computing them here ensures those checks pass even
+    /// when the rest of the SRAM is all-zero.
+    fn update_sram_checksum(&mut self) {
+        self.sram[0x13] = 0b0110_1100; // 0x6C, same as native
+
+        let mut c1: u16 = 0;
+        let mut c2: u16 = 0;
+        for i in 0..4usize {
+            let off = 0x0C + 2 * i;
+            let word = u16::from_be_bytes([self.sram[off], self.sram[off + 1]]);
+            c1 = c1.wrapping_add(word);
+            c2 = c2.wrapping_add(word ^ 0xFFFF);
+        }
+
+        let [h1, l1] = c1.to_be_bytes();
+        let [h2, l2] = c2.to_be_bytes();
+        self.sram[0x00] = h1;
+        self.sram[0x01] = l1;
+        self.sram[0x02] = h2;
+        self.sram[0x03] = l2;
+    }
+
     /// Handle an EXI transfer request for `channel`.
     ///
     /// For the SRAM/RTC device (channel 0, device_sel bit 1 = 0b010):
@@ -168,10 +200,11 @@ impl ExiState {
 
         if ch == 0 && device_sel == 0b010 && dma == 0 {
             if rw == 0 {
-                // Immediate read — return bytes from stub SRAM.
-                // The data register's high byte is used as an SRAM address by
-                // the OS; return the byte at that address (all zeroes from the
-                // stub SRAM).
+                // Immediate read — update checksum then return bytes from stub SRAM.
+                // Mirrors `exi::update_sram_checksum` + `sram_transfer_read` in the
+                // native build: checksums at bytes 0x00–0x03 are recomputed from the
+                // data words at 0x0C–0x13 before any read is served.
+                self.update_sram_checksum();
                 self.uart_pending = false;
                 let sram_addr = ((self.channels[ch].data >> 24) & 0x3F) as usize;
                 let mut result = 0u32;

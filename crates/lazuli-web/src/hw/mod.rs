@@ -410,13 +410,16 @@ impl WasmEmulator {
         // forever with EE=1, producing an endless 0x00000500 interrupt loop.
         self.vi.fire_display_interrupts();
 
-        // Sync PI_INTSR to reflect the current DI status.  If any DI source is
-        // now active (enable AND status both set) the VI bit is set;  if none
-        // is active (OS hasn't configured DI registers yet, or all status bits
-        // are still clear from a previous clear) set it unconditionally anyway
-        // so the OS can still service the retrace on the first few frames
-        // before it has fully configured the VI.
-        self.pi_intsr |= PI_INT_VI;
+        // Sync PI_INTSR VI bit with the actual DI register state.
+        // Native `get_active_interrupts` only sets the VI bit when at least
+        // one VI DisplayInterrupt source has both its enable (bit 28) and
+        // status (bit 31) bits set.  If no source is active the bit is
+        // cleared, matching the native write to pi_intsr from pi.rs.
+        if self.vi.any_display_interrupt_active() {
+            self.pi_intsr |= PI_INT_VI;
+        } else {
+            self.pi_intsr &= !PI_INT_VI;
+        }
 
         // Fire PE_FINISH once per frame to unblock GXWaitForDrawDone().
         // The native build generates this via gx::cmd::consume when the CP

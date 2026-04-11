@@ -151,12 +151,72 @@ impl ViState {
         self.read_u16(0x2C)
     }
 
+    /// Compute lines per frame from the programmed VI timing registers.
+    ///
+    /// Mirrors `vi::VideoState::lines_per_frame()` in the native build.
+    ///
+    /// Register sources (all offsets from `VI_BASE`):
+    /// - VTR  (0x00, 16-bit upper halfword): bits 0..4 = equalization_pulse,
+    ///         bits 4..14 = active_video_lines
+    /// - DCR  (0x02, 16-bit lower halfword): bit 2 = field_mode
+    ///         (0 = Double/interlaced, 1 = Single/progressive)
+    /// - VTO  (0x0C, 32-bit): bits 0..10 = pre_blanking_odd,
+    ///         bits 16..26 = post_blanking_odd
+    /// - VTE  (0x10, 32-bit): bits 0..10 = pre_blanking_even,
+    ///         bits 16..26 = post_blanking_even
+    ///
+    /// ```
+    /// halflines_top    = 3*eq + pre_odd  + 2*active + post_odd
+    /// halflines_bottom = 3*eq + pre_even + 2*active + post_even
+    /// halflines_frame  = top + (Double ? bottom : 0)
+    /// lines_per_frame  = halflines_frame / 2
+    /// ```
+    ///
+    /// Falls back to 525 (NTSC default) if `active_video_lines` is zero
+    /// (VI not yet programmed).
+    pub(crate) fn lines_per_frame(&self) -> u32 {
+        // VTR: upper 16-bit halfword of the word at offset 0x00.
+        let word0 = self.read32(0x00);
+        let vtr = (word0 >> 16) as u16;
+        let eq_pulse    = (vtr & 0xF) as u32;           // bits 0..4
+        let active_lines = ((vtr >> 4) & 0x3FF) as u32; // bits 4..14
+
+        if active_lines == 0 {
+            // VI not yet programmed; fall back to NTSC 525.
+            return 525;
+        }
+
+        // DCR: lower 16-bit halfword of the word at offset 0x00.
+        let dcr = (word0 & 0xFFFF) as u16;
+        let field_single = (dcr >> 2) & 1 != 0; // bit 2: 1=Single, 0=Double
+
+        // VTO (offset 0x0C, 32-bit).
+        let vto = self.read32(0x0C);
+        let pre_odd  = (vto & 0x3FF) as u32;         // bits 0..10
+        let post_odd = ((vto >> 16) & 0x3FF) as u32; // bits 16..26
+
+        // VTE (offset 0x10, 32-bit).
+        let vte = self.read32(0x10);
+        let pre_even  = (vte & 0x3FF) as u32;         // bits 0..10
+        let post_even = ((vte >> 16) & 0x3FF) as u32; // bits 16..26
+
+        let halflines_top    = 3 * eq_pulse + pre_odd  + 2 * active_lines + post_odd;
+        let halflines_bottom = 3 * eq_pulse + pre_even + 2 * active_lines + post_even;
+        let halflines_frame  = halflines_top + if field_single { 0 } else { halflines_bottom };
+
+        halflines_frame / 2
+    }
+
     /// Increment the vertical counter by 1 (called once per frame).
     ///
-    /// The counter wraps at 525 lines (NTSC 525-line frame).
+    /// The wrap point is derived from the programmed VI timing registers via
+    /// [`ViState::lines_per_frame`], mirroring the native `vertical_count`
+    /// callback which uses `sys.video.lines_per_frame()`.  Before the VI is
+    /// programmed (all-zero VTR) this falls back to 525 (NTSC).
     pub(crate) fn advance_vcount(&mut self) {
         let current = self.read_u16(0x2C) as u32;
-        let next = (current + 1) % 525;
+        let lines = self.lines_per_frame().max(1);
+        let next = (current + 1) % lines;
         // Write back upper halfword of the VCOUNT word at offset 0x2C.
         self.write_u16(0x2C, next as u16);
     }
