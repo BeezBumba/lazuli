@@ -2294,6 +2294,15 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     emu.add_cpu_cycles(blockCycles);
     emu.advance_decrementer(Math.max(1, Math.floor(blockCycles / 12)));
 
+    // AI sample counter: advance proportional to emulated CPU cycles.
+    // Gekko runs at 486 MHz; the default sample rate is 48 kHz
+    // (10 125 CPU cycles per sample: 486_000_000 / 48_000 = 10_125).
+    // advance_ai() accumulates fractional samples across blocks so no
+    // samples are lost, mirrors the native ai::push_streaming_frame
+    // scheduler event, and asserts PI_INT_AI automatically when AISCNT
+    // crosses AIIT.
+    emu.advance_ai(blockCycles);
+
     // Stuck-PC detection: track how many consecutive blocks leave the PC
     // unchanged.  This catches both "branch to self" tight loops and the
     // raise_exception path where WASM returns 0 without advancing the PC.
