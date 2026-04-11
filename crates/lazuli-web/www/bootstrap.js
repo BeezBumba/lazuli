@@ -885,6 +885,21 @@ function feedStdoutByte(ch) {
 }
 
 /**
+ * Flush any partial line accumulated in stdoutLineBuffer to the apploader
+ * log, even if no trailing newline has been received.
+ *
+ * Call this before emitting diagnostic banners (UART-active, ArenaLo, timeout)
+ * so that OSReport content that was never newline-terminated is still visible
+ * in the apploader window.
+ */
+function flushStdoutLineBuffer() {
+  if (stdoutLineBuffer.length > 0) {
+    appendApploaderLog(stdoutLineBuffer);
+    stdoutLineBuffer = "";
+  }
+}
+
+/**
  * Drain any bytes queued in the EXI UART output buffer (OSReport output)
  * and feed them through the same stdoutLineBuffer pipeline used by the
  * ipl-hle 0xCC007000 direct-write path.
@@ -2473,6 +2488,9 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     // Report UART activity exactly once (bytes may trickle in over many frames).
     if (newUartBytes > 0 && !osUartActiveSeen) {
       osUartActiveSeen = true;
+      // Flush any partial OSReport line so the content is visible before the
+      // activity banner.  OSReport may not always terminate strings with '\n'.
+      flushStdoutLineBuffer();
       appendApploaderLog(
         `[OS] EXI UART active — OSReport is functional (${newUartBytes} bytes)`
       );
@@ -2480,10 +2498,12 @@ function gameLoop(emu, canvas, ctx, timestamp) {
 
     // Detect when OSInit writes a valid ArenaLo (>= 0x80000000 = in main RAM).
     if (currentArenaLo >= 0x80000000) {
+      flushStdoutLineBuffer();
       appendApploaderLog(`[OS] Arena : ${hexU32(currentArenaLo)} - ${hexU32(currentArenaHi)}`);
       osInitBannerDone = true;
     } else if (osPostEntryFrames >= 300) {
       // 300 frames (~5 s) with no valid ArenaLo from OSInit.
+      flushStdoutLineBuffer();
       appendApploaderLog(
         `[OS] Note: ArenaLo still 0 after 300 frames — ` +
         `OSInit may not have run or OSReport may be a NOP in this binary`
