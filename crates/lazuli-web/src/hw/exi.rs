@@ -227,7 +227,11 @@ impl ExiState {
                     // does in `uart_transfer_write`.
                     let data_bytes = data.to_be_bytes();
                     for &byte in &data_bytes[..bytes.min(4)] {
-                        if byte != 0x1B {
+                        // Filter ESC (0x1B) as the native emulator does, and
+                        // null bytes (0x00) which are padding added by OSReport
+                        // when it sends each character as a 2-byte EXI write
+                        // (character in the high byte, 0x00 in the low byte).
+                        if byte != 0x1B && byte != 0x00 {
                             self.uart_output.push(byte);
                         }
                     }
