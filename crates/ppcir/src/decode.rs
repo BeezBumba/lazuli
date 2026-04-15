@@ -57,6 +57,160 @@ impl Decoder {
         else { b.push(IrInst::LoadGpr(ra)); b.push(IrInst::LoadGpr(rb)); b.push(IrInst::I32Add); }
     }
 
+    // ── PSQ helpers ───────────────────────────────────────────────────────────
+
+    /// Emit a GQR-aware psq_l or psq_lu.
+    ///
+    /// If `update` is true the base register `ra` is written back with EA.
+    fn emit_psq_load(&self, b: &mut IrBlock, fd: u8, ra: u8, d: i32, gqr_idx: u8, single: bool, update: bool) {
+        let ea  = b.alloc_local(IrTy::I32);
+        let gqr = b.alloc_local(IrTy::I32);
+
+        // EA = rA + d  (ra == 0 means use 0, but update forms always use rA)
+        b.push(IrInst::LoadGpr(ra));
+        if d != 0 { b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add); }
+        if update {
+            b.push(IrInst::LocalTee(ea));
+            b.push(IrInst::StoreGpr(ra));
+        } else {
+            b.push(IrInst::LocalSet(ea));
+        }
+
+        b.push(IrInst::LoadGqr(gqr_idx));
+        b.push(IrInst::LocalSet(gqr));
+
+        self.psq_load_pair(b, fd, ea, gqr, single);
+    }
+
+    /// Core paired-single load: load PS0 (and optionally PS1) into FPR fd.
+    ///
+    /// `ea` and `gqr` are already-allocated locals holding the effective address
+    /// and GQR register value respectively.
+    fn psq_load_pair(&self, b: &mut IrBlock, fd: u8, ea: IrLocal, gqr: IrLocal, single: bool) {
+        // Load PS0.
+        b.push(IrInst::LocalGet(ea));
+        b.push(IrInst::LocalGet(gqr));
+        b.push(IrInst::PsqLoad);
+        b.push(IrInst::StoreFprPs0(fd));
+
+        if single {
+            // W=1: PS1 = 1.0 (per GameCube architecture manual)
+            b.push(IrInst::F64Const(1.0));
+            b.push(IrInst::StoreFprPs1(fd));
+        } else {
+            // W=0: advance EA by the byte size of one element, then load PS1.
+            let size = b.alloc_local(IrTy::I32);
+            b.push(IrInst::LocalGet(gqr));
+            b.push(IrInst::PsqLoadSize);
+            b.push(IrInst::LocalSet(size));
+
+            b.push(IrInst::LocalGet(ea));
+            b.push(IrInst::LocalGet(size));
+            b.push(IrInst::I32Add);
+            b.push(IrInst::LocalGet(gqr));
+            b.push(IrInst::PsqLoad);
+            b.push(IrInst::StoreFprPs1(fd));
+        }
+    }
+
+    /// Emit a GQR-aware psq_st or psq_stu.
+    fn emit_psq_store(&self, b: &mut IrBlock, fs: u8, ra: u8, d: i32, gqr_idx: u8, single: bool, update: bool) {
+        let ea  = b.alloc_local(IrTy::I32);
+        let gqr = b.alloc_local(IrTy::I32);
+
+        b.push(IrInst::LoadGpr(ra));
+        if d != 0 { b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add); }
+        b.push(IrInst::LocalSet(ea));
+
+        b.push(IrInst::LoadGqr(gqr_idx));
+        b.push(IrInst::LocalSet(gqr));
+
+        self.psq_store_pair(b, fs, ea, gqr, single);
+
+        if update {
+            b.push(IrInst::LocalGet(ea));
+            b.push(IrInst::StoreGpr(ra));
+        }
+    }
+
+    /// Core paired-single store: write PS0 (and optionally PS1) from FPR fs.
+    fn psq_store_pair(&self, b: &mut IrBlock, fs: u8, ea: IrLocal, gqr: IrLocal, single: bool) {
+        // Store PS0 and capture element byte size.
+        let size = b.alloc_local(IrTy::I32);
+        b.push(IrInst::LocalGet(ea));
+        b.push(IrInst::LocalGet(gqr));
+        b.push(IrInst::LoadFprPs0(fs));
+        b.push(IrInst::PsqStore);      // → i32 (byte count)
+        b.push(IrInst::LocalSet(size));
+
+        if !single {
+            // W=0: write PS1 at ea + size.
+            b.push(IrInst::LocalGet(ea));
+            b.push(IrInst::LocalGet(size));
+            b.push(IrInst::I32Add);
+            b.push(IrInst::LocalGet(gqr));
+            b.push(IrInst::LoadFprPs1(fs));
+            b.push(IrInst::PsqStore);
+            b.push(IrInst::Drop);       // discard second element's size
+        }
+    }
+
+    // ── FPSCR helpers ─────────────────────────────────────────────────────────
+
+    /// Update FPSCR[FPRF] (stored bits 12–15) from an f64 result.
+    ///
+    /// Stores:
+    /// - bit 12 = FU (unordered / NaN)  
+    /// - bit 13 = FE (equal to zero)
+    /// - bit 14 = FG (greater than zero)
+    /// - bit 15 = FL (less than zero)
+    /// - bit 16 = C (class, approximated as FL | FU; bit 16 cleared otherwise)
+    ///
+    /// The FPRF update is applied in-place to FPSCR — the caller's job is to
+    /// make sure the result is already in the FPR before calling this helper.
+    fn update_fprf(&self, b: &mut IrBlock, val: IrLocal) {
+        const FPRF_MASK: u32 = 0x1F << 12; // bits 12-16
+
+        // Allocate locals for each flag (0 or 1).
+        let l_fu = b.alloc_local(IrTy::I32);
+        let l_fe = b.alloc_local(IrTy::I32);
+        let l_fg = b.alloc_local(IrTy::I32);
+        let l_fl = b.alloc_local(IrTy::I32);
+
+        // FU = (val != val), i.e. NaN: F64Eq returns 0 for NaN, so negate.
+        b.push(IrInst::LocalGet(val)); b.push(IrInst::LocalGet(val));
+        b.push(IrInst::F64Eq);
+        b.push(IrInst::I32Const(1)); b.push(IrInst::I32Xor); // NOT
+        b.push(IrInst::LocalSet(l_fu));
+
+        // FE = (val == 0.0)  — WASM f64.eq treats +0 == -0 correctly.
+        b.push(IrInst::LocalGet(val)); b.push(IrInst::F64Const(0.0));
+        b.push(IrInst::F64Eq);
+        b.push(IrInst::LocalSet(l_fe));
+
+        // FG = (val > 0.0)
+        b.push(IrInst::LocalGet(val)); b.push(IrInst::F64Const(0.0));
+        b.push(IrInst::F64Gt);
+        b.push(IrInst::LocalSet(l_fg));
+
+        // FL = (val < 0.0)
+        b.push(IrInst::LocalGet(val)); b.push(IrInst::F64Const(0.0));
+        b.push(IrInst::F64Lt);
+        b.push(IrInst::LocalSet(l_fl));
+
+        // FPSCR = (FPSCR & ~FPRF_MASK) | (FL<<15 | FG<<14 | FE<<13 | FU<<12)
+        b.push(IrInst::LoadFpscr);
+        b.push(IrInst::I32Const(!FPRF_MASK as i32));
+        b.push(IrInst::I32And);
+
+        Self::push_shifted_or(b, l_fl, 15);
+        Self::push_shifted_or(b, l_fg, 14);
+        Self::push_shifted_or(b, l_fe, 13);
+        Self::push_shifted_or(b, l_fu, 12);
+
+        b.push(IrInst::StoreFpscr);
+    }
+
     // ── CR helpers ────────────────────────────────────────────────────────────
 
     fn update_cr_signed(&self, b: &mut IrBlock, cr_fd: u8, loc: IrLocal) {
@@ -332,7 +486,10 @@ impl Decoder {
         let fb = ins.fpr_b() as u8;
         let fc = ins.fpr_c() as u8;
         self.fma_slot(b, fa, fb, fc, false, sub, neg, single);
+        let lv = b.alloc_local(IrTy::F64);
+        b.push(IrInst::LocalTee(lv));
         b.push(IrInst::StoreFprPs0(fd));
+        self.update_fprf(b, lv);
     }
 
     /// Emit a paired-single FMA-family instruction.
@@ -1113,14 +1270,14 @@ impl Decoder {
             Opcode::Stfdx => { let fs=ins.fpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::WriteF64); }
 
             // ── Scalar FPU arithmetic ─────────────────────────────────────────
-            Opcode::Fadd  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Add); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fadds => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Add); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fsub  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sub); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fsubs => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sub); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fmul  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fc=ins.fpr_c() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fc)); b.push(IrInst::F64Mul); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fmuls => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fc=ins.fpr_c() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fc)); b.push(IrInst::F64Mul); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fdiv  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Div); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fdivs => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Div); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
+            Opcode::Fadd  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Add);               let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fadds => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Add); b.push(IrInst::F64RoundToSingle); let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fsub  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sub);               let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fsubs => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sub); b.push(IrInst::F64RoundToSingle); let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fmul  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fc=ins.fpr_c() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fc)); b.push(IrInst::F64Mul);               let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fmuls => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fc=ins.fpr_c() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fc)); b.push(IrInst::F64Mul); b.push(IrInst::F64RoundToSingle); let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fdiv  => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Div);               let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fdivs => { let fd=ins.fpr_d() as u8; let fa=ins.fpr_a() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fa)); b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Div); b.push(IrInst::F64RoundToSingle); let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
             Opcode::Fmadd  => { self.emit_fma_scalar(b,ins,false,false,false); }
             Opcode::Fmadds => { self.emit_fma_scalar(b,ins,false,false,true); }
             Opcode::Fmsub  => { self.emit_fma_scalar(b,ins,true,false,false); }
@@ -1130,9 +1287,9 @@ impl Decoder {
             Opcode::Fnmsub  => { self.emit_fma_scalar(b,ins,true,true,false); }
             Opcode::Fnmsubs => { self.emit_fma_scalar(b,ins,true,true,true); }
             Opcode::Fmr   => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fneg  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Neg); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fabs  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Abs); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Frsp  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
+            Opcode::Fneg  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Neg);             let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fabs  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Abs);             let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Frsp  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64RoundToSingle); let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
             Opcode::Fctiw => {
                 // Convert to Integer Word, rounding per FPSCR[RN] (default = round to nearest even).
                 // The result integer is stored as a raw bit-pattern in the low 32 bits of the FPR
@@ -1157,12 +1314,70 @@ impl Decoder {
                 b.push(IrInst::F64ReinterpretI64);   // i64 → f64 bitcast
                 b.push(IrInst::StoreFprPs0(fd));
             }
-            Opcode::Fsqrt  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sqrt); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Fsqrts => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sqrt); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs0(fd)); }
+            Opcode::Fsqrt  => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sqrt);             let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
+            Opcode::Fsqrts => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; b.push(IrInst::LoadFprPs0(fb)); b.push(IrInst::F64Sqrt); b.push(IrInst::F64RoundToSingle); let lv=b.alloc_local(IrTy::F64); b.push(IrInst::LocalTee(lv)); b.push(IrInst::StoreFprPs0(fd)); self.update_fprf(b,lv); }
             Opcode::Fres    => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; self.emit_recip(b,fd,fb,false,false); }
             Opcode::Frsqrte => { let fd=ins.fpr_d() as u8; let fb=ins.fpr_b() as u8; self.emit_recip(b,fd,fb,true,false); }
-            Opcode::Mffs    => { let fd=ins.fpr_d() as u8; b.push(IrInst::F64Const(0.0)); b.push(IrInst::StoreFprPs0(fd)); }
-            Opcode::Mtfsf | Opcode::Mtfsb0 | Opcode::Mtfsb1 | Opcode::Mtfsfi => { /* no-op */ }
+            Opcode::Mffs    => {
+                // Read FPSCR bits as a raw i32, zero-extend to i64, reinterpret
+                // as f64 bit-pattern and store in PS0. PS1 is left unchanged
+                // (mirrors what the native JIT does — PS1 is undefined for mffs).
+                let fd = ins.fpr_d() as u8;
+                b.push(IrInst::LoadFpscr);
+                b.push(IrInst::I64ExtendI32U);
+                b.push(IrInst::F64ReinterpretI64);
+                b.push(IrInst::StoreFprPs0(fd));
+            }
+            Opcode::Mtfsf => {
+                // mtfsf FM, frB — update FPSCR fields selected by the 8-bit FM mask.
+                // FM bit i=1 means update FPSCR field i (each field = 4 bits).
+                // The source is the low 32 bits of the f64 bit-pattern in frB.PS0.
+                let fm = ins.field_mtfsf_fm() as u32;
+                let mut mask = 0u32;
+                for i in 0..8u32 { if (fm >> (7 - i)) & 1 != 0 { mask |= 0xF << (28 - i * 4); } }
+                let fb = ins.fpr_b() as u8;
+                // Extract low 32 bits of frB.PS0 bit-pattern.
+                b.push(IrInst::LoadFprPs0(fb));
+                b.push(IrInst::I64ReinterpretF64);
+                b.push(IrInst::I32WrapI64);  // low 32 bits = FPSCR-format bits
+                b.push(IrInst::I32Const(mask as i32));
+                b.push(IrInst::I32And);      // masked source bits
+                // (fpscr & ~mask) | (frB_bits & mask)
+                b.push(IrInst::LoadFpscr);
+                b.push(IrInst::I32Const(!mask as i32));
+                b.push(IrInst::I32And);
+                b.push(IrInst::I32Or);
+                b.push(IrInst::StoreFpscr);
+            }
+            Opcode::Mtfsb0 => {
+                // mtfsb0 crbD — clear FPSCR bit crbD (PPC bit 0=MSB → stored bit 31).
+                let stored_bit = 31u32 - ins.field_crbd() as u32;
+                b.push(IrInst::LoadFpscr);
+                b.push(IrInst::I32Const(!(1u32 << stored_bit) as i32));
+                b.push(IrInst::I32And);
+                b.push(IrInst::StoreFpscr);
+            }
+            Opcode::Mtfsb1 => {
+                // mtfsb1 crbD — set FPSCR bit crbD.
+                let stored_bit = 31u32 - ins.field_crbd() as u32;
+                b.push(IrInst::LoadFpscr);
+                b.push(IrInst::I32Const((1u32 << stored_bit) as i32));
+                b.push(IrInst::I32Or);
+                b.push(IrInst::StoreFpscr);
+            }
+            Opcode::Mtfsfi => {
+                // mtfsfi crfD, IMM — write IMM (4 bits) into FPSCR field crfD.
+                let crfd = ins.field_crfd() as u32;
+                let shift = 28 - crfd * 4;
+                let mask = 0xFu32 << shift;
+                let val  = (ins.field_uimm() as u32 & 0xF) << shift;
+                b.push(IrInst::LoadFpscr);
+                b.push(IrInst::I32Const(!mask as i32));
+                b.push(IrInst::I32And);
+                b.push(IrInst::I32Const(val as i32));
+                b.push(IrInst::I32Or);
+                b.push(IrInst::StoreFpscr);
+            }
             Opcode::Fcmpu | Opcode::Fcmpo => {
                 let cr = ins.field_crfd() as u8;
                 let fa = ins.fpr_a() as u8;
@@ -1230,11 +1445,70 @@ impl Decoder {
                 // For ps1: fa.ps1 * c1 + fb.ps1
                 b.push(IrInst::LoadFprPs1(fb)); b.push(IrInst::LoadFprPs1(fa)); b.push(IrInst::LocalGet(c1)); b.push(IrInst::F64Mul); b.push(IrInst::F64Add); b.push(IrInst::F64RoundToSingle); b.push(IrInst::StoreFprPs1(fd));
             }
-            // psq_l / psq_st: quantized loads/stores — treat as lfs/stfs for now
-            Opcode::PsqL  => { let fd=ins.fpr_d() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32; self.push_ea_d(b,ra,d); b.push(IrInst::ReadU32); b.push(IrInst::F64PromoteSingleBits); b.push(IrInst::StoreFprPs0(fd)); b.push(IrInst::LoadFprPs0(fd)); b.push(IrInst::StoreFprPs1(fd)); }
-            Opcode::PsqSt => { let fs=ins.fpr_s() as u8; let ra=ins.gpr_a() as u8; let d=ins.field_offset() as i32; self.push_ea_d(b,ra,d); b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::I32DemoteToSingleBits); b.push(IrInst::WriteU32); }
-            Opcode::PsqLx  => { let fd=ins.fpr_d() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::ReadU32); b.push(IrInst::F64PromoteSingleBits); b.push(IrInst::StoreFprPs0(fd)); b.push(IrInst::LoadFprPs0(fd)); b.push(IrInst::StoreFprPs1(fd)); }
-            Opcode::PsqStx => { let fs=ins.fpr_s() as u8; let ra=ins.gpr_a() as u8; let rb=ins.gpr_b() as u8; self.push_ea_x(b,ra,rb); b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::I32DemoteToSingleBits); b.push(IrInst::WriteU32); }
+            // ── Paired-single quantized loads/stores ──────────────────────────
+            // Each instruction reads the GQR[i] register at runtime to determine
+            // the element type (float, u8, u16, i8, i16) and scale factor.
+            // W=0 means paired (load/store both PS0 and PS1 with adjacent elements),
+            // W=1 means single (load/store only PS0; for loads PS1 = 1.0).
+            Opcode::PsqL => {
+                let fd = ins.fpr_d() as u8;
+                let ra = ins.gpr_a() as u8;
+                let d  = ins.field_ps_offset() as i32;
+                let i  = ins.field_ps_i() as u8;   // GQR index 0-7
+                let w  = ins.field_ps_w() != 0;    // true → single element
+                self.emit_psq_load(b, fd, ra, d, i, w, false);
+            }
+            Opcode::PsqLu => {
+                let fd = ins.fpr_d() as u8;
+                let ra = ins.gpr_a() as u8;
+                let d  = ins.field_ps_offset() as i32;
+                let i  = ins.field_ps_i() as u8;
+                let w  = ins.field_ps_w() != 0;
+                self.emit_psq_load(b, fd, ra, d, i, w, true);
+            }
+            Opcode::PsqLx => {
+                let fd = ins.fpr_d() as u8;
+                let ra = ins.gpr_a() as u8;
+                let rb = ins.gpr_b() as u8;
+                let i  = ins.field_ps_i() as u8;
+                let w  = ins.field_ps_w() != 0;
+                // EA = (rA|0) + rB  (no displacement, no update)
+                self.push_ea_x(b, ra, rb);
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LocalSet(ea));
+                let gqr = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGqr(i)); b.push(IrInst::LocalSet(gqr));
+                self.psq_load_pair(b, fd, ea, gqr, w);
+            }
+            Opcode::PsqSt => {
+                let fs = ins.fpr_s() as u8;
+                let ra = ins.gpr_a() as u8;
+                let d  = ins.field_ps_offset() as i32;
+                let i  = ins.field_ps_i() as u8;
+                let w  = ins.field_ps_w() != 0;
+                self.emit_psq_store(b, fs, ra, d, i, w, false);
+            }
+            Opcode::PsqStu => {
+                let fs = ins.fpr_s() as u8;
+                let ra = ins.gpr_a() as u8;
+                let d  = ins.field_ps_offset() as i32;
+                let i  = ins.field_ps_i() as u8;
+                let w  = ins.field_ps_w() != 0;
+                self.emit_psq_store(b, fs, ra, d, i, w, true);
+            }
+            Opcode::PsqStx => {
+                let fs = ins.fpr_s() as u8;
+                let ra = ins.gpr_a() as u8;
+                let rb = ins.gpr_b() as u8;
+                let i  = ins.field_ps_i() as u8;
+                let w  = ins.field_ps_w() != 0;
+                self.push_ea_x(b, ra, rb);
+                let ea = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LocalSet(ea));
+                let gqr = b.alloc_local(IrTy::I32);
+                b.push(IrInst::LoadGqr(i)); b.push(IrInst::LocalSet(gqr));
+                self.psq_store_pair(b, fs, ea, gqr, w);
+            }
 
             // ── Branches ──────────────────────────────────────────────────────
             Opcode::B => {
@@ -1303,6 +1577,14 @@ impl Decoder {
                     273 => IrInst::LoadSprg(1),
                     274 => IrInst::LoadSprg(2),
                     275 => IrInst::LoadSprg(3),
+                    912 => IrInst::LoadGqr(0),
+                    913 => IrInst::LoadGqr(1),
+                    914 => IrInst::LoadGqr(2),
+                    915 => IrInst::LoadGqr(3),
+                    916 => IrInst::LoadGqr(4),
+                    917 => IrInst::LoadGqr(5),
+                    918 => IrInst::LoadGqr(6),
+                    919 => IrInst::LoadGqr(7),
                     _   => IrInst::I32Const(0),
                 };
                 b.push(load); b.push(IrInst::StoreGpr(rd));
@@ -1322,6 +1604,14 @@ impl Decoder {
                     273 => b.push(IrInst::StoreSprg(1)),
                     274 => b.push(IrInst::StoreSprg(2)),
                     275 => b.push(IrInst::StoreSprg(3)),
+                    912 => b.push(IrInst::StoreGqr(0)),
+                    913 => b.push(IrInst::StoreGqr(1)),
+                    914 => b.push(IrInst::StoreGqr(2)),
+                    915 => b.push(IrInst::StoreGqr(3)),
+                    916 => b.push(IrInst::StoreGqr(4)),
+                    917 => b.push(IrInst::StoreGqr(5)),
+                    918 => b.push(IrInst::StoreGqr(6)),
+                    919 => b.push(IrInst::StoreGqr(7)),
                     _   => b.push(IrInst::Drop),
                 }
             }
@@ -1772,25 +2062,6 @@ impl Decoder {
                 b.push(IrInst::LoadFprPs1(fa)); b.push(IrInst::LocalSet(la));
                 b.push(IrInst::LoadFprPs1(fb)); b.push(IrInst::LocalSet(lb));
                 self.update_cr_float(b, cr, la, lb);
-            }
-
-            // ── PS quantized load / store with update ─────────────────────────
-            Opcode::PsqLu => {
-                let fd = ins.fpr_d() as u8; let ra = ins.gpr_a() as u8; let d = ins.field_offset() as i32;
-                let ea = b.alloc_local(IrTy::I32);
-                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
-                b.push(IrInst::LocalTee(ea)); b.push(IrInst::StoreGpr(ra));
-                b.push(IrInst::LocalGet(ea));
-                b.push(IrInst::ReadU32); b.push(IrInst::F64PromoteSingleBits);
-                b.push(IrInst::StoreFprPs0(fd)); b.push(IrInst::LoadFprPs0(fd)); b.push(IrInst::StoreFprPs1(fd));
-            }
-            Opcode::PsqStu => {
-                let fs = ins.fpr_s() as u8; let ra = ins.gpr_a() as u8; let d = ins.field_offset() as i32;
-                let ea = b.alloc_local(IrTy::I32);
-                b.push(IrInst::LoadGpr(ra)); b.push(IrInst::I32Const(d)); b.push(IrInst::I32Add);
-                b.push(IrInst::LocalTee(ea));
-                b.push(IrInst::LoadFprPs0(fs)); b.push(IrInst::I32DemoteToSingleBits); b.push(IrInst::WriteU32);
-                b.push(IrInst::LocalGet(ea)); b.push(IrInst::StoreGpr(ra));
             }
 
             // ── Unimplemented ─────────────────────────────────────────────────
