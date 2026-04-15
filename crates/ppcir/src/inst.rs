@@ -54,6 +54,10 @@ pub enum IrInst {
     LoadTbLo,
     LoadTbHi,
     LoadDec,
+    /// `() → (i32)` — load GQR[n] (Graphics Quantization Register, n ∈ 0..=7).
+    LoadGqr(u8),
+    /// `() → (i32)` — load FPSCR as raw i32 bits.
+    LoadFpscr,
 
     // ─── Guest register stores ────────────────────────────────────────────────
     StoreGpr(u8),        // (i32) → ()
@@ -69,6 +73,10 @@ pub enum IrInst {
     StoreSprg(u8),
     StoreDec,
     StorePC,             // write CPU's pc field
+    /// `(i32) → ()` — store i32 to GQR[n] (n ∈ 0..=7).
+    StoreGqr(u8),
+    /// `(i32) → ()` — store raw i32 bits to FPSCR.
+    StoreFpscr,
 
     // ─── Integer arithmetic ───────────────────────────────────────────────────
     I32Add, I32Sub, I32Mul, I32DivS, I32DivU,
@@ -138,10 +146,34 @@ pub enum IrInst {
     I64ShrS32,
     /// `(i64) → (i32)` — logical shift right by 32, then wrap to i32.
     I64ShrU32,
+    /// `(f64) → (i64)` — reinterpret f64 bit-pattern as i64 (bitcast, no numeric conversion).
+    /// Used by `mtfsf` to read raw FPR bits as an integer.
+    I64ReinterpretF64,
+    /// `(i64) → (i32)` — wrap i64 to i32 (take low 32 bits).
+    /// Used by `mtfsf` to extract the low 32 bits of an FPR's i64 bit-pattern.
+    I32WrapI64,
 
     // ─── Memory (via hook calls) ──────────────────────────────────────────────
     ReadU8, ReadU16, ReadU32, ReadF64,
     WriteU8, WriteU16, WriteU32, WriteF64,
+
+    // ─── Quantized paired-single memory (via hook calls) ─────────────────────
+    /// `(addr: i32, gqr: i32) → (f64)` — load one dequantized element.
+    ///
+    /// Reads 1, 2, or 4 bytes from guest memory at `addr` depending on
+    /// `gqr.load_type`, applies `gqr.load_scale`, and returns the f64 result.
+    PsqLoad,
+    /// `(addr: i32, gqr: i32, val: f64) → (i32)` — quantize and store one element.
+    ///
+    /// Converts `val` per `gqr.store_type` / `gqr.store_scale`, writes 1, 2,
+    /// or 4 bytes to guest memory at `addr`, and returns the byte count written.
+    PsqStore,
+    /// `(gqr: i32) → (i32)` — return the byte size of one load element.
+    ///
+    /// Extracts `gqr.load_type` from bits \[18:16\] and returns 4 for float,
+    /// 2 for u16/i16, and 1 for u8/i8.  Used to advance the address between
+    /// the first and second element of a paired load (W=0).
+    PsqLoadSize,
 
     // ─── Control flow (terminal) ──────────────────────────────────────────────
     /// Return a compile-time constant PC.

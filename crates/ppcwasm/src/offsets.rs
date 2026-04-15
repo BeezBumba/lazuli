@@ -50,6 +50,10 @@ pub struct RegOffsets {
     pub sprg: [u64; 4],
     /// Byte offset of `Cpu::supervisor.misc.dec` (DEC, SPR 22).
     pub dec: u64,
+    /// Byte offsets of `Cpu::supervisor.gq[0..8]` (GQR0–7, SPR 912–919).
+    pub gqr: [u64; 8],
+    /// Byte offset of `Cpu::user.fpscr` (FPSCR).
+    pub fpscr: u64,
 }
 
 impl RegOffsets {
@@ -73,6 +77,12 @@ impl RegOffsets {
 
         let srr_base  = offset_of!(Cpu, supervisor.exception.srr) as u64;
         let sprg_base = offset_of!(Cpu, supervisor.exception.sprg) as u64;
+        let gqr_base  = offset_of!(Cpu, supervisor.gq) as u64;
+
+        let mut gqr = [0u64; 8];
+        for i in 0..8usize {
+            gqr[i] = gqr_base + (i as u64) * 4;
+        }
 
         RegOffsets {
             pc,
@@ -90,6 +100,8 @@ impl RegOffsets {
             srr1: srr_base + 4,
             sprg: [sprg_base, sprg_base + 4, sprg_base + 8, sprg_base + 12],
             dec: offset_of!(Cpu, supervisor.misc.dec) as u64,
+            gqr,
+            fpscr: offset_of!(Cpu, user.fpscr) as u64,
         }
     }
 }

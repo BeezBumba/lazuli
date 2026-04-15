@@ -33,6 +33,8 @@ const TY_II_VOID:   u32 = 1; // (i32, i32) -> ()
 const TY_I_VOID:    u32 = 2; // (i32) -> ()
 const TY_I_F64:     u32 = 3; // (i32) -> f64
 const TY_IF64_VOID: u32 = 4; // (i32, f64) -> ()
+const TY_II_F64:    u32 = 5; // (i32, i32) -> f64  — psq_load
+const TY_IIF64_I32: u32 = 6; // (i32, i32, f64) -> i32  — psq_store
 const TY_EXECUTE:   u32 = TY_I32_I32;
 
 // ─── MemArg helpers ───────────────────────────────────────────────────────────
@@ -77,6 +79,8 @@ pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
     types.ty().function([ValType::I32], []);                                // 2
     types.ty().function([ValType::I32], [ValType::F64]);                    // 3
     types.ty().function([ValType::I32, ValType::F64], []);                  // 4
+    types.ty().function([ValType::I32, ValType::I32], [ValType::F64]);      // 5  psq_load
+    types.ty().function([ValType::I32, ValType::I32, ValType::F64], [ValType::I32]); // 6  psq_store
 
     let mut isec = ImportSection::new();
     isec.import("env", "memory", EntityType::Memory(MemoryType {
@@ -92,6 +96,9 @@ pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
     isec.import(h, "write_u32",       EntityType::Function(TY_II_VOID));
     isec.import(h, "write_f64",       EntityType::Function(TY_IF64_VOID));
     isec.import(h, "raise_exception", EntityType::Function(TY_I_VOID));
+    isec.import(h, "psq_load",        EntityType::Function(TY_II_F64));
+    isec.import(h, "psq_store",       EntityType::Function(TY_IIF64_I32));
+    isec.import(h, "psq_load_size",   EntityType::Function(TY_I32_I32));
 
     let mut fsec = FunctionSection::new();
     fsec.function(TY_EXECUTE);
@@ -191,6 +198,8 @@ fn emit_inst(
         IrInst::LoadTbLo       => load_i32(off.tb_lo, b),
         IrInst::LoadTbHi       => load_i32(off.tb_hi, b),
         IrInst::LoadDec        => load_i32(off.dec, b),
+        IrInst::LoadGqr(n)     => load_i32(off.gqr[*n as usize], b),
+        IrInst::LoadFpscr      => load_i32(off.fpscr, b),
 
         // ── Guest register stores ──────────────────────────────────────────────
         IrInst::StoreGpr(r)    => store_i32(off.gpr[*r as usize], si32, b),
@@ -206,6 +215,8 @@ fn emit_inst(
         IrInst::StoreSprg(n)   => store_i32(off.sprg[*n as usize], si32, b),
         IrInst::StoreDec       => store_i32(off.dec, si32, b),
         IrInst::StorePC        => store_i32(off.pc, si32, b),
+        IrInst::StoreGqr(n)    => store_i32(off.gqr[*n as usize], si32, b),
+        IrInst::StoreFpscr     => store_i32(off.fpscr, si32, b),
 
         // ── Integer arithmetic ─────────────────────────────────────────────────
         IrInst::I32Add   => b.push(Instruction::I32Add),
@@ -359,6 +370,8 @@ fn emit_inst(
             b.push(Instruction::I64ShrU);
             b.push(Instruction::I32WrapI64);
         }
+        IrInst::I64ReinterpretF64 => b.push(Instruction::I64ReinterpretF64),
+        IrInst::I32WrapI64        => b.push(Instruction::I32WrapI64),
 
         // ── Memory access via host hooks ───────────────────────────────────────
         // addr is on top of stack; call pops it, pushes result.
@@ -371,6 +384,14 @@ fn emit_inst(
         IrInst::WriteU16 => b.push(Instruction::Call(imports::WRITE_U16)),
         IrInst::WriteU32 => b.push(Instruction::Call(imports::WRITE_U32)),
         IrInst::WriteF64 => b.push(Instruction::Call(imports::WRITE_F64)),
+
+        // ── Quantized paired-single memory ────────────────────────────────────
+        // Stack: (addr i32, gqr i32) → f64
+        IrInst::PsqLoad     => b.push(Instruction::Call(imports::PSQ_LOAD)),
+        // Stack: (addr i32, gqr i32, val f64) → i32 (byte count)
+        IrInst::PsqStore    => b.push(Instruction::Call(imports::PSQ_STORE)),
+        // Stack: (gqr i32) → i32 (byte count per load element)
+        IrInst::PsqLoadSize => b.push(Instruction::Call(imports::PSQ_LOAD_SIZE)),
 
         // ── Control flow ──────────────────────────────────────────────────────
 

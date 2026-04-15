@@ -1449,6 +1449,141 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       }
       pushDebugEvent(`⚡ exception(${kind}) at ${pcContext}`);
     },
+
+    // ── Quantized paired-single memory hooks ─────────────────────────────────
+    //
+    // These implement the GameCube Graphics Quantization Register (GQR) logic.
+    // Each GQR is a 32-bit value with:
+    //   bits [2:0]   store_type  (0=float, 4=u8, 5=u16, 6=i8, 7=i16)
+    //   bits [13:8]  store_scale (signed 6-bit scale factor)
+    //   bits [18:16] load_type
+    //   bits [29:24] load_scale
+
+    /**
+     * Load one dequantized element from guest memory.
+     * @param {number} addr  Guest physical address (i32)
+     * @param {number} gqr   GQR register value (i32, interpreted as u32)
+     * @returns {number}     Dequantized f64 value
+     */
+    psq_load(addr, gqr) {
+      addr = addr >>> 0;
+      gqr  = gqr  >>> 0;
+      addr &= PHYS_MASK;
+      const loadType  = (gqr >>> 16) & 7;
+      const loadScale = (gqr >>> 24) & 63;
+      // The scale is a 6-bit signed value: if bit 5 is set it is negative.
+      const scale = loadScale >= 32 ? loadScale - 64 : loadScale;
+      // Dequantize factor: 2^(-scale) for loads.
+      const factor = scale >= 0 ? 1.0 / (1 << scale) : (1 << (-scale));
+
+      switch (loadType) {
+        case 0: { // float — 4 bytes, no scaling
+          if (addr + 3 >= r.length) return 0.0;
+          const bits = (((r[addr] << 24) | (r[addr+1] << 16) | (r[addr+2] << 8) | r[addr+3]) >>> 0);
+          // Reinterpret u32 as IEEE-754 f32 then promote to f64.
+          const buf = new ArrayBuffer(4);
+          new Uint32Array(buf)[0] = bits;
+          return new Float32Array(buf)[0];
+        }
+        case 4: { // u8 — 1 byte, scale
+          const byte = addr < r.length ? r[addr] : 0;
+          return byte * factor;
+        }
+        case 5: { // u16 — 2 bytes big-endian, scale
+          if (addr + 1 >= r.length) return 0.0;
+          const val = ((r[addr] << 8) | r[addr+1]) & 0xFFFF;
+          return val * factor;
+        }
+        case 6: { // i8 — 1 byte signed, scale
+          const byte = addr < r.length ? r[addr] : 0;
+          return ((byte << 24) >> 24) * factor; // sign-extend via arithmetic shift
+        }
+        case 7: { // i16 — 2 bytes big-endian signed, scale
+          if (addr + 1 >= r.length) return 0.0;
+          const val = ((r[addr] << 8) | r[addr+1]) & 0xFFFF;
+          return (((val << 16) >> 16)) * factor; // sign-extend via arithmetic shift
+        }
+        default: return 0.0; // reserved types
+      }
+    },
+
+    /**
+     * Quantize and store one element to guest memory.
+     * @param {number} addr  Guest physical address (i32)
+     * @param {number} gqr   GQR register value (i32)
+     * @param {number} val   f64 value to store
+     * @returns {number}     Byte count written (1, 2, or 4) as i32
+     */
+    psq_store(addr, gqr, val) {
+      addr = addr >>> 0;
+      gqr  = gqr  >>> 0;
+      addr &= PHYS_MASK;
+      const storeType  = gqr & 7;
+      const storeScale = (gqr >>> 8) & 63;
+      const scale = storeScale >= 32 ? storeScale - 64 : storeScale;
+      // Quantize factor: 2^scale for stores (inverse of load).
+      const factor = scale >= 0 ? (1 << scale) : 1.0 / (1 << (-scale));
+
+      switch (storeType) {
+        case 0: { // float — 4 bytes, no scaling
+          const buf = new ArrayBuffer(4);
+          new Float32Array(buf)[0] = val;
+          const bits = new Uint32Array(buf)[0] >>> 0;
+          if (addr + 3 < r.length) {
+            r[addr]   = (bits >>> 24) & 0xFF;
+            r[addr+1] = (bits >>> 16) & 0xFF;
+            r[addr+2] = (bits >>>  8) & 0xFF;
+            r[addr+3] =  bits         & 0xFF;
+          }
+          return 4;
+        }
+        case 4: { // u8
+          const q = Math.max(0, Math.min(255, (val * factor) | 0));
+          if (addr < r.length) r[addr] = q & 0xFF;
+          return 1;
+        }
+        case 5: { // u16
+          const q = Math.max(0, Math.min(65535, (val * factor) | 0));
+          if (addr + 1 < r.length) {
+            r[addr]   = (q >> 8) & 0xFF;
+            r[addr+1] =  q       & 0xFF;
+          }
+          return 2;
+        }
+        case 6: { // i8
+          const q = Math.max(-128, Math.min(127, (val * factor) | 0));
+          if (addr < r.length) r[addr] = q & 0xFF;
+          return 1;
+        }
+        case 7: { // i16
+          const q = Math.max(-32768, Math.min(32767, (val * factor) | 0));
+          if (addr + 1 < r.length) {
+            r[addr]   = (q >> 8) & 0xFF;
+            r[addr+1] =  q       & 0xFF;
+          }
+          return 2;
+        }
+        default: return 4; // reserved types — treat as float
+      }
+    },
+
+    /**
+     * Return the byte size of one load element based on GQR.load_type.
+     * @param {number} gqr  GQR register value (i32)
+     * @returns {number}    1, 2, or 4 as i32
+     */
+    psq_load_size(gqr) {
+      gqr = gqr >>> 0;
+      const loadType = (gqr >>> 16) & 7;
+      switch (loadType) {
+        case 0:  return 4;  // float
+        case 4:             // u8
+        case 6:  return 1;  // i8
+        case 5:             // u16
+        case 7:  return 2;  // i16
+        default: return 4;  // reserved — treat as float
+      }
+    },
   };
 }
 

@@ -13,6 +13,9 @@
 /// 6  write_u32          (i32, i32) -> ()
 /// 7  write_f64          (i32, f64) -> ()
 /// 8  raise_exception    (i32) -> ()
+/// 9  psq_load           (i32, i32) -> f64
+/// 10 psq_store          (i32, i32, f64) -> i32
+/// 11 psq_load_size      (i32) -> i32
 /// ```
 pub mod imports {
     pub const READ_U8:          u32 = 0;
@@ -24,8 +27,11 @@ pub mod imports {
     pub const WRITE_U32:        u32 = 6;
     pub const WRITE_F64:        u32 = 7;
     pub const RAISE_EXCEPTION:  u32 = 8;
+    pub const PSQ_LOAD:         u32 = 9;
+    pub const PSQ_STORE:        u32 = 10;
+    pub const PSQ_LOAD_SIZE:    u32 = 11;
     /// Total number of imported functions. `execute` is at function index `COUNT`.
-    pub const COUNT:            u32 = 9;
+    pub const COUNT:            u32 = 12;
 }
 
 /// A PowerPC basic block compiled to WebAssembly bytecode.
