@@ -30,8 +30,12 @@ pub mod imports {
     pub const PSQ_LOAD:         u32 = 9;
     pub const PSQ_STORE:        u32 = 10;
     pub const PSQ_LOAD_SIZE:    u32 = 11;
+    /// Invalidate the JIT block at the given guest address (icbi).
+    pub const ICBI:             u32 = 12;
+    /// Flush the entire instruction-cache (isync / sync).
+    pub const ISYNC:            u32 = 13;
     /// Total number of imported functions. `execute` is at function index `COUNT`.
-    pub const COUNT:            u32 = 12;
+    pub const COUNT:            u32 = 14;
 }
 
 /// A PowerPC basic block compiled to WebAssembly bytecode.
@@ -62,6 +66,11 @@ pub mod imports {
 /// | `write_u32`       | `(i32, i32) -> ()`     |
 /// | `write_f64`       | `(i32, f64) -> ()`     |
 /// | `raise_exception` | `(i32) -> ()`          |
+/// | `psq_load`        | `(i32, i32) -> f64`    |
+/// | `psq_store`       | `(i32, i32, f64) -> i32` |
+/// | `psq_load_size`   | `(i32) -> i32`         |
+/// | `icbi`            | `(i32) -> ()`          |
+/// | `isync`           | `() -> ()`             |
 #[derive(Debug, Clone)]
 pub struct WasmBlock {
     /// Raw WebAssembly binary module bytes.

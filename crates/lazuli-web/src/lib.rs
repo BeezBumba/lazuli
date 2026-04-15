@@ -176,6 +176,16 @@ pub struct WasmEmulator {
     /// (0xA8) command.  JavaScript reads this after `take_dma_dirty()` to
     /// format the `[lazuli] DI: DVD Read` log entry in the apploader-log panel.
     pub(crate) last_di_disc_offset: u32,
+    /// 16 KiB Gekko L2 cache-as-RAM region.
+    ///
+    /// GameCube software can lock the L2 cache and use it as fast scratch RAM
+    /// mapped at `0xE000_0000`–`0xE003_FFFF`.  Many games store physics
+    /// scratch buffers, temporary vertex data, and thread stacks here.
+    ///
+    /// Matches the native emulator's 16 KiB L2 allocation.  JavaScript routes
+    /// guest reads/writes to `0xE000_xxxx` to/from this buffer via the
+    /// `l2c_ptr()` / `l2c_size()` exports.
+    pub(crate) l2c: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -222,6 +232,7 @@ impl WasmEmulator {
             last_dma_addr: 0,
             last_dma_len: 0,
             last_di_disc_offset: 0,
+            l2c: vec![0u8; 16 * 1024],
         }
     }
 }
