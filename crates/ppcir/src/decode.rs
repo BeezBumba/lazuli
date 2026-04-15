@@ -164,7 +164,9 @@ impl Decoder {
     /// - bit 13 = FE (equal to zero)
     /// - bit 14 = FG (greater than zero)
     /// - bit 15 = FL (less than zero)
-    /// - bit 16 = C (class, approximated as FL | FU; bit 16 cleared otherwise)
+    /// - bit 16 = C (class descriptor) — always cleared in this implementation
+    ///   (the native JIT also clears C from arithmetic results; it is only set
+    ///   by comparison instructions)
     ///
     /// The FPRF update is applied in-place to FPSCR — the caller's job is to
     /// make sure the result is already in the FPR before calling this helper.

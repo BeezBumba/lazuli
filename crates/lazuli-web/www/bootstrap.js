@@ -1496,12 +1496,12 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
         }
         case 6: { // i8 — 1 byte signed, scale
           const byte = addr < r.length ? r[addr] : 0;
-          return ((byte << 24) >> 24) * factor; // sign-extend 8→32
+          return ((byte << 24) >> 24) * factor; // sign-extend via arithmetic shift
         }
         case 7: { // i16 — 2 bytes big-endian signed, scale
           if (addr + 1 >= r.length) return 0.0;
           const val = ((r[addr] << 8) | r[addr+1]) & 0xFFFF;
-          return (((val << 16) >> 16)) * factor; // sign-extend 16→32
+          return (((val << 16) >> 16)) * factor; // sign-extend via arithmetic shift
         }
         default: return 0.0; // reserved types
       }
