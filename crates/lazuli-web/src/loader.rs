@@ -48,7 +48,7 @@ fn flatten_disc_image(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress a CISO (Compact ISO) sparse disc image into a flat buffer.
 ///
-/// CISO stores a 32-byte header followed by a 32 760-byte block-presence map.
+/// CISO stores a 32-byte header followed by a 32,760-byte block-presence map.
 /// Blocks marked present are stored consecutively in the file; missing blocks
 /// expand to zero-filled pages.  This function reads every used block via
 /// [`disks::cso::Cso::read`] and writes them into a contiguous `Vec<u8>`
