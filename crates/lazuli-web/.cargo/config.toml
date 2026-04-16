@@ -1,0 +1,30 @@
+# crates/lazuli-web/.cargo/config.toml
+#
+# Build configuration for the lazuli-web WASM target.
+#
+# ## Phase 1 – Atomics / Shared Linear Memory (future / Phase 4)
+#
+# The CPU Worker (Phase 2) and SAB audio ring buffer (Phase 3) work with a
+# standard WASM build because they use *JavaScript-created* SharedArrayBuffers
+# that are passed into the WASM module.  No special Rust flags are needed for
+# those phases.
+#
+# Phase 4 and beyond (sharing the WASM *linear memory* itself between workers)
+# requires the WASM binary to be built with atomic instruction support and the
+# standard library rebuilt with those features.  Use `just web-build-atomics`
+# for that workflow — it passes the required RUSTFLAGS and `-Z build-std` to
+# wasm-pack automatically.  Do not enable these flags here permanently: a WASM
+# binary compiled with `+atomics` requires `{ shared: true }` WebAssembly.Memory
+# at instantiation time, which is incompatible with the current single-threaded
+# bootstrap path.
+#
+# The block below is intentionally left commented out.  Uncomment it only when
+# targeting shared-WASM-memory Workers (requires nightly + build-std):
+#
+# [target.wasm32-unknown-unknown]
+# rustflags = [
+#   "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+# ]
+#
+# [unstable]
+# build-std = ["panic_abort", "std"]

@@ -42,6 +42,324 @@
 // ── Imports ───────────────────────────────────────────────────────────────────
 import init, { WasmEmulator, wasm_memory } from "./pkg/lazuli_web.js";
 
+// ── CPU Worker management ─────────────────────────────────────────────────────
+//
+// When a Worker is available the main thread acts purely as a render host:
+//   • receives XFB frames + stats from the Worker via postMessage
+//   • forwards input (pad buttons) and control signals to the Worker
+//   • renders frames to canvas in requestAnimationFrame (renderLoop)
+//
+// The single-threaded fallback (cpuWorker === null) preserves the original
+// gameLoop path exactly so the emulator still works in environments without
+// Worker support or before COOP/COEP headers are active.
+
+/** The CPU execution Worker, or null when unavailable. */
+let cpuWorker  = null;
+
+/** True once the Worker has sent its 'ready' acknowledgement. */
+let workerReady = false;
+
+/**
+ * Most recent RGBA frame buffer received from the Worker.
+ * Rendered in the next renderLoop tick, then cleared.
+ * @type {Uint8ClampedArray|null}
+ */
+let latestXfbRgba = null;
+
+/**
+ * Shadow emulator state, kept in sync by Worker 'stats' messages.
+ * Used by updateStats / renderRegisters / renderFprRegisters so they do not
+ * need a live WasmEmulator when the Worker is active.
+ */
+const workerState = {
+  pc: 0, lr: 0, ctr: 0, cr: 0, msr: 0, srr0: 0, srr1: 0, dec: 0,
+  gprs:              new Array(32).fill(0),
+  blocksCompiled:    0,
+  blocksExecuted:    0,
+  cacheSize:         0,
+  stuckRuns:         0,
+  lastExcPc:         0,
+  lastExcKind:       -1,
+  unimplBlockCount:  0,
+  raiseExcCount:     0,
+  padButtons:        0,
+};
+
+/**
+ * Phase 3 – SAB audio ring buffer.
+ * Created in initDspAudioWorklet() when crossOriginIsolated is true.
+ * Distributed to both the CPU Worker and the AudioWorkletNode.
+ */
+let pcmSab    = null; // SharedArrayBuffer: Float32 [L[0..8191], R[0..8191]]
+let pcmIdxSab = null; // SharedArrayBuffer: Int32[2] [writeHead, readHead]
+
+/**
+ * A proxy object that forwards reads to workerState and writes (pad input,
+ * PC reset) as Worker messages.  Passed to the existing UI helpers
+ * (updateStats, renderRegisters, etc.) so they work unchanged while the
+ * emulator runs inside the Worker.
+ */
+const fakeEmu = {
+  get_pc:    () => workerState.pc,
+  get_lr:    () => workerState.lr,
+  get_ctr:   () => workerState.ctr,
+  get_cr:    () => workerState.cr,
+  get_msr:   () => workerState.msr,
+  get_srr0:  () => workerState.srr0,
+  get_srr1:  () => workerState.srr1,
+  get_dec:   () => workerState.dec,
+  get_gpr:   (i) => workerState.gprs[i] ?? 0,
+  get_fpr:   (_i) => 0,
+  blocks_compiled:           () => workerState.blocksCompiled,
+  blocks_executed:           () => workerState.blocksExecuted,
+  cache_size:                () => workerState.cacheSize,
+  unimplemented_block_count: () => workerState.unimplBlockCount,
+  raise_exception_count:     () => workerState.raiseExcCount,
+  get_pad_buttons:           () => workerState.padButtons,
+  set_pad_buttons: (v) => {
+    workerState.padButtons = v >>> 0;
+    cpuWorker?.postMessage({ type: "input", padButtons: v >>> 0 });
+  },
+  // All other methods are no-ops or stubs; they are never called on the main
+  // thread when the Worker is active.
+  set_pc:      () => {},
+  set_gpr:     () => {},
+  set_msr:     () => {},
+  load_bytes:  () => {},
+  load_ipl_hle:    () => 0,
+  load_disc_image: () => {},
+  get_sram:    () => new Uint8Array(64),
+  set_sram:    () => {},
+  cpu_struct_size:          () => 0,
+  compile_block:            () => { throw new Error("use Worker compile_demo message"); },
+  last_compiled_cycles:     () => 0,
+  last_compiled_ins_count:  () => 0,
+  last_compiled_wasm_bytes: () => 0,
+  hw_read_u16:  () => 0, hw_read_u32:  () => 0,
+  hw_write_u16: () => {}, hw_write_u32: () => {},
+  take_dma_dirty:      () => false,
+  last_dma_addr:       () => 0,
+  last_dma_len:        () => 0,
+  last_di_disc_offset: () => 0,
+  take_uart_output:    () => [],
+  advance_timebase:    () => {},
+  advance_decrementer: () => {},
+  advance_ai:          () => false,
+  add_cpu_cycles:      () => {},
+  cpu_cycles_lo:       () => 0,
+  cpu_cycles_hi:       () => 0,
+  assert_vi_interrupt:              () => {},
+  maybe_deliver_external_interrupt: () => {},
+  deliver_exception:                () => false,
+  record_block_executed:  () => {},
+  record_raise_exception: () => {},
+  get_compiled_block_pcs: () => [],
+  ram_ptr:  () => 0, ram_size: () => 0,
+  l2c_ptr:  () => 0, l2c_size: () => 0,
+  vi_xfb_addr: () => 0,
+};
+
+/**
+ * Spawn the CPU Worker, send the init message, and resolve when 'ready'.
+ *
+ * @param {number}                    ramSize  Guest RAM size in bytes.
+ * @param {HTMLCanvasElement}         canvas
+ * @param {CanvasRenderingContext2D}  ctx
+ * @returns {Promise<void>}
+ */
+function spawnCpuWorker(ramSize, canvas, ctx) {
+  return new Promise((resolve) => {
+    cpuWorker = new Worker("./cpu-worker.js", { type: "module" });
+
+    cpuWorker.onmessage = ({ data: msg }) => {
+      handleWorkerMessage(msg, canvas, ctx);
+      if (msg.type === "ready") resolve();
+    };
+
+    cpuWorker.onerror = (e) => {
+      console.error("[lazuli] CPU Worker error:", e);
+      setStatus(`✗ CPU Worker error: ${e.message ?? e}`, "status-err");
+    };
+
+    cpuWorker.postMessage({ type: "init", ramSize });
+  });
+}
+
+/**
+ * Dispatch a message arriving from the CPU Worker and update the main thread.
+ *
+ * @param {object}                    msg
+ * @param {HTMLCanvasElement}         canvas
+ * @param {CanvasRenderingContext2D}  ctx
+ */
+function handleWorkerMessage(msg, canvas, ctx) {
+  switch (msg.type) {
+
+    case "ready":
+      workerReady = true;
+      setStatus("✓ CPU Worker ready — load an ISO or a demo program to begin", "status-ok");
+      break;
+
+    case "frame":
+      // Store the transferred RGBA buffer; renderLoop paints it next tick.
+      latestXfbRgba = new Uint8ClampedArray(msg.rgba);
+      xfbHasContent = true;
+      break;
+
+    case "no_frame":
+      // Worker found no XFB content; renderLoop draws the placeholder.
+      break;
+
+    case "stats":
+      workerState.pc             = msg.pc             >>> 0;
+      workerState.lr             = msg.lr             >>> 0;
+      workerState.ctr            = msg.ctr            >>> 0;
+      workerState.cr             = msg.cr             >>> 0;
+      workerState.msr            = msg.msr            >>> 0;
+      workerState.srr0           = msg.srr0           >>> 0;
+      workerState.srr1           = msg.srr1           >>> 0;
+      workerState.dec            = msg.dec            >>> 0;
+      workerState.gprs           = msg.gprs ?? new Array(32).fill(0);
+      workerState.blocksCompiled = msg.blocksCompiled ?? 0;
+      workerState.blocksExecuted = msg.blocksExecuted ?? 0;
+      workerState.cacheSize      = msg.cacheSize      ?? 0;
+      workerState.stuckRuns      = msg.stuckRuns      ?? 0;
+      workerState.lastExcPc      = msg.lastExcPc      >>> 0;
+      workerState.lastExcKind    = msg.lastExcKind    ?? -1;
+      workerState.unimplBlockCount = msg.unimplBlockCount ?? 0;
+      workerState.raiseExcCount  = msg.raiseExcCount  ?? 0;
+      workerState.padButtons     = msg.padButtons     >>> 0;
+      break;
+
+    case "uart":
+      // Feed bytes through the same stdout → apploader-log pipeline.
+      for (const b of (msg.bytes ?? [])) feedStdoutByte(b);
+      break;
+
+    case "apploader_log":
+      appendApploaderLog(msg.line);
+      break;
+
+    case "debug_event":
+      pushDebugEvent(msg.msg);
+      break;
+
+    case "status":
+      setStatus(msg.msg, msg.cls ?? "status-info");
+      break;
+
+    case "milestone": {
+      const elapsed = msg.elapsed ?? "?";
+      console.info(`[lazuli] ✓ Milestone: ${msg.name} — ${elapsed} since boot`);
+      pushDebugEvent(`✓ Milestone: ${msg.name} (${elapsed})`);
+      if (msg.name === "firstXfbContent") {
+        milestones.firstXfbContent = performance.now();
+      }
+      break;
+    }
+
+    case "phase": {
+      const pcHex = "0x" + (msg.pc >>> 0).toString(16).toUpperCase().padStart(8, "0");
+      console.info(`[lazuli] Phase: ${msg.from} → ${msg.to} @ ${pcHex} (block #${msg.blockCount})`);
+      break;
+    }
+
+    case "error":
+      setStatus(`✗ ${msg.msg} (PC=${hexU32(msg.pc)}) — see console`, "status-err");
+      running = false;
+      $("btn-start").disabled = false;
+      $("btn-stop").disabled  = true;
+      $("fps-display").textContent = "—";
+      break;
+
+    case "stopped":
+      running = false;
+      $("btn-start").disabled = false;
+      $("btn-stop").disabled  = true;
+      $("fps-display").textContent = "—";
+      updateStats(fakeEmu);
+      renderRegisters(fakeEmu);
+      renderFprRegisters(fakeEmu);
+      break;
+
+    case "sram":
+      try {
+        const sramB64 = btoa(String.fromCharCode(...msg.data));
+        localStorage.setItem("lazuli_sram", sramB64);
+      } catch (_) {}
+      break;
+
+    case "step_done":
+      for (const line of (msg.log ?? [])) appendExecLog(line);
+      workerState.pc = msg.pc >>> 0;
+      updateStats(fakeEmu);
+      renderRegisters(fakeEmu);
+      renderFprRegisters(fakeEmu);
+      setStatus(
+        msg.ok
+          ? `✓ Stepped — PC now ${hexU32(msg.pc)}`
+          : "✗ Step failed — see execution log",
+        msg.ok ? "status-ok" : "status-err",
+      );
+      break;
+
+    case "run_done":
+      workerState.pc = msg.pc >>> 0;
+      updateStats(fakeEmu);
+      renderRegisters(fakeEmu);
+      renderFprRegisters(fakeEmu);
+      setStatus(
+        msg.count > 0
+          ? `✓ Ran ${msg.count} block(s) — PC now ${hexU32(msg.pc)}`
+          : "✗ Run failed at first block",
+        msg.count > 0 ? "status-ok" : "status-err",
+      );
+      break;
+
+    case "block_compiled":
+      if (msg.error) {
+        setStatus(`✗ Compilation failed: ${msg.error}`, "status-err");
+        $("block-output").textContent = `Error: ${msg.error}`;
+      } else {
+        const wasmBytes = new Uint8Array(msg.wasmBytes);
+        $("block-output").textContent = annotateWasm(Array.from(wasmBytes));
+        updateStats(fakeEmu);
+        setStatus(
+          `✓ Block compiled to ${wasmBytes.length} WASM bytes — verified OK`,
+          "status-ok",
+        );
+      }
+      break;
+
+    case "iso_loaded":
+      if (msg.error) {
+        setStatus(`✗ ISO load failed: ${msg.error}`, "status-err");
+        $("iso-meta").textContent = `Error: ${msg.error}`;
+      } else {
+        gameTitle      = msg.gameName || msg.gameId || "Unknown Game";
+        lastEntryPoint = msg.entry;
+        $("header-game").textContent = `— ${gameTitle}`;
+        $("iso-meta").textContent =
+          `Game ID: ${msg.gameId} | Title: ${msg.gameName} | ` +
+          `Entry: 0x${msg.entry.toString(16).toUpperCase()}`;
+        $("btn-reset").disabled = false;
+        drawPlaceholder(ctx, gameTitle, null);
+        updateStats(fakeEmu);
+        renderRegisters(fakeEmu);
+        renderFprRegisters(fakeEmu);
+        setStatus(
+          `✓ Loaded "${msg.gameName}" (${msg.gameId}) — ` +
+          `entry 0x${msg.entry.toString(16).toUpperCase()} — press ▶ Start`,
+          "status-ok",
+        );
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
 // ── DOM helpers ───────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 
@@ -1093,6 +1411,7 @@ const breakpoints = new Set();
 function addBreakpoint(pc) {
   pc = pc >>> 0;
   breakpoints.add(pc);
+  if (cpuWorker) cpuWorker.postMessage({ type: "breakpoint_add", pc });
   renderBreakpointList();
 }
 
@@ -1103,12 +1422,14 @@ function addBreakpoint(pc) {
 function removeBreakpoint(pc) {
   pc = pc >>> 0;
   breakpoints.delete(pc);
+  if (cpuWorker) cpuWorker.postMessage({ type: "breakpoint_remove", pc });
   renderBreakpointList();
 }
 
 /** Remove all breakpoints and refresh the UI. */
 function clearBreakpoints() {
   breakpoints.clear();
+  if (cpuWorker) cpuWorker.postMessage({ type: "breakpoint_clear" });
   renderBreakpointList();
 }
 
@@ -1759,6 +2080,22 @@ const blockMetaMap = new Map(); // u32 pc → { cycles: u32, insCount: u32 }
 const pcHitMap = new Map(); // u32 pc → number
 
 function clearModuleCache() {
+  if (cpuWorker) {
+    // Worker path: the Worker owns the JIT cache; forward the clear request.
+    cpuWorker.postMessage({ type: "clear_cache" });
+    xfbHasContent = false;
+    xfbAddr       = XFB_PHYS_DEFAULT;
+    latestXfbRgba = null;
+    debugEvents   = [];
+    const el = $("debug-log");
+    if (el) el.textContent = "(no events yet)";
+    clearApploaderLog();
+    milestones = {
+      startedAt: null, iplHleStarted: null, apploaderRunning: null,
+      apploaderDone: null, gameEntry: null, firstXfbContent: null,
+    };
+    return;
+  }
   moduleCache.clear();
   blockMetaMap.clear();
   pcHitMap.clear();
@@ -2203,27 +2540,46 @@ const DSP_WORKLET_SOURCE = `
 class DspAudioProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super(options);
-    const SIZE    = 8192; // must be a power of two so that (pos + n) & MASK is equivalent to modulo
-    const MASK    = SIZE - 1;
-    this._ringL   = new Float32Array(SIZE);
-    this._ringR   = new Float32Array(SIZE);
+    // Ring buffer constants (power of two so & MASK replaces % SIZE).
+    this._SIZE = 8192;
+    this._MASK = this._SIZE - 1;
+
+    // postMessage fallback ring buffer (used when crossOriginIsolated is false
+    // and SharedArrayBuffer is not available).
+    this._ringL    = new Float32Array(this._SIZE);
+    this._ringR    = new Float32Array(this._SIZE);
     this._writePos = 0;
     this._readPos  = 0;
     this._avail    = 0;
-    this._size     = SIZE;
-    this._mask     = MASK;
+
+    // Phase 3 SAB mode — activated by an 'init_sab' message from the main
+    // thread.  When active, samples are read directly from the SharedArrayBuffer
+    // ring buffer written by the CPU Worker (zero-copy, lock-free SPSC).
+    this._sabMode = false;
+    this._pcmData = null; // Float32Array view of pcmSab
+    this._pcmIdx  = null; // Int32Array  view of idxSab
 
     this.port.onmessage = ({ data }) => {
-      // data.left / data.right are Float32Array (transferred, not copied).
-      const { left, right } = data;
-      const n = Math.min(left.length, this._size - this._avail);
-      for (let i = 0; i < n; i++) {
-        const p = (this._writePos + i) & this._mask;
-        this._ringL[p] = left[i];
-        this._ringR[p] = right[i];
+      if (data && data.type === 'init_sab') {
+        // Switch to SharedArrayBuffer ring buffer (Phase 3).
+        this._pcmData = new Float32Array(data.pcmSab);
+        this._pcmIdx  = new Int32Array(data.idxSab);
+        this._sabMode = true;
+        return;
       }
-      this._writePos = (this._writePos + n) & this._mask;
-      this._avail   += n;
+      // postMessage fallback: data.left / data.right are Float32Array
+      // (transferred from the main thread, not copied).
+      if (!this._sabMode && data && data.left && data.right) {
+        const { left, right } = data;
+        const n = Math.min(left.length, this._SIZE - this._avail);
+        for (let i = 0; i < n; i++) {
+          const p = (this._writePos + i) & this._MASK;
+          this._ringL[p] = left[i];
+          this._ringR[p] = right[i];
+        }
+        this._writePos = (this._writePos + n) & this._MASK;
+        this._avail   += n;
+      }
     };
   }
 
@@ -2234,15 +2590,35 @@ class DspAudioProcessor extends AudioWorkletProcessor {
     const outR = out.length > 1 ? out[1] : out[0];
     const n    = outL.length; // typically 128
 
-    const canRead = Math.min(n, this._avail);
-    for (let i = 0; i < canRead; i++) {
-      const p = (this._readPos + i) & this._mask;
-      outL[i] = this._ringL[p];
-      outR[i] = this._ringR[p];
+    if (this._sabMode && this._pcmData && this._pcmIdx) {
+      // Phase 3: read from SharedArrayBuffer ring buffer (lock-free SPSC).
+      // Layout: [L[0..SIZE-1], R[0..SIZE-1]] as Float32.
+      const RING_SIZE = this._SIZE;
+      const RING_MASK = this._MASK;
+      const wHead   = Atomics.load(this._pcmIdx, 0);
+      const rHead   = Atomics.load(this._pcmIdx, 1);
+      const avail   = (wHead - rHead + RING_SIZE) & RING_MASK;
+      const canRead = Math.min(n, avail);
+      for (let i = 0; i < canRead; i++) {
+        const pos = (rHead + i) & RING_MASK;
+        outL[i] = this._pcmData[pos];
+        outR[i] = this._pcmData[pos + RING_SIZE];
+      }
+      if (canRead > 0) {
+        Atomics.store(this._pcmIdx, 1, (rHead + canRead) & RING_MASK);
+      }
+    } else {
+      // postMessage fallback ring buffer.
+      const canRead = Math.min(n, this._avail);
+      for (let i = 0; i < canRead; i++) {
+        const p = (this._readPos + i) & this._MASK;
+        outL[i] = this._ringL[p];
+        outR[i] = this._ringR[p];
+      }
+      this._readPos = (this._readPos + canRead) & this._MASK;
+      this._avail  -= canRead;
     }
-    this._readPos = (this._readPos + canRead) & this._mask;
-    this._avail  -= canRead;
-    // Frames beyond canRead remain at the default 0.0 (silence).
+    // Samples beyond canRead remain at the default 0.0 (silence).
 
     return true; // Keep processor alive.
   }
@@ -2278,6 +2654,34 @@ async function initDspAudioWorklet() {
       outputChannelCount: [2], // Stereo output
     });
     dspWorkletNode.connect(audioCtx.destination);
+
+    // Phase 3: when the page is cross-origin isolated, create a SharedArrayBuffer
+    // ring buffer and distribute it to both the AudioWorklet and the CPU Worker.
+    // This replaces per-frame postMessage buffer transfers with a zero-copy
+    // lock-free SPSC ring buffer (single producer = CPU Worker, single consumer
+    // = AudioWorklet.process()).
+    if (self.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined") {
+      const PCM_RING_SIZE = 8192; // power of two — must match cpu-worker.js
+      // Layout: [L[0..RING-1], R[0..RING-1]] as Float32 (2 ch × 8192 × 4 bytes)
+      pcmSab    = new SharedArrayBuffer(PCM_RING_SIZE * 2 * 4);
+      // Atomic indices: [writeHead (Int32), readHead (Int32)]
+      pcmIdxSab = new SharedArrayBuffer(2 * 4);
+
+      // Initialise both indices to zero.
+      new Int32Array(pcmIdxSab).fill(0);
+
+      // Send to the AudioWorklet so it switches from postMessage to SAB mode.
+      dspWorkletNode.port.postMessage({ type: "init_sab", pcmSab, idxSab: pcmIdxSab });
+
+      // Send to the CPU Worker if it is already running.
+      if (cpuWorker) {
+        cpuWorker.postMessage({ type: "pcm_sab", pcmSab, idxSab: pcmIdxSab });
+      }
+      console.log("[lazuli] Phase 3: SAB audio ring buffer initialised (crossOriginIsolated=true)");
+    } else {
+      console.log("[lazuli] DSP AudioWorklet pipeline ready (postMessage mode — SAB requires COOP/COEP headers)");
+    }
+
     console.log("[lazuli] DSP AudioWorklet pipeline ready (32 kHz stereo)");
   } catch (e) {
     console.warn("[lazuli] AudioWorklet init failed — audio will be silent:", e);
@@ -2365,6 +2769,53 @@ function suspendAudio() {
 const BLOCKS_PER_FRAME = 500;
 
 /**
+ * Render-only animation loop — used when the CPU Worker is active.
+ *
+ * The Worker runs the JIT execution loop at ~60 Hz on its own `setInterval`
+ * cadence.  This RAF loop only:
+ *   1. Polls the Gamepad API (main-thread-only API) and forwards input.
+ *   2. Renders the most recent XFB RGBA frame received from the Worker.
+ *   3. Updates the stats / register panels from the cached workerState.
+ *   4. Tracks the FPS counter.
+ *
+ * @param {HTMLCanvasElement}         canvas
+ * @param {CanvasRenderingContext2D}  ctx
+ * @param {number}                    timestamp  performance.now() from RAF
+ */
+function renderLoop(canvas, ctx, timestamp) {
+  if (!running) return;
+
+  // Forward latest gamepad state to the Worker.
+  pollGamepad(fakeEmu);
+
+  // Render the latest XFB frame the Worker sent us, or draw the placeholder.
+  if (latestXfbRgba) {
+    ctx.putImageData(new ImageData(latestXfbRgba, SCREEN_W, SCREEN_H), 0, 0);
+    latestXfbRgba = null;
+  } else if (!xfbHasContent) {
+    drawPlaceholder(ctx, gameTitle, null);
+  }
+
+  // FPS counter (update every second)
+  frameCount++;
+  if (timestamp - lastFpsTime >= 1000) {
+    const fps = (frameCount * 1000 / (timestamp - lastFpsTime)).toFixed(1);
+    $("fps-display").textContent = fps;
+    frameCount  = 0;
+    lastFpsTime = timestamp;
+  }
+
+  // Update stats / register panels every ~10 frames.
+  if (frameCount % 10 === 0) {
+    updateStats(fakeEmu);
+    renderRegisters(fakeEmu);
+    renderFprRegisters(fakeEmu);
+  }
+
+  animFrameId = requestAnimationFrame((ts) => renderLoop(canvas, ctx, ts));
+}
+
+
  * Time-base ticks to advance per animation frame.
  *
  * The GameCube's Gekko time base increments at CPU / 12 ≈ 40.5 MHz.
@@ -2392,6 +2843,12 @@ let animFrameId    = null;
 let gameTitle      = null;
 let frameCount     = 0;
 let lastFpsTime    = 0;
+/**
+ * Last ISO entry point — used by the Reset button to return the CPU to the
+ * correct start address.  Declared at module level so handleWorkerMessage()
+ * can update it when the Worker reports 'iso_loaded'.
+ */
+let lastEntryPoint = 0x80000000;
 /** Set to true once non-zero XFB data is found; cleared on ISO load / Reset. */
 let xfbHasContent  = false;
 /** Physical base address of the discovered XFB (updated by detectXfbAddress). */
@@ -2419,6 +2876,14 @@ function getMsrEe(emu) {
  */
 function gameLoop(emu, canvas, ctx, timestamp) {
   if (!running) return;
+
+  // When the CPU Worker is active this function should not be called; the
+  // Worker runs its own setInterval execution loop and renderLoop() handles
+  // the main thread's RAF.  Guard against accidental invocation.
+  if (cpuWorker) {
+    animFrameId = requestAnimationFrame((ts) => renderLoop(canvas, ctx, ts));
+    return;
+  }
 
   // Poll the Gamepad API and merge with keyboard state before executing
   // blocks, so that the emulator reads the latest controller input.
@@ -2829,7 +3294,14 @@ function startLoop(emu, canvas, ctx) {
   if (milestones.startedAt === null) {
     milestones.startedAt = performance.now();
   }
-  animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
+  if (cpuWorker) {
+    // Worker path: Worker handles execution; main thread only renders.
+    cpuWorker.postMessage({ type: "start" });
+    animFrameId = requestAnimationFrame((ts) => renderLoop(canvas, ctx, ts));
+  } else {
+    // Single-threaded fallback.
+    animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
+  }
   $("btn-start").disabled = true;
   $("btn-stop").disabled  = false;
   setStatus("▶ Emulation running…", "status-ok");
@@ -2840,6 +3312,13 @@ function stopLoop() {
   if (animFrameId !== null) {
     cancelAnimationFrame(animFrameId);
     animFrameId = null;
+  }
+  if (cpuWorker) {
+    // Tell the Worker to stop its execution loop.  The Worker will send a
+    // 'stopped' message back which updates the button states.
+    cpuWorker.postMessage({ type: "stop" });
+    $("fps-display").textContent = "—";
+    return;
   }
   $("btn-start").disabled = false;
   $("btn-stop").disabled  = true;
@@ -2885,8 +3364,8 @@ async function main() {
   const canvas = $("screen");
   const ctx    = canvas.getContext("2d");
 
-  // Last ISO entry point — used by the Reset button to restart at the correct PC.
-  let lastEntryPoint = 0x80000000;
+  // Note: lastEntryPoint is declared at module level so handleWorkerMessage()
+  // can update it when the Worker reports 'iso_loaded'.
 
   // ipl-hle DOL bytes fetched from the server at startup.  null when the file
   // is not available (built from crates/ipl-hle/ via `just ipl-hle build` and
@@ -2896,35 +3375,69 @@ async function main() {
   // Draw splash screen while WASM loads
   drawPlaceholder(ctx, null, null);
 
-  try {
-    await init();
-    // 24 MiB of guest RAM — matches the GameCube's main memory
-    emu = new WasmEmulator(24 * 1024 * 1024);
-    emu.set_pc(0x80000000);
-    // ── Restore persistent SRAM from localStorage ─────────────────────────
-    // The GameCube IPL stores user settings (language, sound mode, progressive
-    // mode, etc.) in a 64-byte SRAM backed by a coin-cell battery.  We persist
-    // it in localStorage so games see the same settings across sessions, just
-    // as the native emulator persists SRAM to disk.
+  if (typeof Worker !== "undefined") {
+    // ── Worker path ───────────────────────────────────────────────────────
+    // Spawn the CPU Worker — it initialises its own WASM instance and owns
+    // the full emulator state.  The main thread uses fakeEmu as a proxy so
+    // existing UI helpers (updateStats, renderRegisters, …) work unchanged.
+    emu = fakeEmu;
+    setStatus("Starting CPU Worker…", "status-info");
+    try {
+      await spawnCpuWorker(24 * 1024 * 1024, canvas, ctx);
+    } catch (e) {
+      setStatus(`✗ Failed to start CPU Worker: ${e}`, "status-err");
+      console.error(e);
+      return;
+    }
+    // Restore persistent SRAM and send it to the Worker.
     try {
       const sramB64 = localStorage.getItem("lazuli_sram");
       if (sramB64) {
         const raw = Uint8Array.from(atob(sramB64), c => c.charCodeAt(0));
-        emu.set_sram(raw);
-        console.log("[lazuli] SRAM restored from localStorage");
+        cpuWorker.postMessage({ type: "load_sram", data: raw });
+        console.log("[lazuli] SRAM sent to CPU Worker");
       }
     } catch (sramErr) {
-      console.warn("[lazuli] Could not restore SRAM from localStorage:", sramErr);
+      console.warn("[lazuli] Could not restore SRAM:", sramErr);
     }
-    setStatus("✓ WASM module loaded — load an ISO or a demo program to begin", "status-ok");
     $("btn-compile").disabled  = false;
     $("btn-load-iso").disabled = false;
     $("btn-start").disabled    = false;
     $("btn-audio").disabled    = false;
-  } catch (e) {
-    setStatus(`✗ Failed to load WASM module: ${e}`, "status-err");
-    console.error(e);
-    return;
+    renderRegisters(emu);
+    renderFprRegisters(emu);
+    updateStats(emu);
+  } else {
+    // ── Single-threaded fallback ───────────────────────────────────────────
+    try {
+      await init();
+      // 24 MiB of guest RAM — matches the GameCube's main memory
+      emu = new WasmEmulator(24 * 1024 * 1024);
+      emu.set_pc(0x80000000);
+      // Restore persistent SRAM from localStorage.
+      try {
+        const sramB64 = localStorage.getItem("lazuli_sram");
+        if (sramB64) {
+          const raw = Uint8Array.from(atob(sramB64), c => c.charCodeAt(0));
+          emu.set_sram(raw);
+          console.log("[lazuli] SRAM restored from localStorage");
+        }
+      } catch (sramErr) {
+        console.warn("[lazuli] Could not restore SRAM from localStorage:", sramErr);
+      }
+      setStatus("✓ WASM module loaded — load an ISO or a demo program to begin", "status-ok");
+      $("btn-compile").disabled  = false;
+      $("btn-load-iso").disabled = false;
+      $("btn-start").disabled    = false;
+      $("btn-audio").disabled    = false;
+    } catch (e) {
+      setStatus(`✗ Failed to load WASM module: ${e}`, "status-err");
+      console.error(e);
+      return;
+    }
+    renderRegisters(emu);
+    renderFprRegisters(emu);
+    updateStats(emu);
   }
 
   // Fetch the ipl-hle DOL (built from crates/ipl-hle/ and served alongside
@@ -2948,10 +3461,6 @@ async function main() {
       "status-err"
     );
   }
-
-  renderRegisters(emu);
-  renderFprRegisters(emu);
-  updateStats(emu);
 
   // ── Keyboard controller ────────────────────────────────────────────────────
   document.addEventListener("keydown", (e) => {
@@ -2989,6 +3498,26 @@ async function main() {
 
   // ── Reset button ───────────────────────────────────────────────────────────
   $("btn-reset").addEventListener("click", () => {
+    if (cpuWorker) {
+      // Worker path: cancel RAF, clear local XFB state, then send stop+reset
+      // to the Worker (messages are processed in order, so stop fires first).
+      running = false;
+      if (animFrameId !== null) { cancelAnimationFrame(animFrameId); animFrameId = null; }
+      xfbHasContent = false;
+      xfbAddr       = XFB_PHYS_DEFAULT;
+      latestXfbRgba = null;
+      cpuWorker.postMessage({ type: "stop" });
+      cpuWorker.postMessage({ type: "reset", pc: lastEntryPoint });
+      drawPlaceholder(ctx, gameTitle, null);
+      renderRegisters(fakeEmu);
+      renderFprRegisters(fakeEmu);
+      updateStats(fakeEmu);
+      setStatus(
+        `↺ Reset to entry 0x${lastEntryPoint.toString(16).toUpperCase()} — press ▶ Start`,
+        "status-info",
+      );
+      return;
+    }
     stopLoop();
     clearModuleCache();
     ramView       = null;        // force refresh of zero-copy view
@@ -3041,6 +3570,28 @@ async function main() {
       try {
         stopLoop();
         clearModuleCache();
+
+        if (cpuWorker) {
+          // Worker path: transfer the ISO ArrayBuffer to the Worker (zero-copy).
+          // iplHleDol is sent as a copy so we keep the original for future resets.
+          xfbHasContent = false;
+          xfbAddr       = XFB_PHYS_DEFAULT;
+          latestXfbRgba = null;
+          const isoData   = evt.target.result;
+          const iplCopy   = iplHleDol ? iplHleDol.buffer.slice(0) : null;
+          const transfers = [isoData];
+          if (iplCopy) transfers.push(iplCopy);
+          cpuWorker.postMessage(
+            { type: "load_iso", isoData, iplHleData: iplCopy },
+            transfers,
+          );
+          setStatus(`Loading "${file.name}" in CPU Worker…`, "status-info");
+          // The Worker will respond with an 'iso_loaded' message handled
+          // in handleWorkerMessage() which updates the UI.
+          return;
+        }
+
+        // Single-threaded fallback: load synchronously on the main thread.
         ramView       = null;
         xfbHasContent = false;
         xfbAddr       = XFB_PHYS_DEFAULT;
@@ -3050,7 +3601,7 @@ async function main() {
         // DVD controller can service in-game sector reads (streams, audio,
         // textures) without re-reading from the JS File object.
         emu.load_disc_image(new Uint8Array(evt.target.result));
-        gameTitle     = meta.gameName || meta.gameId || "Unknown Game";
+        gameTitle      = meta.gameName || meta.gameId || "Unknown Game";
         lastEntryPoint = meta.entry;
 
         $("header-game").textContent = `— ${gameTitle}`;
@@ -3107,11 +3658,13 @@ async function main() {
     const rawLines = $("asm-input").value.trim().split(/\s+/);
     const basePc   = parseInt($("base-pc").value.trim(), 16) || 0x80000000;
 
+    const words = [];
     const bytes = [];
     for (const line of rawLines) {
       const cleaned = line.replace(/^0x/i, "").replace(/[^0-9a-fA-F]/g, "");
       if (!cleaned.length) continue;
       const word = parseInt(cleaned.padStart(8, "0"), 16);
+      words.push(cleaned.padStart(8, "0"));
       bytes.push((word >>> 24) & 0xff, (word >>> 16) & 0xff,
                  (word >>>  8) & 0xff,  word         & 0xff);
     }
@@ -3120,7 +3673,15 @@ async function main() {
       return;
     }
 
-    // Load instructions into guest RAM at basePc
+    if (cpuWorker) {
+      // Worker path: forward the compile request to the Worker.
+      setStatus("Compiling…", "status-info");
+      cpuWorker.postMessage({ type: "compile_demo", words, basePc });
+      // Result arrives as 'block_compiled' in handleWorkerMessage().
+      return;
+    }
+
+    // Single-threaded fallback: compile on the main thread.
     emu.load_bytes(basePc, new Uint8Array(bytes));
     emu.set_pc(basePc);
     clearModuleCache();
@@ -3154,6 +3715,11 @@ async function main() {
 
   // ── Step button ────────────────────────────────────────────────────────────
   $("btn-step").addEventListener("click", () => {
+    if (cpuWorker) {
+      // Worker path: forward to Worker; result arrives as 'step_done'.
+      cpuWorker.postMessage({ type: "step" });
+      return;
+    }
     const ram = getRamView(emu);
     const log = [];
     const ok  = executeOneBlockSync(emu, ram, log);
@@ -3171,6 +3737,11 @@ async function main() {
 
   // ── Run 10 blocks button ───────────────────────────────────────────────────
   $("btn-run10").addEventListener("click", () => {
+    if (cpuWorker) {
+      // Worker path: forward to Worker; result arrives as 'run_done'.
+      cpuWorker.postMessage({ type: "run_n", n: 10 });
+      return;
+    }
     let ram = getRamView(emu);
     let count = 0;
     for (let i = 0; i < 10; i++) {
