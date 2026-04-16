@@ -78,6 +78,34 @@ pub enum IrInst {
     /// `(i32) → ()` — store raw i32 bits to FPSCR.
     StoreFpscr,
 
+    // ─── Generic register-struct field access ─────────────────────────────────
+    /// `() → (i32)` — load a u32 from `Cpu` at compile-time byte offset.
+    ///
+    /// Used for SPRs that don't have an individually named IR variant (BAT,
+    /// HID0/2, WPAR, DMAU, DMAL, L2CR, segment registers, etc.).
+    LoadRegOff(u64),
+    /// `(i32) → ()` — store a u32 to `Cpu` at compile-time byte offset.
+    StoreRegOff(u64),
+
+    // ─── Instruction-cache management (via hook calls) ────────────────────────
+    /// `(addr: i32) → ()` — invalidate the JIT block covering `addr`.
+    ///
+    /// Mirrors the native JIT's `HookKind::InvICache` hook emitted by `icbi`.
+    CallIcbi,
+    /// `() → ()` — flush the entire instruction cache.
+    ///
+    /// Mirrors the native JIT's `HookKind::ClearICache` hook emitted by `isync`.
+    CallIsync,
+
+    // ─── FPU availability guard ───────────────────────────────────────────────
+    /// Check MSR.FP (bit 13); if clear, write `pc` to `Cpu::pc` and raise
+    /// `FloatUnavailable` (exception vector `0x0800`).
+    ///
+    /// Emitted before the first floating-point instruction in a block (once per
+    /// block, tracked by [`IrBlock::fp_checked`]).  Mirrors the native JIT's
+    /// `Builder::check_floats()` in-block guard.
+    CheckFpAvail(u32),
+
     // ─── Integer arithmetic ───────────────────────────────────────────────────
     I32Add, I32Sub, I32Mul, I32DivS, I32DivU,
 
@@ -199,6 +227,11 @@ pub struct IrBlock {
     pub local_types: Vec<IrTy>,
     /// Names of unimplemented PPC opcodes.
     pub unimplemented_ops: Vec<String>,
+    /// Whether a [`IrInst::CheckFpAvail`] guard has already been emitted in
+    /// this block.  Set to `true` after the first floating-point instruction
+    /// so that subsequent FP instructions in the same block do not re-check.
+    /// Mirrors the native JIT's `Builder::floats_checked` flag.
+    pub fp_checked: bool,
 }
 
 impl IrBlock {

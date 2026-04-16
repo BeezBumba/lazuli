@@ -669,6 +669,23 @@ function getRamView(emu) {
   return ramView;
 }
 
+/**
+ * Zero-copy view of the L2 cache-as-RAM region (16 KiB).
+ *
+ * Refreshed alongside `ramView` whenever WASM linear memory grows.
+ * Serves guest accesses to `0xE000_0000`–`0xE003_FFFF` (Gekko L2 cache-RAM).
+ */
+let l2cView = null;
+
+function getL2cView(emu) {
+  const mem = wasm_memory();
+  // Share the stale-buffer check with getRamView via lastMemoryBuffer.
+  if (!l2cView || mem.buffer !== lastMemoryBuffer) {
+    l2cView = new Uint8Array(mem.buffer, emu.l2c_ptr(), emu.l2c_size());
+  }
+  return l2cView;
+}
+
 // ── Hook closure factory ──────────────────────────────────────────────────────
 
 /**
@@ -1282,9 +1299,20 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
   // view inside write_u32 (after the DMA completes) so that any subsequent
   // hook calls in the same block execution see the correctly written data.
   let r = ram;
+  // Zero-copy view of the L2 cache-as-RAM region (0xE000_0000–0xE003_FFFF).
+  // Captured once per buildHooks call; stays valid as long as WASM linear
+  // memory does not grow (growth is detected by getL2cView's buffer check).
+  const l2c = emu ? getL2cView(emu) : null;
+  // Offset and size constants for the L2 region.
+  const L2C_BASE   = 0xE0000000;
+  const L2C_MASK   = 0x00003FFF; // 16 KiB − 1
   return {
     read_u8(addr) {
       addr = addr >>> 0;
+      // L2 cache-as-RAM region (0xE000_0000–0xE003_FFFF)
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        return l2c[addr & L2C_MASK];
+      }
       // Hardware-register space (0xCCxxxxxx): all GC MMIO is 32-bit wide;
       // sub-word reads to HW space are not meaningful, return 0.
       if ((addr >>> 24 & 0xFE) === 0xCC) return 0;
@@ -1293,6 +1321,10 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     read_u16(addr) {
       addr = addr >>> 0;
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        const off = addr & L2C_MASK;
+        return off + 1 < l2c.length ? (l2c[off] << 8) | l2c[off + 1] : 0;
+      }
       if ((addr >>> 24 & 0xFE) === 0xCC) {
         // Route to Rust hw_read_u16 for hardware registers (e.g. DSP mailbox).
         const val = emu ? emu.hw_read_u16(addr) & 0xFFFF : 0;
@@ -1306,6 +1338,13 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     read_u32(addr) {
       addr = addr >>> 0;
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        const off = addr & L2C_MASK;
+        if (off + 3 < l2c.length) {
+          return (((l2c[off] << 24) | (l2c[off+1] << 16) | (l2c[off+2] << 8) | l2c[off+3]) >>> 0);
+        }
+        return 0;
+      }
       // Route hardware-register reads to hw_read_u32 before masking so that
       // 0xCC006000 (DVD Interface) reaches the correct handler instead of
       // aliasing to RAM offset 0x00006000.
@@ -1324,6 +1363,14 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
       // Read a big-endian IEEE-754 double from guest address.
       // GC hardware registers do not hold IEEE doubles — return 0.0.
       addr = addr >>> 0;
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        const off = addr & L2C_MASK;
+        if (off + 7 < l2c.length) {
+          const view = new DataView(l2c.buffer, l2c.byteOffset + off, 8);
+          return view.getFloat64(0, false /* big-endian */);
+        }
+        return 0.0;
+      }
       if ((addr >>> 24 & 0xFE) === 0xCC) return 0.0;
       addr &= PHYS_MASK;
       if (addr + 7 >= r.length) return 0.0;
@@ -1332,6 +1379,11 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     write_u8(addr, val) {
       addr = addr >>> 0;
+      // L2 cache-as-RAM region
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        l2c[addr & L2C_MASK] = val & 0xFF;
+        return;
+      }
       // Intercept character writes to the GC EXI stdout port.
       // The ipl-hle and apploader write to 0xCC007000 (cached) or
       // 0xCD007000 (uncached) one byte at a time using stb instructions.
@@ -1348,6 +1400,15 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     },
     write_u16(addr, val) {
       addr = addr >>> 0;
+      // L2 cache-as-RAM region
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        const off = addr & L2C_MASK;
+        if (off + 1 < l2c.length) {
+          l2c[off]     = (val >> 8) & 0xFF;
+          l2c[off + 1] = val & 0xFF;
+        }
+        return;
+      }
       if ((addr >>> 24 & 0xFE) === 0xCC) {
         // Route to Rust hw_write_u16 for hardware registers (e.g. DSP mailbox).
         recentMmioAccesses.push({ dir: "W", size: 16, addr, subsystem: mmioSubsystem(addr), val: val & 0xFFFF });
@@ -1364,6 +1425,17 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     write_u32(addr, val) {
       addr = addr >>> 0;
       val  = val  >>> 0;
+      // L2 cache-as-RAM region
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        const off = addr & L2C_MASK;
+        if (off + 3 < l2c.length) {
+          l2c[off]     = (val >>> 24) & 0xFF;
+          l2c[off + 1] = (val >>> 16) & 0xFF;
+          l2c[off + 2] = (val >>>  8) & 0xFF;
+          l2c[off + 3] =  val         & 0xFF;
+        }
+        return;
+      }
       // Route hardware-register writes to hw_write_u32 before masking.
       // Writing 0xCC006000-0xCC006027 drives the DVD Interface; bit 0 of
       // DICR (0x1C) triggers a DMA from the stored disc image into guest RAM.
@@ -1429,6 +1501,14 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
     write_f64(addr, val) {
       // Write a big-endian IEEE-754 double to guest address.
       addr = addr >>> 0;
+      if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length) {
+        const off = addr & L2C_MASK;
+        if (off + 7 < l2c.length) {
+          const view = new DataView(l2c.buffer, l2c.byteOffset + off, 8);
+          view.setFloat64(0, val, false /* big-endian */);
+        }
+        return;
+      }
       if ((addr >>> 24 & 0xFE) === 0xCC) return; // HW registers are not doubles
       addr &= PHYS_MASK;
       if (addr + 7 >= r.length) return;
@@ -1583,6 +1663,65 @@ function buildHooks(ram, log, emu, numericPc, pcContext = "?") {
         case 7:  return 2;  // i16
         default: return 4;  // reserved — treat as float
       }
+    },
+
+    // ── Instruction-cache management hooks ────────────────────────────────────
+    //
+    // These implement the GameCube Gekko `icbi` / `isync` instructions.  Guest
+    // code uses them after patching executable memory (e.g. patching a branch,
+    // self-modifying code, or overlays) to ensure the CPU fetches the new
+    // instructions.  We mirror this by evicting the affected compiled WASM
+    // modules from the JavaScript block cache.
+
+    /**
+     * Invalidate the compiled block containing guest address `addr`.
+     *
+     * Called for every `icbi rA, rB` instruction.  We convert the effective
+     * address to a physical address and evict all moduleCache entries whose
+     * physical PC falls within a 4-byte window around that address (a block
+     * that covers any instruction at the invalidated cache line is purged).
+     *
+     * @param {number} addr  Effective address (i32, sign-extended — treated as u32)
+     */
+    icbi(addr) {
+      addr = addr >>> 0;
+      const physAddr = addr & PHYS_MASK;
+      // Evict any block whose physical PC matches this address.
+      // We also check the most common virtual address forms (KSEG0 / KSEG1).
+      for (const [vpc] of moduleCache) {
+        const physPc = (vpc & PHYS_MASK) >>> 0;
+        const meta   = blockMetaMap.get(vpc);
+        // A cache line on Gekko is 32 bytes; icbi aligns to the 32-byte line
+        // containing addr.  Be conservative and invalidate any block whose
+        // first instruction falls within the same 32-byte cache line.
+        const lineBase = physAddr & ~31;
+        const lineEnd  = lineBase + 32;
+        if (physPc >= lineBase && physPc < lineEnd) {
+          moduleCache.delete(vpc);
+          blockMetaMap.delete(vpc);
+        } else if (meta) {
+          // Also check if the block *contains* the address (block may start
+          // before the cache line but encode instructions within it).
+          const blockEnd = physPc + meta.insCount * 4;
+          if (physPc < lineEnd && blockEnd > lineBase) {
+            moduleCache.delete(vpc);
+            blockMetaMap.delete(vpc);
+          }
+        }
+      }
+    },
+
+    /**
+     * Flush the entire instruction cache.
+     *
+     * Called for every `isync` instruction.  `isync` marks the end of an
+     * icbi sequence, guaranteeing subsequent instruction fetches see the new
+     * code.  We conservatively flush all compiled blocks, mirroring the
+     * native JIT's `HookKind::ClearICache` path.
+     */
+    isync() {
+      moduleCache.clear();
+      blockMetaMap.clear();
     },
   };
 }
@@ -2663,6 +2802,19 @@ function gameLoop(emu, canvas, ctx, timestamp) {
     renderFprRegisters(emu);
   }
 
+  // Persist SRAM to localStorage once per second (~every 60 frames).
+  // The SRAM stores user settings (language, sound mode, etc.) that games
+  // read during boot.  Saving periodically ensures they survive page reloads.
+  if (frameCount % 60 === 0) {
+    try {
+      const sramBytes = emu.get_sram();
+      const sramB64   = btoa(String.fromCharCode(...sramBytes));
+      localStorage.setItem("lazuli_sram", sramB64);
+    } catch (_) {
+      // localStorage may be unavailable (private browsing, quota exceeded).
+    }
+  }
+
   animFrameId = requestAnimationFrame((ts) => gameLoop(emu, canvas, ctx, ts));
 }
 
@@ -2749,6 +2901,21 @@ async function main() {
     // 24 MiB of guest RAM — matches the GameCube's main memory
     emu = new WasmEmulator(24 * 1024 * 1024);
     emu.set_pc(0x80000000);
+    // ── Restore persistent SRAM from localStorage ─────────────────────────
+    // The GameCube IPL stores user settings (language, sound mode, progressive
+    // mode, etc.) in a 64-byte SRAM backed by a coin-cell battery.  We persist
+    // it in localStorage so games see the same settings across sessions, just
+    // as the native emulator persists SRAM to disk.
+    try {
+      const sramB64 = localStorage.getItem("lazuli_sram");
+      if (sramB64) {
+        const raw = Uint8Array.from(atob(sramB64), c => c.charCodeAt(0));
+        emu.set_sram(raw);
+        console.log("[lazuli] SRAM restored from localStorage");
+      }
+    } catch (sramErr) {
+      console.warn("[lazuli] Could not restore SRAM from localStorage:", sramErr);
+    }
     setStatus("✓ WASM module loaded — load an ISO or a demo program to begin", "status-ok");
     $("btn-compile").disabled  = false;
     $("btn-load-iso").disabled = false;

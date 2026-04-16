@@ -319,6 +319,43 @@ impl WasmEmulator {
         self.ram.len() as u32
     }
 
+    /// Returns the WASM linear-memory pointer to the L2 cache-as-RAM buffer.
+    ///
+    /// The L2 cache region is 16 KiB and corresponds to guest addresses
+    /// `0xE000_0000`–`0xE003_FFFF`.  JavaScript uses this pointer to create a
+    /// `Uint8Array` view and services reads/writes to those addresses directly,
+    /// matching the native emulator's `0xE000_0000` L2 cache-RAM region.
+    ///
+    /// ```js
+    /// const l2c = new Uint8Array(wasm_memory().buffer, emu.l2c_ptr(), emu.l2c_size());
+    /// ```
+    pub fn l2c_ptr(&self) -> u32 {
+        self.l2c.as_ptr() as u32
+    }
+
+    /// Returns the size of the L2 cache-as-RAM buffer in bytes (always 16 KiB).
+    pub fn l2c_size(&self) -> u32 {
+        self.l2c.len() as u32
+    }
+
+    /// Returns the 64-byte SRAM contents as a `Uint8Array`.
+    ///
+    /// JavaScript should persist these bytes in `localStorage` and call
+    /// [`set_sram`] on startup to restore saved settings (language, sound mode,
+    /// etc.), mirroring the native emulator's on-disk SRAM persistence.
+    pub fn get_sram(&self) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::from(self.exi.sram.as_slice())
+    }
+
+    /// Overwrite the 64-byte SRAM with `data`.
+    ///
+    /// Call this on emulator startup with bytes previously saved to
+    /// `localStorage` by [`get_sram`].
+    pub fn set_sram(&mut self, data: js_sys::Uint8Array) {
+        let len = data.length().min(self.exi.sram.len() as u32) as usize;
+        data.slice(0, len as u32).copy_to(&mut self.exi.sram[..len]);
+    }
+
     // ── CPU struct serialisation ──────────────────────────────────────────────
 
     /// Size in bytes of the [`gekko::Cpu`] struct.

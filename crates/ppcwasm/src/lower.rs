@@ -35,6 +35,7 @@ const TY_I_F64:     u32 = 3; // (i32) -> f64
 const TY_IF64_VOID: u32 = 4; // (i32, f64) -> ()
 const TY_II_F64:    u32 = 5; // (i32, i32) -> f64  — psq_load
 const TY_IIF64_I32: u32 = 6; // (i32, i32, f64) -> i32  — psq_store
+const TY_VOID:      u32 = 7; // () -> ()  — isync
 const TY_EXECUTE:   u32 = TY_I32_I32;
 
 // ─── MemArg helpers ───────────────────────────────────────────────────────────
@@ -81,6 +82,7 @@ pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
     types.ty().function([ValType::I32, ValType::F64], []);                  // 4
     types.ty().function([ValType::I32, ValType::I32], [ValType::F64]);      // 5  psq_load
     types.ty().function([ValType::I32, ValType::I32, ValType::F64], [ValType::I32]); // 6  psq_store
+    types.ty().function([], []);                                            // 7  isync
 
     let mut isec = ImportSection::new();
     isec.import("env", "memory", EntityType::Memory(MemoryType {
@@ -99,6 +101,8 @@ pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
     isec.import(h, "psq_load",        EntityType::Function(TY_II_F64));
     isec.import(h, "psq_store",       EntityType::Function(TY_IIF64_I32));
     isec.import(h, "psq_load_size",   EntityType::Function(TY_I32_I32));
+    isec.import(h, "icbi",            EntityType::Function(TY_I_VOID));
+    isec.import(h, "isync",           EntityType::Function(TY_VOID));
 
     let mut fsec = FunctionSection::new();
     fsec.function(TY_EXECUTE);
@@ -217,6 +221,48 @@ fn emit_inst(
         IrInst::StorePC        => store_i32(off.pc, si32, b),
         IrInst::StoreGqr(n)    => store_i32(off.gqr[*n as usize], si32, b),
         IrInst::StoreFpscr     => store_i32(off.fpscr, si32, b),
+
+        // ── Generic register-struct field access ──────────────────────────────
+        // These cover BAT, HID, WPAR, DMAL, DMAU, L2CR, segment registers,
+        // and any other Cpu field accessed via a compile-time byte offset.
+        IrInst::LoadRegOff(offset) => load_i32(*offset, b),
+        IrInst::StoreRegOff(offset) => store_i32(*offset, si32, b),
+
+        // ── Instruction-cache management ──────────────────────────────────────
+        // `icbi rA, rB` — the EA is already on the WASM stack when CallIcbi is
+        // emitted by the decoder.
+        IrInst::CallIcbi  => { b.push(Instruction::Call(imports::ICBI)); }
+        // `isync` / `sync` — no argument.
+        IrInst::CallIsync => { b.push(Instruction::Call(imports::ISYNC)); }
+
+        // ── FPU availability guard ────────────────────────────────────────────
+        // Emitted (at most once per block) before the first floating-point
+        // instruction.  Checks MSR.FP (bit 13 = 0x2000); if clear, writes the
+        // instruction PC to Cpu::pc and raises FloatUnavailable (0x0800) so
+        // that the OS's exception handler can enable FP or do a lazy context
+        // save, exactly as real hardware does.
+        IrInst::CheckFpAvail(pc) => {
+            // Load MSR and test bit 13.
+            b.push(Instruction::LocalGet(0));
+            b.push(Instruction::I32Load(m32(off.msr)));
+            b.push(Instruction::I32Const(0x2000));
+            b.push(Instruction::I32And);
+            b.push(Instruction::I32Eqz);
+            // If FP is disabled (bit 13 == 0) → raise exception.
+            b.push(Instruction::If(BlockType::Empty));
+            // Store the PC of this FP instruction so SRR0 is correct.
+            b.push(Instruction::LocalGet(0));
+            b.push(Instruction::I32Const(*pc as i32));
+            b.push(Instruction::I32Store(m32(off.pc)));
+            // Call raise_exception(0x0800) — FloatUnavailable vector.
+            b.push(Instruction::I32Const(0x0800));
+            b.push(Instruction::Call(imports::RAISE_EXCEPTION));
+            // Return 0 (the raise_exception hook delivers the exception through
+            // the normal JS path; returning 0 signals "PC already written").
+            b.push(Instruction::I32Const(0));
+            b.push(Instruction::Return);
+            b.push(Instruction::End);
+        }
 
         // ── Integer arithmetic ─────────────────────────────────────────────────
         IrInst::I32Add   => b.push(Instruction::I32Add),

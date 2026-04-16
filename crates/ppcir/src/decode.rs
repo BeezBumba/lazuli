@@ -1,7 +1,10 @@
 //! PowerPC → IR decoder.
 
 use gekko::disasm::{Ins, Opcode};
-use gekko::InsExt;
+use gekko::{Cpu, InsExt};
+// `util::offset_of!` supports array indexing (e.g. `sr[n]`, `ibat[n]`)
+// unlike `std::mem::offset_of!` in the current nightly toolchain.
+use util::offset_of;
 
 use crate::inst::{IrBlock, IrInst, IrLocal, IrTy};
 
@@ -521,6 +524,58 @@ impl Decoder {
     // ── Main dispatch ─────────────────────────────────────────────────────────
 
     /// Returns the cycle cost for a given opcode, matching the native JIT costs.
+    /// Returns `true` if `op` is a floating-point instruction that requires
+    /// MSR.FP (bit 13) to be set.  Used by [`emit_inst`] to guard the first
+    /// FP instruction in a block with [`IrInst::CheckFpAvail`], mirroring the
+    /// native JIT's `check_floats()`.
+    fn is_fp_opcode(op: Opcode) -> bool {
+        matches!(op,
+            // FP loads / stores
+            Opcode::Lfs  | Opcode::Lfsu  | Opcode::Lfsx  | Opcode::Lfsux
+            | Opcode::Lfd  | Opcode::Lfdu  | Opcode::Lfdx  | Opcode::Lfdux
+            | Opcode::Stfs | Opcode::Stfsu | Opcode::Stfsx | Opcode::Stfsux
+            | Opcode::Stfd | Opcode::Stfdu | Opcode::Stfdx | Opcode::Stfdux
+            | Opcode::Stfiwx
+            // FP arithmetic
+            | Opcode::Fadd  | Opcode::Fadds
+            | Opcode::Fsub  | Opcode::Fsubs
+            | Opcode::Fmul  | Opcode::Fmuls
+            | Opcode::Fdiv  | Opcode::Fdivs
+            | Opcode::Fmadd | Opcode::Fmadds
+            | Opcode::Fmsub | Opcode::Fmsubs
+            | Opcode::Fnmadd | Opcode::Fnmadds
+            | Opcode::Fnmsub | Opcode::Fnmsubs
+            | Opcode::Fabs  | Opcode::Fnabs
+            | Opcode::Fmr   | Opcode::Fneg
+            | Opcode::Frsp
+            | Opcode::Fsqrt | Opcode::Fsqrts
+            | Opcode::Fres  | Opcode::Frsqrte
+            | Opcode::Fctiw | Opcode::Fctiwz
+            // FP compare / FPSCR
+            | Opcode::Fcmpu | Opcode::Fcmpo
+            | Opcode::Mffs
+            | Opcode::Mtfsf | Opcode::Mtfsfi | Opcode::Mtfsb0 | Opcode::Mtfsb1
+            | Opcode::Mcrfs
+            // Paired-singles (base ops only; the Adds0/Subs1/… slot variants
+            // are not separate enum members in the powerpc crate)
+            | Opcode::PsAdd  | Opcode::PsSub  | Opcode::PsMul
+            | Opcode::PsDiv
+            | Opcode::PsMadd  | Opcode::PsMadds0  | Opcode::PsMadds1
+            | Opcode::PsMsub
+            | Opcode::PsNmadd | Opcode::PsNmsub
+            | Opcode::PsMuls0 | Opcode::PsMuls1
+            | Opcode::PsAbs | Opcode::PsNabs | Opcode::PsMr | Opcode::PsNeg
+            | Opcode::PsRes | Opcode::PsRsqrte
+            | Opcode::PsMerge00 | Opcode::PsMerge01
+            | Opcode::PsMerge10 | Opcode::PsMerge11
+            | Opcode::PsCmpu0 | Opcode::PsCmpu1
+            | Opcode::PsCmpo0 | Opcode::PsCmpo1
+            // Quantised paired-single loads/stores
+            | Opcode::PsqL  | Opcode::PsqLu  | Opcode::PsqLx  | Opcode::PsqLux
+            | Opcode::PsqSt | Opcode::PsqStu | Opcode::PsqStx | Opcode::PsqStux
+        )
+    }
+
     fn cycles_for(op: Opcode) -> u32 {
         match op {
             // 1-cycle logical/register operations
@@ -555,6 +610,12 @@ impl Decoder {
     fn emit_inst(&self, b: &mut IrBlock, ins: Ins, pc: u32) -> Result<bool, String> {
         b.instruction_count += 1;
         b.cycles += Self::cycles_for(ins.op);
+        // Emit the FPU-availability guard once per block before the first
+        // floating-point instruction.  Mirrors the native JIT's check_floats().
+        if Self::is_fp_opcode(ins.op) && !b.fp_checked {
+            b.fp_checked = true;
+            b.push(IrInst::CheckFpAvail(pc));
+        }
         match ins.op {
             // ── Integer arithmetic ────────────────────────────────────────────
             Opcode::Addi => {
@@ -1587,6 +1648,31 @@ impl Decoder {
                     917 => IrInst::LoadGqr(5),
                     918 => IrInst::LoadGqr(6),
                     919 => IrInst::LoadGqr(7),
+                    // ── BAT registers ─────────────────────────────────────────
+                    // Bat is 8 bytes; lower word (L) at +0, upper word (U) at +4.
+                    528 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.ibat[0]) + 4) as u64),
+                    529 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.ibat[0])      as u64),
+                    530 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.ibat[1]) + 4) as u64),
+                    531 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.ibat[1])      as u64),
+                    532 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.ibat[2]) + 4) as u64),
+                    533 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.ibat[2])      as u64),
+                    534 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.ibat[3]) + 4) as u64),
+                    535 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.ibat[3])      as u64),
+                    536 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.dbat[0]) + 4) as u64),
+                    537 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.dbat[0])      as u64),
+                    538 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.dbat[1]) + 4) as u64),
+                    539 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.dbat[1])      as u64),
+                    540 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.dbat[2]) + 4) as u64),
+                    541 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.dbat[2])      as u64),
+                    542 => IrInst::LoadRegOff((offset_of!(Cpu, supervisor.memory.dbat[3]) + 4) as u64),
+                    543 => IrInst::LoadRegOff( offset_of!(Cpu, supervisor.memory.dbat[3])      as u64),
+                    // ── HID / WPAR / DMA / L2CR ───────────────────────────────
+                    920  => IrInst::LoadRegOff(offset_of!(Cpu, supervisor.config.hid[2])          as u64),
+                    921  => IrInst::LoadRegOff(offset_of!(Cpu, supervisor.config.wpar)            as u64),
+                    922  => IrInst::LoadRegOff(offset_of!(Cpu, supervisor.config.dma.upper)       as u64),
+                    923  => IrInst::LoadRegOff(offset_of!(Cpu, supervisor.config.dma.lower)       as u64),
+                    1008 => IrInst::LoadRegOff(offset_of!(Cpu, supervisor.config.hid[0])          as u64),
+                    1017 => IrInst::LoadRegOff(offset_of!(Cpu, supervisor.misc.l2cr)              as u64),
                     _   => IrInst::I32Const(0),
                 };
                 b.push(load); b.push(IrInst::StoreGpr(rd));
@@ -1614,6 +1700,30 @@ impl Decoder {
                     917 => b.push(IrInst::StoreGqr(5)),
                     918 => b.push(IrInst::StoreGqr(6)),
                     919 => b.push(IrInst::StoreGqr(7)),
+                    // ── BAT registers ─────────────────────────────────────────
+                    528 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.ibat[0]) + 4) as u64)),
+                    529 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.ibat[0])      as u64)),
+                    530 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.ibat[1]) + 4) as u64)),
+                    531 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.ibat[1])      as u64)),
+                    532 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.ibat[2]) + 4) as u64)),
+                    533 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.ibat[2])      as u64)),
+                    534 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.ibat[3]) + 4) as u64)),
+                    535 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.ibat[3])      as u64)),
+                    536 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.dbat[0]) + 4) as u64)),
+                    537 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.dbat[0])      as u64)),
+                    538 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.dbat[1]) + 4) as u64)),
+                    539 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.dbat[1])      as u64)),
+                    540 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.dbat[2]) + 4) as u64)),
+                    541 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.dbat[2])      as u64)),
+                    542 => b.push(IrInst::StoreRegOff((offset_of!(Cpu, supervisor.memory.dbat[3]) + 4) as u64)),
+                    543 => b.push(IrInst::StoreRegOff( offset_of!(Cpu, supervisor.memory.dbat[3])      as u64)),
+                    // ── HID / WPAR / DMA / L2CR ───────────────────────────────
+                    920  => b.push(IrInst::StoreRegOff(offset_of!(Cpu, supervisor.config.hid[2])          as u64)),
+                    921  => b.push(IrInst::StoreRegOff(offset_of!(Cpu, supervisor.config.wpar)            as u64)),
+                    922  => b.push(IrInst::StoreRegOff(offset_of!(Cpu, supervisor.config.dma.upper)       as u64)),
+                    923  => b.push(IrInst::StoreRegOff(offset_of!(Cpu, supervisor.config.dma.lower)       as u64)),
+                    1008 => b.push(IrInst::StoreRegOff(offset_of!(Cpu, supervisor.config.hid[0])          as u64)),
+                    1017 => b.push(IrInst::StoreRegOff(offset_of!(Cpu, supervisor.misc.l2cr)              as u64)),
                     _   => b.push(IrInst::Drop),
                 }
             }
@@ -1810,9 +1920,34 @@ impl Decoder {
                 }
             }
 
-            // ── Cache/sync hints (no-ops) ─────────────────────────────────────
-            Opcode::Sync|Opcode::Isync|Opcode::Eieio|Opcode::Dcbst|Opcode::Icbi|Opcode::Dcbi|Opcode::Dcbf
-            | Opcode::Dcbt | Opcode::Dcbtst | Opcode::Tlbie | Opcode::Tlbsync
+            // ── Cache/sync hints ──────────────────────────────────────────────
+            // `icbi rA, rB` — invalidate the instruction-cache block that
+            // contains the effective address rA+rB (or rB if rA==0).  We
+            // compute the EA the same way as for X-form memory instructions and
+            // call the `icbi` hook so the JS block cache can evict the
+            // corresponding compiled WASM module.
+            Opcode::Icbi => {
+                let ra = ins.gpr_a() as u8;
+                let rb = ins.gpr_b() as u8;
+                self.push_ea_x(b, ra, rb);
+                b.push(IrInst::CallIcbi);
+            }
+            // `isync` — synchronise the instruction stream after a series of
+            // `icbi` calls.  We map this to the isync hook which flushes the
+            // entire JS block cache (equivalent to the native JIT's
+            // HookKind::ClearICache).
+            Opcode::Isync => {
+                b.push(IrInst::CallIsync);
+            }
+            // `sync` / `eieio` — memory ordering barriers.  No-ops in the JIT
+            // but emitted separately from the true no-ops above so that a
+            // future implementation can add memory-fence semantics if needed.
+            Opcode::Sync | Opcode::Eieio
+            // dcb* / tlb* — data-cache and TLB management hints; no-ops in the
+            // software-emulated memory model.
+            | Opcode::Dcbst | Opcode::Dcbi | Opcode::Dcbf
+            | Opcode::Dcbt  | Opcode::Dcbtst
+            | Opcode::Tlbie | Opcode::Tlbsync
             // External control instructions — no-ops (no physical device attached)
             | Opcode::Eciwx | Opcode::Ecowx => {}
 
@@ -2042,13 +2177,24 @@ impl Decoder {
                 b.push(IrInst::I32Or); b.push(IrInst::StoreCr);
             }
 
-            // ── Segment registers (not tracked in browser emulator) ───────────
+            // ── Segment registers ─────────────────────────────────────────────
+            // mfsr rD, SR<n>  (Opcode::Mfsr, field SR = bits 16–19)
+            // mfsr stores rD ← SR[n].  Segment registers live in Cpu::supervisor.memory.sr[].
             Opcode::Mfsr => {
-                // Move from segment register: return 0 (SR not tracked).
                 let rd = ins.gpr_d() as u8;
-                b.push(IrInst::I32Const(0)); b.push(IrInst::StoreGpr(rd));
+                let sr = ins.field_sr() as usize;
+                let off = (offset_of!(Cpu, supervisor.memory.sr[0]) + sr * 4) as u64;
+                b.push(IrInst::LoadRegOff(off));
+                b.push(IrInst::StoreGpr(rd));
             }
-            Opcode::Mtsr => { /* no-op: segment registers not tracked */ }
+            // mtsr SR<n>, rS  (Opcode::Mtsr, field SR = bits 16–19)
+            Opcode::Mtsr => {
+                let rs = ins.gpr_s() as u8;
+                let sr = ins.field_sr() as usize;
+                let off = (offset_of!(Cpu, supervisor.memory.sr[0]) + sr * 4) as u64;
+                b.push(IrInst::LoadGpr(rs));
+                b.push(IrInst::StoreRegOff(off));
+            }
 
             // ── Paired-single compare (ps0 or ps1 slot) ───────────────────────
             Opcode::PsCmpu0 | Opcode::PsCmpo0 => {

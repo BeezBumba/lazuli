@@ -71,7 +71,9 @@ struct ExiChannel {
 pub(crate) struct ExiState {
     channels: [ExiChannel; 3],
     /// 64-byte stub SRAM (all zeroes; games fall back to defaults when read).
-    sram: [u8; 64],
+    /// Made `pub(crate)` so `WasmEmulator::get_sram` / `set_sram` can provide
+    /// JavaScript with persistent access (stored in `localStorage`).
+    pub(crate) sram: [u8; 64],
     /// True after the IPL/UART device (channel 0, device_sel=0b010) receives
     /// the UART-write command (`0xA001_0000`).  Subsequent writes on that
     /// channel are treated as UART data bytes rather than new commands.
