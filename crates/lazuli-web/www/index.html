@@ -636,6 +636,30 @@
   </div>
 </main>
 
+<!-- Cross-Origin Isolation shim — must run before the ES-module bootstrap.
+     Registers coi-serviceworker.js which re-serves all same-origin responses
+     with COOP/COEP headers.  On the very first page load (before the worker
+     controls the page) the fetch listener is not yet active, so the page is
+     reloaded once after registration to get the isolation headers.
+     When the production server already sends these headers (see `just
+     web-serve`) the service worker is redundant but harmless. -->
+<script>
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./coi-serviceworker.js")
+      .then(() => {
+        // If the service worker is newly registered it does not yet control
+        // this page.  Reload so all subsequent fetches go through the worker
+        // and receive the COOP/COEP headers that enable SharedArrayBuffer.
+        if (!navigator.serviceWorker.controller) {
+          console.log("[lazuli] COI service worker installed — reloading for cross-origin isolation");
+          window.location.reload();
+        }
+      })
+      .catch((e) =>
+        console.warn("[lazuli] COI service worker registration failed:", e)
+      );
+  }
+</script>
 <script type="module" src="bootstrap.js"></script>
 </body>
 </html>
