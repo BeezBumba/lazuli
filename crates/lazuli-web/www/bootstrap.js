@@ -2816,7 +2816,7 @@ function renderLoop(canvas, ctx, timestamp) {
 }
 
 
- * Time-base ticks to advance per animation frame.
+ /* Time-base ticks to advance per animation frame.
  *
  * The GameCube's Gekko time base increments at CPU / 12 ≈ 40.5 MHz.
  * At 60 fps that is 40,500,000 / 60 = 675,000 ticks per frame.  Games use
