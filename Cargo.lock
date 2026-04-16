@@ -2672,6 +2672,7 @@ dependencies = [
 name = "lazuli-web"
 version = "0.1.0"
 dependencies = [
+ "disks",
  "gekko",
  "js-sys",
  "ppcwasm",

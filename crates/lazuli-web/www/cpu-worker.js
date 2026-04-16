@@ -1077,13 +1077,51 @@ self.onmessage = async ({ data: msg }) => {
         prevPhase = "unknown"; frameCount = 0; blocksExecutedTotal = 0;
 
         const iplHleDol = msg.iplHleData ? new Uint8Array(msg.iplHleData) : null;
-        const meta = parseAndLoadIso(msg.isoData, iplHleDol);
 
-        // Store disc image for in-game DVD reads.
-        emu.load_disc_image(new Uint8Array(msg.isoData));
+        // Use the Rust-side disc parser which handles both raw ISO and CISO
+        // (Compact ISO) formats transparently.  It:
+        //   • Detects and decompresses CISO images
+        //   • Parses the ISO header, apploader, and boot DOL
+        //   • Loads all DOL sections and the apploader body into guest RAM
+        //   • Stores the flat disc image for runtime DVD Read DMA
+        //   • Returns { gameName, gameId, dolEntry, apploaderEntry }
+        const discBytes = new Uint8Array(msg.isoData);
+        const discMeta = emu.parse_and_load_disc(discBytes);
+        const { gameName, gameId, dolEntry, apploaderEntry } = discMeta;
 
-        gameTitle = meta.gameName || meta.gameId || "Unknown Game";
-        self.postMessage({ type: "iso_loaded", gameName: meta.gameName, gameId: meta.gameId, entry: meta.entry });
+        postApploaderLog(`[IPL-HLE] ISO: "${gameName}" (${gameId}), ${(discBytes.byteLength / (1024*1024)).toFixed(1)} MiB`);
+        postApploaderLog(`[IPL-HLE] Apploader entry:   0x${apploaderEntry.toString(16).toUpperCase().padStart(8,"0")}`);
+        postApploaderLog(`[IPL-HLE] DOL entry:         0x${dolEntry.toString(16).toUpperCase().padStart(8,"0")}`);
+        console.log(`[lazuli-worker] ISO: "${gameName}" (${gameId}) apploader=0x${apploaderEntry.toString(16)} dol=0x${dolEntry.toString(16)}`);
+
+        // Load and set up the ipl-hle DOL; this is separate from the game
+        // DOL and cannot be done inside parse_and_load_disc.
+        if (!iplHleDol)
+          throw new Error("ipl-hle.dol is not available — run `just ipl-hle build` then `just web-build`");
+
+        const iplEntry = emu.load_ipl_hle(iplHleDol);
+        emu.set_gpr(3, apploaderEntry);
+        postApploaderLog(`[IPL-HLE] ipl-hle entry:     0x${iplEntry.toString(16).toUpperCase().padStart(8,"0")}`);
+        postApploaderLog(`[IPL-HLE] r3: 0x${apploaderEntry.toString(16).toUpperCase().padStart(8,"0")}  (apploader entry fn)`);
+
+        // Minimal exception-vector stubs so the OS can take interrupts during boot.
+        const rfi         = new Uint8Array([0x4C, 0x00, 0x00, 0x64]);
+        const skipAndRfi  = new Uint8Array([0x7C,0x1A,0x02,0xA6, 0x38,0x00,0x00,0x04, 0x7C,0x1A,0x03,0xA6, 0x4C,0x00,0x00,0x64]);
+        const fpEnableRfi = new Uint8Array([0x7C,0x1B,0x02,0xA6, 0x60,0x00,0x20,0x00, 0x7C,0x1B,0x03,0xA6, 0x4C,0x00,0x00,0x64]);
+        emu.load_bytes(0x00000300, skipAndRfi);
+        emu.load_bytes(0x00000400, skipAndRfi);
+        emu.load_bytes(0x00000500, rfi);
+        emu.load_bytes(0x00000600, skipAndRfi);
+        emu.load_bytes(0x00000700, skipAndRfi);
+        emu.load_bytes(0x00000800, fpEnableRfi);
+        emu.load_bytes(0x00000900, rfi);
+        emu.load_bytes(0x00000C00, rfi);
+
+        emu.set_pc(iplEntry);
+        emu.set_msr(0x0000);
+
+        gameTitle = gameName || gameId || "Unknown Game";
+        self.postMessage({ type: "iso_loaded", gameName, gameId, entry: iplEntry });
       } catch (e) {
         console.error("[lazuli-worker] ISO load failed:", e);
         self.postMessage({ type: "iso_loaded", error: String(e) });

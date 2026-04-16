@@ -26,6 +26,7 @@ pub(crate) mod dsp;
 pub(crate) mod exi;
 pub(crate) mod gx;
 pub(crate) mod gx_fifo;
+pub(crate) mod mi;
 pub(crate) mod pi;
 pub(crate) mod si;
 pub(crate) mod vi;
@@ -35,6 +36,7 @@ pub(crate) use di::{DiState, DI_BASE, DI_SIZE};
 pub(crate) use dsp::{DspState, DSP_BASE, DSP_SIZE};
 pub(crate) use exi::{ExiState, EXI_BASE, EXI_SIZE};
 pub(crate) use gx::{GxState, GX_BASE, GX_SIZE};
+pub(crate) use mi::{MiState, MI_BASE, MI_SIZE};
 pub(crate) use pi::{
     PI_BASE, PI_BUSCLK_VAL, PI_CPUCLK_VAL, PI_INT_AI, PI_INT_DI, PI_INT_DSP, PI_INT_PE_FINISH,
     PI_INT_PE_TOKEN, PI_INT_SI as PI_SI, PI_INT_VI, PI_MEMSIZE_VAL, PI_SIZE,
@@ -111,6 +113,14 @@ impl WasmEmulator {
         // ── DVD Interface ──────────────────────────────────────────────────
         if addr >= DI_BASE && addr < DI_BASE + DI_SIZE {
             return self.di.read_reg(addr - DI_BASE);
+        }
+
+        // ── Memory Interface ───────────────────────────────────────────────
+        if addr >= MI_BASE && addr < MI_BASE + MI_SIZE {
+            let offset = addr - MI_BASE;
+            let hi = self.mi.read_u16(offset) as u32;
+            let lo = self.mi.read_u16(offset + 2) as u32;
+            return (hi << 16) | lo;
         }
 
         // ── Serial Interface ───────────────────────────────────────────────
@@ -268,6 +278,14 @@ impl WasmEmulator {
             return;
         }
 
+        // ── Memory Interface ───────────────────────────────────────────────
+        if addr >= MI_BASE && addr < MI_BASE + MI_SIZE {
+            let offset = addr - MI_BASE;
+            self.mi.write_u16(offset, (val >> 16) as u16);
+            self.mi.write_u16(offset + 2, val as u16);
+            return;
+        }
+
         // ── Serial Interface ───────────────────────────────────────────────
         if addr >= SI_BASE && addr < SI_BASE + SI_SIZE {
             let triggered = self.si.write_u32(addr - SI_BASE, val, self.pad_buttons);
@@ -336,6 +354,11 @@ impl WasmEmulator {
             };
         }
 
+        // ── Memory Interface ───────────────────────────────────────────────
+        if addr >= MI_BASE && addr < MI_BASE + MI_SIZE {
+            return self.mi.read_u16(addr - MI_BASE);
+        }
+
         // ── Serial Interface — 16-bit access to 32-bit SI register ────────
         if addr >= SI_BASE && addr < SI_BASE + SI_SIZE {
             let word = self.si.read_u32(addr - SI_BASE & !3);
@@ -386,6 +409,12 @@ impl WasmEmulator {
             // have changed, or interrupt pending bits may have been W1C'd).
             self.sync_pi_dsp();
             self.maybe_deliver_external_interrupt();
+            return;
+        }
+
+        // ── Memory Interface ───────────────────────────────────────────────
+        if addr >= MI_BASE && addr < MI_BASE + MI_SIZE {
+            self.mi.write_u16(addr - MI_BASE, val);
         }
     }
 
