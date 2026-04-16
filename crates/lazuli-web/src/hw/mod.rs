@@ -25,6 +25,7 @@ pub(crate) mod di;
 pub(crate) mod dsp;
 pub(crate) mod exi;
 pub(crate) mod gx;
+pub(crate) mod gx_fifo;
 pub(crate) mod pi;
 pub(crate) mod si;
 pub(crate) mod vi;
@@ -147,6 +148,32 @@ impl WasmEmulator {
     pub fn hw_write_u32(&mut self, addr: u32, val: u32) {
         let addr = addr & !UNCACHED_MIRROR_BIT;
 
+        // ── PI Write-Gather Port (GX FIFO) — 0xCC008000–0xCC00801F ──────────
+        // The CPU pushes GX commands here via STW/STWBRX.  Each 32-byte burst
+        // is forwarded to the GX FIFO parser which:
+        //   • tracks the CP register file (VCD / VAT) for vertex-size computation;
+        //   • fires PE_FINISH when a LoadBP PixelDone (0x45) command is seen,
+        //     replacing the coarse VI-rate PE_FINISH stub.
+        // Mirrors native `pi::fifo_push` → CP FIFO buffer → `cmd::consume/process`.
+        if addr >= 0xCC00_8000 && addr < 0xCC00_8020 {
+            self.gx.fifo.push_u32(val);
+            // Check if the FIFO parser fired any PE interrupt.
+            if core::mem::replace(&mut self.gx.fifo.pe_finish_pending, false) {
+                if self.gx.fire_pe_finish() {
+                    self.pi_intsr |= PI_INT_PE_FINISH;
+                    self.maybe_deliver_external_interrupt();
+                }
+            }
+            if core::mem::replace(&mut self.gx.fifo.pe_token_pending, false) {
+                let token = self.gx.fifo.pe_token;
+                if self.gx.fire_pe_token(token) {
+                    self.pi_intsr |= PI_INT_PE_TOKEN;
+                    self.maybe_deliver_external_interrupt();
+                }
+            }
+            return;
+        }
+
         // ── GX: Command Processor + Pixel Engine ──────────────────────────
         // GX registers are 16-bit wide; split the 32-bit write into two
         // consecutive halfword writes (high halfword at the lower address).
@@ -254,7 +281,18 @@ impl WasmEmulator {
 
         // ── External Interface ─────────────────────────────────────────────
         if addr >= EXI_BASE && addr < EXI_BASE + EXI_SIZE {
-            self.exi.write_u32(addr - EXI_BASE, val);
+            if let Some(dma) = self.exi.write_u32(addr - EXI_BASE, val) {
+                // DMA-mode SRAM read: copy SRAM bytes → guest RAM.
+                let sram = &self.exi.sram;
+                let src_end = (dma.sram_offset + dma.length as usize).min(sram.len());
+                let src_len = src_end.saturating_sub(dma.sram_offset);
+                let dst_addr = crate::phys_addr(dma.ram_addr);
+                let dst_end  = dst_addr + src_len;
+                if dst_end <= self.ram.len() {
+                    self.ram[dst_addr..dst_end]
+                        .copy_from_slice(&sram[dma.sram_offset..src_end]);
+                }
+            }
             return;
         }
 
@@ -421,12 +459,13 @@ impl WasmEmulator {
             self.pi_intsr &= !PI_INT_VI;
         }
 
-        // Fire PE_FINISH once per frame to unblock GXWaitForDrawDone().
-        // The native build generates this via gx::cmd::consume when the CP
-        // processes a DrawDone (0x61) GX command.  Without a full FIFO decoder
-        // we simulate it here at VI-retrace rate.  `fire_pe_finish()` sets
-        // bit 3 (finish_pending) and returns true only when bit 1
-        // (finish_enable) is also set — i.e. the game has enabled the interrupt.
+        // Fire PE_FINISH once per frame as a fallback for games whose draw-done
+        // commands were not captured by the GX FIFO parser (e.g. games that use
+        // a linked FIFO mode or direct ARAM writes).  For games that properly
+        // push a LoadBP PixelDone (0x45) command through the PI Write-Gather
+        // Port (0xCC008000), the FIFO parser in `hw_write_u32` already fires
+        // PE_FINISH at the precise moment the command is processed, which is
+        // more accurate than this VI-rate approximation.
         if self.gx.fire_pe_finish() {
             self.pi_intsr |= PI_INT_PE_FINISH;
         }
