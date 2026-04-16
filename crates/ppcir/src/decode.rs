@@ -203,7 +203,21 @@ impl Decoder {
         b.push(IrInst::F64Lt);
         b.push(IrInst::LocalSet(l_fl));
 
+        // OX (overflow exception) = |val| > f64::MAX, i.e. result is ±Inf.
+        // f64.abs(NaN) = NaN; f64.gt(NaN, anything) = 0, so NaN doesn't trigger OX.
+        let l_ox = b.alloc_local(IrTy::I32);
+        b.push(IrInst::LocalGet(val)); b.push(IrInst::F64Abs);
+        b.push(IrInst::F64Const(f64::MAX)); b.push(IrInst::F64Gt);
+        b.push(IrInst::LocalSet(l_ox));
+
         // FPSCR = (FPSCR & ~FPRF_MASK) | (FL<<15 | FG<<14 | FE<<13 | FU<<12)
+        //       | VX (bit 29) | OX (bit 28) | FX (bit 31) — sticky, ORed in.
+        //
+        // FPSCR bit layout (PPC big-endian bit numbering, bit 31 = LSB):
+        //   bit 31 (LE bit  0) = FX   — floating-point exception summary (sticky)
+        //   bit 29 (LE bit  2) = VX   — invalid operation summary
+        //   bit 28 (LE bit  3) = OX   — overflow exception
+        //   bits 16–12         = FPRF — result class flags
         b.push(IrInst::LoadFpscr);
         b.push(IrInst::I32Const(!FPRF_MASK as i32));
         b.push(IrInst::I32And);
@@ -212,6 +226,20 @@ impl Decoder {
         Self::push_shifted_or(b, l_fg, 14);
         Self::push_shifted_or(b, l_fe, 13);
         Self::push_shifted_or(b, l_fu, 12);
+
+        // VX (bit 29 from LE perspective = FPSCR bit 2 from the MSB, i.e. the
+        // bit with value 1<<29 in a u32).  Use l_fu (NaN flag).
+        Self::push_shifted_or(b, l_fu, 29);
+
+        // OX (bit with value 1<<28).
+        Self::push_shifted_or(b, l_ox, 28);
+
+        // FX (bit with value 1<<31): set if either VX or OX is new.
+        // Compute l_fx = l_fu | l_ox.
+        let l_fx = b.alloc_local(IrTy::I32);
+        b.push(IrInst::LocalGet(l_fu)); b.push(IrInst::LocalGet(l_ox));
+        b.push(IrInst::I32Or); b.push(IrInst::LocalSet(l_fx));
+        Self::push_shifted_or(b, l_fx, 31);
 
         b.push(IrInst::StoreFpscr);
     }

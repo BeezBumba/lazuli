@@ -101,6 +101,13 @@ pub(crate) struct GxState {
 
     /// PE token value (0x100E): the 16-bit token written by the GX command.
     pub(crate) pe_token: u16,
+
+    // ── GX FIFO command parser ─────────────────────────────────────────────
+    /// Byte-stream parser for GX commands written to the PI Write-Gather Port
+    /// (`0xCC008000`).  Tracks the CP register file (VCD/VAT) so vertex sizes
+    /// can be computed correctly, and fires `pe_finish_pending` when a
+    /// `LoadBP PixelDone` (0x45) command is seen.
+    pub(crate) fifo: super::gx_fifo::GxFifo,
 }
 
 impl GxState {
