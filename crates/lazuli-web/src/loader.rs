@@ -324,7 +324,7 @@ impl WasmEmulator {
         set(&mut globals, 0x00, 0x0D15_EA5E); // BI2 magic
         set(&mut globals, 0x04, 0x0000_0001); // BI2 version
         set(&mut globals, 0x08, 0x0180_0000); // physical memory size (24 MiB)
-        set(&mut globals, 0x0C, 0x1000_0005); // console type (retail)
+        set(&mut globals, 0x0C, 0x0000_0003); // console type (retail)
         set(&mut globals, 0x10, 0x8042_E260); // arena_lo
         set(&mut globals, 0x14, 0x817F_E8C0); // arena_hi
         set(&mut globals, 0x18, 0x817F_E8C0); // FSSInit
