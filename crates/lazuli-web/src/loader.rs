@@ -232,8 +232,8 @@ impl WasmEmulator {
         }
     }
 
-    /// Parse a GameCube disc image (raw ISO or CISO), load the boot DOL and
-    /// apploader into guest RAM, and store the disc for runtime DVD reads.
+    /// Parse a GameCube disc image (raw ISO or CISO), load the apploader into
+    /// guest RAM, and store the disc for runtime DVD reads.
     ///
     /// This method consolidates the disc-loading logic that was previously
     /// split between the JavaScript `parseAndLoadIso` function and the
@@ -248,8 +248,12 @@ impl WasmEmulator {
     ///    `0x8000_0020`–`0x8000_00FF`, matching what the native IPL ROM writes
     ///    before transferring control to the apploader.
     /// 5. **Apploader** — the apploader body is loaded at `0x8120_0000`.
-    /// 6. **Boot DOL** — all text and data sections of the game's main DOL are
-    ///    loaded at their target addresses; the BSS region is zeroed.
+    /// 6. **Boot DOL** — the header is parsed to read the entry point; sections
+    ///    are **not** pre-loaded and BSS is **not** zeroed here.  The apploader
+    ///    (run by ipl-hle) loads every section via DI DMA, making pre-loading
+    ///    redundant.  Pre-zeroing BSS would also wipe the OS globals written in
+    ///    step 4 (e.g. arena_lo at `0x8000_0030`) if the game's BSS covers that
+    ///    region, causing a false "ArenaLo still 0" diagnostic.
     /// 7. **Runtime disc** — the flat disc image is stored for later `0xA8`
     ///    DVD Read DMA commands.
     ///
@@ -358,7 +362,18 @@ impl WasmEmulator {
             }
         }
 
-        // ── 7. Boot DOL ───────────────────────────────────────────────────────
+        // ── 7. Boot DOL (header only) ─────────────────────────────────────────
+        // Parse the DOL header to obtain the entry point for the return value,
+        // but do NOT pre-load text/data sections or zero BSS into guest RAM.
+        //
+        // The apploader (executed by ipl-hle) loads every DOL section into RAM
+        // via DI DMA during the boot sequence, so pre-loading them here would
+        // be redundant and inconsistent with native IPL behaviour.  More
+        // importantly, zeroing BSS at this point would wipe the Dolphin OS
+        // globals written in step 5 above (e.g. arena_lo at physical 0x30 /
+        // virtual 0x8000_0030) if the game's BSS region covers that area,
+        // causing the post-entry ArenaLo watch to report a false timeout.
+        // The game's CRT startup code zeroes BSS before OSInit runs anyway.
         cursor
             .seek(SeekFrom::Start(iso_header.bootfile_offset as u64))
             .map_err(|e| JsValue::from_str(&format!("seek to boot DOL: {e}")))?;
@@ -366,24 +381,9 @@ impl WasmEmulator {
             .map_err(|e| JsValue::from_str(&format!("boot DOL parse error: {e}")))?;
 
         let dol_entry = dol.entrypoint();
-        let mut section_count = 0usize;
-
-        for section in dol.text_sections() {
-            self.load_bytes(section.target, section.content);
-            section_count += 1;
-        }
-        for section in dol.data_sections() {
-            self.load_bytes(section.target, section.content);
-            section_count += 1;
-        }
-        if dol.header.bss_size > 0 {
-            let zeros = vec![0u8; dol.header.bss_size as usize];
-            self.load_bytes(dol.header.bss_target, &zeros);
-        }
 
         console_log!(
-            "[lazuli] parse_and_load_disc: boot DOL — {} sections, entry=0x{:08X}, bss=0x{:08X}+0x{:X}",
-            section_count,
+            "[lazuli] parse_and_load_disc: boot DOL — entry=0x{:08X}, bss=0x{:08X}+0x{:X} (sections not pre-loaded)",
             dol_entry,
             dol.header.bss_target,
             dol.header.bss_size,
