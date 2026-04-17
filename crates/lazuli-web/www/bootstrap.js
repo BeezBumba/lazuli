@@ -1513,24 +1513,39 @@ function osConsoleTypeString(type) {
 
 /**
  * Log a synthetic OS-banner snapshot by reading OS globals directly from guest
- * RAM.  Logs Console Type and Memory size only — ArenaLo/Hi are NOT logged
- * here because the game DOL sections loaded by the apploader can overwrite
- * physical 0x30/0x34 before game entry fires.  The post-entry watch logs Arena
- * once OSInit has written a valid value.
+ * RAM.  Logs Console Type, Memory size, and ArenaLo/Hi (when already valid).
+ *
+ * ArenaLo (physical 0x30) is checked at this point because the HLE boot path
+ * initialises it before handing control to the apploader; game DOL sections
+ * are not loaded below virtual 0x80000100, so the value is still intact when
+ * game entry fires.  If ArenaLo is valid (>= 0x80000000) the arena bounds are
+ * logged and the function returns true, signalling the caller that the
+ * post-entry ArenaLo watch is no longer needed.
  *
  * Physical addresses (= virtual - 0x80000000):
  *   0x28  RAM size (bytes)     → 0x8000_0028
  *   0x2C  Console type         → 0x8000_002C
+ *   0x30  Arena low            → 0x8000_0030
+ *   0x34  Arena high           → 0x8000_0034
  *
  * @param {Uint8Array} ram  Zero-copy guest RAM view.
+ * @returns {boolean} True if ArenaLo was valid and the arena was logged.
  */
 function logOsBannerFromRam(ram) {
   const consoleType = readRamU32(ram, 0x2C);
   const memSize     = readRamU32(ram, 0x28);
-  const memMB       = memSize ? (memSize >>> 20) : 24;
+  const memMB       = memSize >>> 20;
   const typeStr     = osConsoleTypeString(consoleType);
   appendApploaderLog(`[OS] Console Type : ${typeStr}`);
   appendApploaderLog(`[OS] Memory ${memMB} MB`);
+
+  const arenaLo = readRamU32(ram, 0x30);
+  const arenaHi = readRamU32(ram, 0x34);
+  if (arenaLo >= 0x80000000) {
+    appendApploaderLog(`[OS] Arena : ${hexU32(arenaLo)} - ${hexU32(arenaHi)}`);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -2939,11 +2954,12 @@ function gameLoop(emu, canvas, ctx, timestamp) {
             `(${elapsed} since boot)`
           );
           appendApploaderLog(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
-          // Log a synthetic OS-banner snapshot from the current RAM globals.
-          // ArenaLo is deliberately omitted — the apploader may have overwritten
-          // physical 0x30 while loading game DOL sections.  The post-entry watch
-          // below logs Arena once OSInit has written a valid value.
-          logOsBannerFromRam(ram);
+          // Log Console Type, Memory, and ArenaLo from the current RAM globals.
+          // The HLE boot path initialises ArenaLo at physical 0x30 before the
+          // apploader runs; game DOL sections are not loaded below 0x80000100,
+          // so the value is intact at game entry.  If it is already valid we
+          // mark the post-entry watch done immediately.
+          if (logOsBannerFromRam(ram)) osInitBannerDone = true;
           uartBytesAtGameEntry = totalEximUartBytes;
         }
 
