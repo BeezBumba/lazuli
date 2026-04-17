@@ -879,25 +879,11 @@ function runFrame() {
           ? Math.trunc(milestones.gameEntry - milestones.startedAt) + " ms" : "?";
         self.postMessage({ type: "milestone", name: "gameEntry", elapsed });
         uartBytesAtGameEntry = totalUartBytes;
-        // Log the OS banner from RAM globals (mirrors logOsBannerFromRam in
-        // bootstrap.js, which is only called in the single-threaded gameLoop
-        // path that is bypassed when this Worker is active).
-        // Physical 0x28 = RAM size, 0x2C = console type, 0x30/0x34 = arena.
-        // ArenaLo is checked immediately: the HLE boot path sets it before the
+        // Check ArenaLo immediately: the HLE boot path sets it before the
         // apploader runs and game DOL sections are not loaded below 0x80000100,
         // so the value is intact at game entry.  If valid, mark the post-entry
         // watch done immediately to avoid the 300-frame timeout.
         {
-          const consoleType = readRamU32(ram, 0x2C);
-          const memSize     = readRamU32(ram, 0x28);
-          const memMB       = memSize >>> 20;
-          const high        = (consoleType >>> 28) & 0xF;
-          const hex         = (consoleType >>> 0).toString(16).toUpperCase().padStart(8, "0");
-          const typeStr     = high === 0x1 ? `Development (${hex})`
-                            : high === 0x0 ? `Retail (${hex})`
-                            : `Unknown (${hex})`;
-          postApploaderLog(`[OS] Console Type : ${typeStr}`);
-          postApploaderLog(`[OS] Memory ${memMB} MB`);
           const arenaLo = readRamU32(ram, 0x30);
           const arenaHi = readRamU32(ram, 0x34);
           if (arenaLo >= 0x8000_0000) {

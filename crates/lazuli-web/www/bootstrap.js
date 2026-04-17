@@ -1532,13 +1532,6 @@ function osConsoleTypeString(type) {
  * @returns {boolean} True if ArenaLo was valid and the arena was logged.
  */
 function logOsBannerFromRam(ram) {
-  const consoleType = readRamU32(ram, 0x2C);
-  const memSize     = readRamU32(ram, 0x28);
-  const memMB       = memSize >>> 20;
-  const typeStr     = osConsoleTypeString(consoleType);
-  appendApploaderLog(`[OS] Console Type : ${typeStr}`);
-  appendApploaderLog(`[OS] Memory ${memMB} MB`);
-
   const arenaLo = readRamU32(ram, 0x30);
   const arenaHi = readRamU32(ram, 0x34);
   if (arenaLo >= 0x80000000) {
@@ -2954,11 +2947,10 @@ function gameLoop(emu, canvas, ctx, timestamp) {
             `(${elapsed} since boot)`
           );
           appendApploaderLog(`✓ Milestone: game entry @ ${hexU32(blockPc)} (${elapsed})`);
-          // Log Console Type, Memory, and ArenaLo from the current RAM globals.
-          // The HLE boot path initialises ArenaLo at physical 0x30 before the
-          // apploader runs; game DOL sections are not loaded below 0x80000100,
-          // so the value is intact at game entry.  If it is already valid we
-          // mark the post-entry watch done immediately.
+          // Check ArenaLo from RAM globals.  The HLE boot path initialises it
+          // at physical 0x30 before the apploader runs; game DOL sections are
+          // not loaded below 0x80000100, so the value is intact at game entry.
+          // If it is already valid we mark the post-entry watch done immediately.
           if (logOsBannerFromRam(ram)) osInitBannerDone = true;
           uartBytesAtGameEntry = totalEximUartBytes;
         }
