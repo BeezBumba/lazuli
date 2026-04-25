@@ -928,6 +928,13 @@ let keyboardBits = 0;
 let gamepadBits = 0;
 
 /**
+ * Analog trigger value (0–255) reported when a keyboard L/R key is held.
+ * ~78% of full travel — identical to the legacy BTN_L/BTN_R to analog
+ * mapping before full analog support was added.
+ */
+const KEYBOARD_TRIGGER_VALUE = 200;
+
+/**
  * Derive analog stick / trigger values from the current keyboard STICK_* bits
  * and forward them to the emulator's SI layer via `set_analog_axes`.
  *
@@ -939,7 +946,7 @@ let gamepadBits = 0;
  *
  * Stick deflection: 75% of full range (128 ± 96) matching the legacy
  * STICK_* constant used before full analog support was added.
- * Trigger: 200/255 (~78%) when the corresponding L/R key is held.
+ * Trigger: `KEYBOARD_TRIGGER_VALUE` (~78%) when the corresponding L/R key is held.
  *
  * @param {import("./pkg/lazuli_web.js").WasmEmulator} emu
  * @param {number} bits  Current `keyboardBits` value.
@@ -951,12 +958,13 @@ function updateKeyboardAnalog(emu, bits) {
   const jy = Math.max(0, Math.min(255, 128
     + ((bits & GC_BTN.STICK_UP)   ? 96 : 0)
     - ((bits & GC_BTN.STICK_DOWN) ? 96 : 0)));
-  const lt = (bits & GC_BTN.L) ? 200 : 0;
-  const rt = (bits & GC_BTN.R) ? 200 : 0;
+  const lt = (bits & GC_BTN.L) ? KEYBOARD_TRIGGER_VALUE : 0;
+  const rt = (bits & GC_BTN.R) ? KEYBOARD_TRIGGER_VALUE : 0;
   emu.set_analog_axes(jx, jy, 128, 128, lt, rt);
 }
 
-
+/**
+ * Poll the Gamepad API and update `gamepadBits`.
  *
  * Uses the first connected gamepad.  Digital buttons are mapped via
  * `GAMEPAD_BTN_MAP`; the left analog stick is mapped both to the four
@@ -1022,18 +1030,10 @@ function pollGamepad(emu) {
   }
 
   if (!gamepadConnected) {
-    // No gamepad: derive stick axes from keyboard STICK_* bits so the SI
-    // poll response always carries meaningful values (±96 deflection, 75%).
-    const bits = keyboardBits;
-    const jx = Math.max(0, Math.min(255, 128
-      + ((bits & GC_BTN.STICK_RIGHT) ? 96 : 0)
-      - ((bits & GC_BTN.STICK_LEFT)  ? 96 : 0)));
-    const jy = Math.max(0, Math.min(255, 128
-      + ((bits & GC_BTN.STICK_UP)   ? 96 : 0)
-      - ((bits & GC_BTN.STICK_DOWN) ? 96 : 0)));
-    const lt = (bits & GC_BTN.L) ? 200 : 0;
-    const rt = (bits & GC_BTN.R) ? 200 : 0;
-    emu.set_analog_axes(jx, jy, 128, 128, lt, rt);
+    // No gamepad: derive stick axes from keyboard STICK_* bits via the same
+    // helper used by keydown / keyup handlers, ensuring a single source of
+    // truth for keyboard → analog conversion.
+    updateKeyboardAnalog(emu, keyboardBits);
   }
 
   emu.set_pad_buttons(keyboardBits | gamepadBits);
