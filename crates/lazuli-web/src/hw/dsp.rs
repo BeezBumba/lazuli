@@ -101,6 +101,9 @@ pub(crate) struct DspState {
     /// AudioDmaControl at offset 0x36 (`0xCC005036`).
     /// Bit 15 = playing; bits 0–14 = length in 32-byte blocks.
     pub(crate) audio_dma_control: u16,
+    /// `AudioDmaBase` at offset 0x30 (`0xCC005030`).
+    /// Main-RAM byte address of the audio PCM source buffer set by the OS.
+    pub(crate) audio_dma_base: u32,
 
     // ── ARAM DMA register state ────────────────────────────────────────────
     /// `DspAramDmaRamBase` (offset 0x20, 4 bytes) — main-RAM byte address for
@@ -126,6 +129,7 @@ impl Default for DspState {
             dsp2cpu_lo: 0,
             control: DSPCTRL_DEFAULT,
             audio_dma_control: 0,
+            audio_dma_base: 0,
             aram_dma_ram_base: 0,
             aram_dma_aram_base: 0,
             aram_dma_control: 0,

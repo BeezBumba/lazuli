@@ -26,10 +26,12 @@ features = [
     "HtmlCanvasElement",
 ]
 
-# ── WebGPU rendering backend (future) ─────────────────────────────────────────
-# Phase 4: add wgpu + renderer wasm32 deps here once renderer is ported to
-# wasm32 (wgpu::SurfaceTarget::Canvas).  Until then these deps are omitted
-# because renderer has native windowing imports incompatible with wasm32.
+# ── WebGPU rendering backend (Phase 4) ────────────────────────────────────────
+# The renderer crate already guards its background-thread path with
+# #[cfg(not(target_arch = "wasm32"))] so it is safe to link on wasm32.
+# wgpu's webgpu feature enables wgpu::SurfaceTarget::Canvas support.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+renderer = { workspace = true, features = ["webgpu"] }
 
 # Enable wasm-opt -O3 for release builds to shrink the WASM binary and improve
 # execution speed.  Disabled for dev builds to keep incremental compile times
