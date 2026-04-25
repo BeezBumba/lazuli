@@ -120,6 +120,9 @@ const fakeEmu = {
     workerState.padButtons = v >>> 0;
     cpuWorker?.postMessage({ type: "input", padButtons: v >>> 0 });
   },
+  set_analog_axes: (jx, jy, cx, cy, lt, rt) => {
+    cpuWorker?.postMessage({ type: "analog_axes", jx, jy, cx, cy, lt, rt });
+  },
   // All other methods are no-ops or stubs; they are never called on the main
   // thread when the Worker is active.
   set_pc:      () => {},
@@ -925,15 +928,48 @@ let keyboardBits = 0;
 let gamepadBits = 0;
 
 /**
- * Poll the Gamepad API and update `gamepadBits`.
+ * Derive analog stick / trigger values from the current keyboard STICK_* bits
+ * and forward them to the emulator's SI layer via `set_analog_axes`.
+ *
+ * Called immediately from keydown / keyup handlers so that the emulator sees
+ * updated axis values within the same event cycle rather than waiting for the
+ * next `pollGamepad` tick.  `pollGamepad` may override these values later in
+ * the same frame if a gamepad is also connected — that is intentional and
+ * correct (gamepad always wins).
+ *
+ * Stick deflection: 75% of full range (128 ± 96) matching the legacy
+ * STICK_* constant used before full analog support was added.
+ * Trigger: 200/255 (~78%) when the corresponding L/R key is held.
+ *
+ * @param {import("./pkg/lazuli_web.js").WasmEmulator} emu
+ * @param {number} bits  Current `keyboardBits` value.
+ */
+function updateKeyboardAnalog(emu, bits) {
+  const jx = Math.max(0, Math.min(255, 128
+    + ((bits & GC_BTN.STICK_RIGHT) ? 96 : 0)
+    - ((bits & GC_BTN.STICK_LEFT)  ? 96 : 0)));
+  const jy = Math.max(0, Math.min(255, 128
+    + ((bits & GC_BTN.STICK_UP)   ? 96 : 0)
+    - ((bits & GC_BTN.STICK_DOWN) ? 96 : 0)));
+  const lt = (bits & GC_BTN.L) ? 200 : 0;
+  const rt = (bits & GC_BTN.R) ? 200 : 0;
+  emu.set_analog_axes(jx, jy, 128, 128, lt, rt);
+}
+
+
  *
  * Uses the first connected gamepad.  Digital buttons are mapped via
- * `GAMEPAD_BTN_MAP`; the left analog stick is converted to the four
- * `STICK_*` pseudo-buttons using `GAMEPAD_AXIS_THRESHOLD`.
+ * `GAMEPAD_BTN_MAP`; the left analog stick is mapped both to the four
+ * discrete `STICK_*` pseudo-buttons (for compatibility) **and** to full
+ * 8-bit `joy_x`/`joy_y` values forwarded via `set_analog_axes`.
  *
- * Must be called once per animation frame (inside `gameLoop`) so that the
- * emulator sees fresh controller state before executing the next batch of
- * blocks.
+ * When no gamepad is connected the analog stick values are derived from the
+ * keyboard `STICK_*` bits (±96 deflection around centre 128) so that
+ * keyboard users still get meaningful axis data rather than a stuck centre.
+ *
+ * Must be called once per animation frame (inside `gameLoop` / `renderLoop`)
+ * so that the emulator sees fresh controller state before executing the next
+ * batch of blocks.
  *
  * @param {import("./pkg/lazuli_web.js").WasmEmulator} emu
  */
@@ -942,9 +978,11 @@ function pollGamepad(emu) {
 
   const gamepads = navigator.getGamepads();
   gamepadBits = 0;
+  let gamepadConnected = false;
 
   for (const gp of gamepads) {
     if (!gp || !gp.connected) continue;
+    gamepadConnected = true;
 
     // Map digital buttons using the standard gamepad layout table.
     for (let i = 0; i < Math.min(gp.buttons.length, GAMEPAD_BTN_MAP.length); i++) {
@@ -953,15 +991,49 @@ function pollGamepad(emu) {
       }
     }
 
-    // Map left analog stick (axes 0 = X, 1 = Y) to STICK_* pseudo-buttons.
+    // Left analog stick (axes 0 = X, 1 = Y).
+    // Standard Gamepad API: axis range is −1.0 (left/up) to +1.0 (right/down).
+    // GC Joy-Y is inverted: larger value = up, so we negate axis 1.
     const ax = gp.axes[0] ?? 0;
     const ay = gp.axes[1] ?? 0;
+
+    // Discrete STICK_* bits for existing threshold-based code paths.
     if (ax < -GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_LEFT;
     if (ax >  GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_RIGHT;
     if (ay < -GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_UP;
     if (ay >  GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_DOWN;
 
+    // Full 8-bit analog values for the SI poll response.
+    const jx = Math.max(0, Math.min(255, Math.round((ax + 1) * 127.5)));
+    const jy = Math.max(0, Math.min(255, Math.round((-ay + 1) * 127.5)));
+
+    // C-Stick (axes 2 / 3 on most controllers; fall back to centre if absent).
+    const cax = gp.axes[2] ?? 0;
+    const cay = gp.axes[3] ?? 0;
+    const cx  = Math.max(0, Math.min(255, Math.round((cax + 1) * 127.5)));
+    const cy  = Math.max(0, Math.min(255, Math.round((-cay + 1) * 127.5)));
+
+    // Analog triggers: button 6 (LT) and 7 (RT) carry a `value` in 0.0–1.0.
+    const lt = Math.max(0, Math.min(255, Math.round((gp.buttons[6]?.value ?? 0) * 255)));
+    const rt = Math.max(0, Math.min(255, Math.round((gp.buttons[7]?.value ?? 0) * 255)));
+
+    emu.set_analog_axes(jx, jy, cx, cy, lt, rt);
     break; // Use the first connected gamepad only.
+  }
+
+  if (!gamepadConnected) {
+    // No gamepad: derive stick axes from keyboard STICK_* bits so the SI
+    // poll response always carries meaningful values (±96 deflection, 75%).
+    const bits = keyboardBits;
+    const jx = Math.max(0, Math.min(255, 128
+      + ((bits & GC_BTN.STICK_RIGHT) ? 96 : 0)
+      - ((bits & GC_BTN.STICK_LEFT)  ? 96 : 0)));
+    const jy = Math.max(0, Math.min(255, 128
+      + ((bits & GC_BTN.STICK_UP)   ? 96 : 0)
+      - ((bits & GC_BTN.STICK_DOWN) ? 96 : 0)));
+    const lt = (bits & GC_BTN.L) ? 200 : 0;
+    const rt = (bits & GC_BTN.R) ? 200 : 0;
+    emu.set_analog_axes(jx, jy, 128, 128, lt, rt);
   }
 
   emu.set_pad_buttons(keyboardBits | gamepadBits);
@@ -3477,6 +3549,7 @@ async function main() {
       e.preventDefault();
       keyboardBits |= bit;
       emu.set_pad_buttons(keyboardBits | gamepadBits);
+      updateKeyboardAnalog(emu, keyboardBits);
       setText("stat-pad",
         "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
     }
@@ -3486,6 +3559,7 @@ async function main() {
     if (bit) {
       keyboardBits &= ~bit;
       emu.set_pad_buttons(keyboardBits | gamepadBits);
+      updateKeyboardAnalog(emu, keyboardBits);
       setText("stat-pad",
         "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
     }

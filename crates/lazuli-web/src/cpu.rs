@@ -122,6 +122,28 @@ impl WasmEmulator {
         self.pad_buttons
     }
 
+    /// Store precise analog axis values for the port-0 controller.
+    ///
+    /// Called by the JavaScript input layer once per animation frame after
+    /// either reading the Gamepad API (full 8-bit resolution) or computing
+    /// axis values from keyboard `STICK_*` pseudo-buttons (±96 deflection).
+    ///
+    /// These values are forwarded verbatim into the SI poll response (bytes 2–7
+    /// of the 8-byte controller report), replacing the old fixed-deflection
+    /// calculation that was derived from the digital button bitmask.
+    ///
+    /// - `joy_x` / `joy_y`: main stick (0–255, centre = 128; Y: up = larger).
+    /// - `c_stick_x` / `c_stick_y`: C-Stick (0–255, centre = 128).
+    /// - `l_trig` / `r_trig`: analog trigger depth (0 = released, 255 = full).
+    pub fn set_analog_axes(
+        &mut self,
+        joy_x: u8, joy_y: u8,
+        c_stick_x: u8, c_stick_y: u8,
+        l_trig: u8, r_trig: u8,
+    ) {
+        self.si.set_analog_axes(joy_x, joy_y, c_stick_x, c_stick_y, l_trig, r_trig);
+    }
+
     // ── Timebase ──────────────────────────────────────────────────────────────
 
     /// Advance the CPU time-base register by `delta` ticks.

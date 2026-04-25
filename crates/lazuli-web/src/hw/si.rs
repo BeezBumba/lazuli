@@ -83,10 +83,6 @@ const BTN_LEFT:        u32 = 0x0100;
 const BTN_RIGHT:       u32 = 0x0200;
 const BTN_L:           u32 = 0x0400;
 const BTN_R:           u32 = 0x0800;
-const BTN_STICK_UP:    u32 = 0x1000;
-const BTN_STICK_DOWN:  u32 = 0x2000;
-const BTN_STICK_LEFT:  u32 = 0x4000;
-const BTN_STICK_RIGHT: u32 = 0x8000;
 
 /// Serial Interface hardware register file.
 pub(crate) struct SiState {
@@ -107,6 +103,23 @@ pub(crate) struct SiState {
     exi_clock_lock: u32,
     /// SI Buffer (128 bytes at offset 0x80; used by some games for raw transfers).
     si_buf: [u8; 128],
+    /// Analog main stick X axis (0–255, centre = 128).
+    ///
+    /// Updated by [`SiState::set_analog_axes`] from the JavaScript input layer.
+    /// Takes precedence over the discrete `STICK_*` pseudo-buttons in the SI
+    /// poll response so that gamepad analog input is reported with full 8-bit
+    /// resolution rather than a fixed ±96 deflection.
+    pub(crate) joy_x: u8,
+    /// Analog main stick Y axis (0–255, centre = 128; up = larger value).
+    pub(crate) joy_y: u8,
+    /// Analog C-Stick X axis (0–255, centre = 128).
+    pub(crate) c_stick_x: u8,
+    /// Analog C-Stick Y axis (0–255, centre = 128).
+    pub(crate) c_stick_y: u8,
+    /// L trigger analog value (0–255; 0 = released, 255 = fully pressed).
+    pub(crate) l_trig: u8,
+    /// R trigger analog value (0–255; 0 = released, 255 = fully pressed).
+    pub(crate) r_trig: u8,
 }
 
 impl Default for SiState {
@@ -120,6 +133,13 @@ impl Default for SiState {
             status: 0,
             exi_clock_lock: 0,
             si_buf: [0u8; 128],
+            // Initialise analog axes to centred / released.
+            joy_x: 128,
+            joy_y: 128,
+            c_stick_x: 128,
+            c_stick_y: 128,
+            l_trig: 0,
+            r_trig: 0,
         }
     }
 }
@@ -239,7 +259,12 @@ impl SiState {
             // ── 0x40 — Poll / 0x41 — GetOrigin / 0x42 — Calibrate ───────────
             0x40 | 0x41 | 0x42 => {
                 if channel == 0 {
-                    let response = build_poll_response(pad_buttons);
+                    let response = build_poll_response(
+                        pad_buttons,
+                        self.joy_x, self.joy_y,
+                        self.c_stick_x, self.c_stick_y,
+                        self.l_trig, self.r_trig,
+                    );
                     // Pack 8 bytes into two u32s (big-endian byte order).
                     self.in_buf_hi[0] = u32::from_be_bytes(response[0..4].try_into().unwrap_or([0; 4]));
                     self.in_buf_lo[0] = u32::from_be_bytes(response[4..8].try_into().unwrap_or([0; 4]));
@@ -258,23 +283,55 @@ impl SiState {
             }
         }
     }
+
+    /// Store analog axis values reported in subsequent controller poll responses.
+    ///
+    /// Called by the JavaScript input layer after polling the Gamepad API or
+    /// converting keyboard `STICK_*` pseudo-buttons to axis values.
+    ///
+    /// - `joy_x` / `joy_y`: main stick (0–255, centre = 128; Y: up = larger).
+    /// - `c_stick_x` / `c_stick_y`: C-Stick (0–255, centre = 128).
+    /// - `l_trig` / `r_trig`: analog trigger depth (0 = released, 255 = full).
+    pub(crate) fn set_analog_axes(
+        &mut self,
+        joy_x: u8, joy_y: u8,
+        c_stick_x: u8, c_stick_y: u8,
+        l_trig: u8, r_trig: u8,
+    ) {
+        self.joy_x     = joy_x;
+        self.joy_y     = joy_y;
+        self.c_stick_x = c_stick_x;
+        self.c_stick_y = c_stick_y;
+        self.l_trig    = l_trig;
+        self.r_trig    = r_trig;
+    }
 }
 
-/// Build the 8-byte SI poll response from `pad_buttons`.
+/// Build the 8-byte SI poll response from digital `pad_buttons` and analog axes.
 ///
 /// Maps the JavaScript `GC_BTN` bitmask to the GameCube controller wire format:
 ///
 /// ```text
 ///   Byte 0: [0, 0, 0, START, Y, X, B, A]
 ///   Byte 1: [1, L_dig, R_dig, Z, D-Up, D-Down, D-Right, D-Left]
-///   Byte 2: Joystick X (0–255, centre=128)
-///   Byte 3: Joystick Y (0–255, centre=128; up = larger)
-///   Byte 4: C-Stick X  (centre=128)
-///   Byte 5: C-Stick Y  (centre=128)
-///   Byte 6: L analog   (0 or 200)
-///   Byte 7: R analog   (0 or 200)
+///   Byte 2: Joystick X  (0–255, centre=128)
+///   Byte 3: Joystick Y  (0–255, centre=128; up = larger)
+///   Byte 4: C-Stick X   (centre=128)
+///   Byte 5: C-Stick Y   (centre=128)
+///   Byte 6: L analog    (0–255)
+///   Byte 7: R analog    (0–255)
 /// ```
-fn build_poll_response(pad: u32) -> [u8; 8] {
+///
+/// The analog values (`joy_x`, `joy_y`, `c_stick_x`, `c_stick_y`, `l_trig`,
+/// `r_trig`) are provided directly by the caller (already converted from
+/// Gamepad API axes or keyboard STICK_* deflection) rather than being derived
+/// from the button bitmask, giving full 8-bit axis resolution.
+fn build_poll_response(
+    pad: u32,
+    joy_x: u8, joy_y: u8,
+    c_stick_x: u8, c_stick_y: u8,
+    l_trig: u8, r_trig: u8,
+) -> [u8; 8] {
     // Byte 0: high button byte
     let b0 = ((pad & BTN_A)     != 0) as u8        // bit 0
            | (((pad & BTN_B)    != 0) as u8) << 1  // bit 1
@@ -292,25 +349,5 @@ fn build_poll_response(pad: u32) -> [u8; 8] {
            | (((pad & BTN_R)    != 0) as u8) << 5  // bit 5 = R digital
            | (((pad & BTN_L)    != 0) as u8) << 6; // bit 6 = L digital
 
-    // Joystick X/Y — analogue values centred at 128.
-    // Keyboard STICK_* pseudo-buttons give ±96 deflection (75% of range).
-    const CENTRE: i32 = 128;
-    const DEFLECT: i32 = 96;
-
-    let joy_x_raw = CENTRE
-        + if (pad & BTN_STICK_RIGHT) != 0 { DEFLECT } else { 0 }
-        - if (pad & BTN_STICK_LEFT)  != 0 { DEFLECT } else { 0 };
-    // GC: larger Y = up
-    let joy_y_raw = CENTRE
-        + if (pad & BTN_STICK_UP)   != 0 { DEFLECT } else { 0 }
-        - if (pad & BTN_STICK_DOWN) != 0 { DEFLECT } else { 0 };
-
-    let joy_x = joy_x_raw.clamp(0, 255) as u8;
-    let joy_y = joy_y_raw.clamp(0, 255) as u8;
-
-    // L/R analogue triggers: digital buttons map to ~80% of travel.
-    let l_trig = if (pad & BTN_L) != 0 { 200_u8 } else { 0 };
-    let r_trig = if (pad & BTN_R) != 0 { 200_u8 } else { 0 };
-
-    [b0, b1, joy_x, joy_y, 128, 128, l_trig, r_trig]
+    [b0, b1, joy_x, joy_y, c_stick_x, c_stick_y, l_trig, r_trig]
 }

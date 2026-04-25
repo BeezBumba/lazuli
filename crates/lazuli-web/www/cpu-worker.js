@@ -17,6 +17,7 @@
  *   { type: 'start' }
  *   { type: 'stop' }
  *   { type: 'input',             padButtons: u32 }
+ *   { type: 'analog_axes',      jx: u8, jy: u8, cx: u8, cy: u8, lt: u8, rt: u8 }
  *   { type: 'reset',             pc: u32 }
  *   { type: 'step' }
  *   { type: 'run_n',             n: number }
@@ -1178,6 +1179,15 @@ self.onmessage = async ({ data: msg }) => {
 
     case "input": {
       if (emu) emu.set_pad_buttons(msg.padButtons >>> 0);
+      break;
+    }
+
+    case "analog_axes": {
+      if (emu) emu.set_analog_axes(
+        msg.jx & 0xFF, msg.jy & 0xFF,
+        msg.cx & 0xFF, msg.cy & 0xFF,
+        msg.lt & 0xFF, msg.rt & 0xFF,
+      );
       break;
     }
 
