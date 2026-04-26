@@ -166,6 +166,10 @@ impl DspState {
             0x06 => self.dsp2cpu_lo,
             // DSPCONTROL at the CORRECT hardware offset 0x0A (0xCC00500A).
             0x0A => self.control,
+            // AudioDmaBase (0x30/0x32): return the stored 32-bit value split
+            // into two 16-bit halves (big-endian: high at 0x30, low at 0x32).
+            0x30 => (self.audio_dma_base >> 16) as u16,
+            0x32 => self.audio_dma_base as u16,
             // AudioDmaControl: return the last written value.
             0x36 => self.audio_dma_control,
             // AudioDmaRemaining: HLE always returns 0 (DMA instantly complete).
@@ -268,9 +272,11 @@ impl DspState {
                 self.control |= 1 << 5;  // aram_dma_interrupt = 1
                 self.control &= !(1 << 9); // aram_dma_ongoing = 0
             }
-            // AudioDmaBase (0x30, 4 bytes): address of the audio DMA source in
-            // main RAM.  HLE does not stream audio, so the write is accepted but
-            // ignored.  DspAramDmaRamBase / DspAramDmaAramBase are handled above.
+            // AudioDmaBase (0x30, 4 bytes): main-RAM byte address of the PCM
+            // source buffer.  HLE does not stream audio, but the value is stored
+            // so that future audio DMA support can reference it without a protocol
+            // change.
+            0x30 => self.audio_dma_base = val,
             _ => {}
         }
     }
