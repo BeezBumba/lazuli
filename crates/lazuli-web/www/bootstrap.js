@@ -40,7 +40,7 @@
  */
 
 // ── Imports ───────────────────────────────────────────────────────────────────
-import init, { WasmEmulator, wasm_memory } from "./pkg/lazuli_web.js";
+import init, { WasmEmulator, wasm_memory, check_webgpu_support, init_webgpu_renderer } from "./pkg/lazuli_web.js";
 
 // ── CPU Worker management ─────────────────────────────────────────────────────
 //
@@ -92,6 +92,24 @@ const workerState = {
  */
 let pcmSab    = null; // SharedArrayBuffer: Float32 [L[0..8191], R[0..8191]]
 let pcmIdxSab = null; // SharedArrayBuffer: Int32[2] [writeHead, readHead]
+
+/**
+ * Phase 4 – WebGPU renderer.
+ * Initialised asynchronously after WASM loads if navigator.gpu is available.
+ * Falls back to the canvas-based YUV422 XFB blitter when null.
+ *
+ * @type {import("./pkg/lazuli_web.js").WgpuRenderer | null}
+ */
+let webgpuRenderer = null;
+
+/** Number of audio samples per animation frame at 48 kHz / 60 fps. */
+const AUDIO_SAMPLES_PER_FRAME_48K = Math.ceil(48000 / 60); // 800
+/** Number of audio samples per animation frame at 32 kHz / 60 fps. */
+const AUDIO_SAMPLES_PER_FRAME_32K = Math.ceil(32000 / 60); // 534
+
+/** PCM ring buffer size (must match cpu-worker.js). */
+const PCM_RING_SIZE = 8192;
+const PCM_RING_MASK = PCM_RING_SIZE - 1;
 
 /**
  * A proxy object that forwards reads to workerState and writes (pad input,
@@ -289,6 +307,14 @@ function handleWorkerMessage(msg, canvas, ctx) {
       try {
         const sramB64 = btoa(String.fromCharCode(...msg.data));
         localStorage.setItem("lazuli_sram", sramB64);
+      } catch (_) {}
+      break;
+
+    case "memcard":
+      // Worker sends memory card data for localStorage persistence.
+      try {
+        const mcB64 = btoa(String.fromCharCode(...msg.data));
+        localStorage.setItem(`lazuli_memcard_${msg.slot}`, mcB64);
       } catch (_) {}
       break;
 
@@ -2794,6 +2820,39 @@ function pushDspSamples(interleavedSamples) {
 }
 
 /**
+ * Push an interleaved stereo Float32Array into the SharedArrayBuffer PCM ring
+ * buffer consumed by the AudioWorkletNode.
+ *
+ * Used by the single-threaded gameLoop path.  The SAB layout is identical to
+ * cpu-worker.js: [L[0..RING-1], R[0..RING-1]] as Float32.
+ *
+ * @param {Float32Array} interleaved  Interleaved L/R pairs [L0, R0, L1, R1, …]
+ */
+function pushPcmInterleavedToSab(interleaved) {
+  if (!pcmSab || !pcmIdxSab) {
+    // SAB not ready: fall back to worklet postMessage transfer.
+    pushDspSamples(interleaved);
+    return;
+  }
+
+  const n      = interleaved.length >> 1; // stereo frame count
+  const data   = new Float32Array(pcmSab);
+  const idx    = new Int32Array(pcmIdxSab);
+  const wHead  = Atomics.load(idx, 0);
+  const rHead  = Atomics.load(idx, 1);
+  const avail  = (wHead - rHead + PCM_RING_SIZE) & PCM_RING_MASK;
+  const free   = PCM_RING_SIZE - avail - 1;
+  const count  = Math.min(n, free);
+
+  for (let i = 0; i < count; i++) {
+    const pos              = (wHead + i) & PCM_RING_MASK;
+    data[pos]              = interleaved[i * 2];
+    data[pos + PCM_RING_SIZE] = interleaved[i * 2 + 1];
+  }
+  Atomics.store(idx, 0, (wHead + count) & PCM_RING_MASK);
+}
+
+/**
  * Initialise (or resume) the Web Audio context and DSP audio worklet.
  *
  * Must be triggered by a user gesture (click) due to browser autoplay
@@ -3278,6 +3337,21 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // Render XFB to canvas
   renderXfb(ram, ctx, emu, gameTitle);
 
+  // ── DSP HLE audio: push PCM samples into the SAB ring buffer ─────────────
+  // Generate one frame's worth of samples (800 at 48 kHz or 534 at 32 kHz)
+  // from the AI DMA ring buffer and push them to the AudioWorkletNode SAB.
+  // Only fires when AudioDmaControl bit 15 (PSTAT) is set and the SAB has
+  // been initialised (requires crossOriginIsolated headers for SharedArrayBuffer).
+  if (pcmSab && pcmIdxSab) {
+    // Choose sample count based on AICR.AISFR (bit 1): 0=48kHz, 1=32kHz.
+    const aisfr     = (emu.get_ai_control?.() ?? 0) >> 1 & 1;
+    const nSamples  = aisfr ? AUDIO_SAMPLES_PER_FRAME_32K : AUDIO_SAMPLES_PER_FRAME_48K;
+    const interleaved = emu.take_audio_samples(nSamples);
+    if (interleaved && interleaved.length > 0) {
+      pushPcmInterleavedToSab(interleaved);
+    }
+  }
+
   // Milestone: first frame with non-zero XFB pixel data.
   // renderXfb() sets xfbHasContent=true the first time it finds a non-zero
   // pixel in any candidate XFB region.  We latch that into milestones here
@@ -3357,6 +3431,21 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       localStorage.setItem("lazuli_sram", sramB64);
     } catch (_) {
       // localStorage may be unavailable (private browsing, quota exceeded).
+    }
+    // Persist memory card data (~every 60 frames = ~1 s).
+    for (const slot of [0, 1]) {
+      try {
+        const mcBytes = emu.get_memcard_data(slot);
+        // Only persist if the card has been written (any byte differs from 0xFF).
+        let hasContent = false;
+        for (let b = 0; b < mcBytes.length; b += 1024) {
+          if (mcBytes[b] !== 0xFF) { hasContent = true; break; }
+        }
+        if (hasContent) {
+          const mcB64 = btoa(String.fromCharCode(...mcBytes));
+          localStorage.setItem(`lazuli_memcard_${slot}`, mcB64);
+        }
+      } catch (_) {}
     }
   }
 
@@ -3480,6 +3569,19 @@ async function main() {
     } catch (sramErr) {
       console.warn("[lazuli] Could not restore SRAM:", sramErr);
     }
+    // Restore persistent memory card data and send it to the Worker.
+    for (const slot of [0, 1]) {
+      try {
+        const mcB64 = localStorage.getItem(`lazuli_memcard_${slot}`);
+        if (mcB64) {
+          const raw = Uint8Array.from(atob(mcB64), c => c.charCodeAt(0));
+          cpuWorker.postMessage({ type: "load_memcard", slot, data: raw });
+          console.log(`[lazuli] Memory card slot ${slot} sent to CPU Worker (${raw.byteLength} bytes)`);
+        }
+      } catch (mcErr) {
+        console.warn(`[lazuli] Could not restore memory card slot ${slot}:`, mcErr);
+      }
+    }
     $("btn-compile").disabled  = false;
     $("btn-load-iso").disabled = false;
     $("btn-start").disabled    = false;
@@ -3504,6 +3606,30 @@ async function main() {
         }
       } catch (sramErr) {
         console.warn("[lazuli] Could not restore SRAM from localStorage:", sramErr);
+      }
+      // Restore persistent memory card data from localStorage.
+      for (const slot of [0, 1]) {
+        try {
+          const mcB64 = localStorage.getItem(`lazuli_memcard_${slot}`);
+          if (mcB64) {
+            const raw = Uint8Array.from(atob(mcB64), c => c.charCodeAt(0));
+            emu.set_memcard_data(slot, raw);
+            console.log(`[lazuli] Memory card slot ${slot} restored (${raw.byteLength} bytes)`);
+          }
+        } catch (mcErr) {
+          console.warn(`[lazuli] Could not restore memory card slot ${slot}:`, mcErr);
+        }
+      }
+      // Phase 4: initialise the WebGPU renderer if the browser supports it.
+      if (check_webgpu_support()) {
+        try {
+          webgpuRenderer = await init_webgpu_renderer("screen");
+          if (webgpuRenderer) {
+            console.log("[lazuli] Phase 4: WebGPU renderer active");
+          }
+        } catch (gpuErr) {
+          console.warn("[lazuli] WebGPU renderer init failed (falling back to canvas 2D):", gpuErr);
+        }
       }
       setStatus("✓ WASM module loaded — load an ISO or a demo program to begin", "status-ok");
       $("btn-compile").disabled  = false;

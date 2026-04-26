@@ -51,6 +51,173 @@ pub(crate) const EXI_BASE: u32 = 0xCC00_6800;
 /// Byte span of the EXI register block (3 channels × 0x14 bytes = 0x3C bytes).
 pub(crate) const EXI_SIZE: u32 = 0x40;
 
+// ─── Memory card (EXI channel 0 slot A / channel 1 slot B) ───────────────────
+
+/// Byte capacity of a simulated Memory Card 59 (512 KiB = 59 usable 8 KiB blocks).
+const MC_SIZE: usize = 512 * 1024;
+
+/// Device ID returned when the memory card chip-select is asserted and the host
+/// performs a read without sending a command first.  Left-aligned in the 32-bit
+/// EXI DATA register:
+///   Byte 0 = 0xC2  (Nintendo EXI manufacturer ID)
+///   Byte 1 = 0x04  (512 KiB / Memory Card 59 type code)
+///   Bytes 2–3 = 0x00 0x00 (not transmitted, transfer is 2 bytes)
+const MC_DEVICE_ID: u32 = 0xC204_0000;
+
+/// Memory card command bytes (sent MSB-first in the EXI DATA register).
+const MC_CMD_READ: u8 = 0x52;  // Read 128-byte sector
+const MC_CMD_WRITE: u8 = 0xF1; // Write 128-byte sector
+const MC_CMD_ERASE: u8 = 0xF2; // Erase 16 KiB block (128 sectors)
+
+/// Phase of the memory card EXI state machine.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum McPhase {
+    /// Idle: awaiting a command byte or a device-ID probe read.
+    #[default]
+    Idle,
+    /// Received command byte; accumulating the 3-byte byte address.
+    GotCmd,
+    /// Address complete; performing the read, write, or erase data transfer.
+    DataXfer,
+}
+
+/// State for one EXI memory card slot (slot A on channel 0, slot B on channel 1).
+///
+/// The GameCube memory card protocol uses the EXI bus in full-duplex SPI mode.
+/// Commands, addresses, and data are sent/received as separate EXI immediate
+/// transfers (each triggered by writing TSTART to the CR register) while the
+/// chip-select (device_sel field in CPR) remains asserted.
+///
+/// ## Transfer sequence for a sector read (command 0x52):
+/// ```text
+/// CS↓  → TX: 0x52 (1 byte)
+///       → TX: addr[23:16] (1 byte)
+///       → TX: addr[15:8]  (1 byte)
+///       → TX: addr[7:0]   (1 byte)
+///       ← RX: sector data (128 bytes)
+/// CS↑
+/// ```
+///
+/// The 128-byte sectors are addressed in bytes; the caller must align the
+/// address to a 128-byte boundary.
+pub(crate) struct MemCard {
+    /// Raw 512 KiB flash data.  Defaults to all `0xFF` (erased flash).
+    pub(crate) data: Vec<u8>,
+    phase:      McPhase,
+    cmd:        u8,
+    addr:       u32,  // accumulated 24-bit byte address
+    addr_bytes: u8,   // 0–3: number of address bytes received
+    xfer_pos:   u32,  // byte offset within the current sector transfer
+}
+
+impl Default for MemCard {
+    fn default() -> Self {
+        Self {
+            data: vec![0xFF; MC_SIZE],
+            phase: McPhase::Idle,
+            cmd: 0,
+            addr: 0,
+            addr_bytes: 0,
+            xfer_pos: 0,
+        }
+    }
+}
+
+impl MemCard {
+    /// Process one EXI immediate transfer directed at this memory card.
+    ///
+    /// - `rw`:      0 = read from card, 1 = write to card
+    /// - `bytes`:   number of bytes transferred (1–4)
+    /// - `data_in`: the value in the DATA register for write transfers
+    ///              (bytes are left-aligned: byte 0 in bits 31–24).
+    ///
+    /// Returns the value to place in the DATA register for read transfers.
+    pub(crate) fn handle(&mut self, rw: u32, bytes: usize, data_in: u32) -> u32 {
+        match self.phase {
+            McPhase::Idle => {
+                if rw == 0 {
+                    // No prior command: the host is probing the device ID.
+                    return MC_DEVICE_ID;
+                }
+                // First write byte is the command.
+                self.cmd = (data_in >> 24) as u8;
+                self.addr = 0;
+                self.addr_bytes = 0;
+                self.xfer_pos = 0;
+                self.phase = McPhase::GotCmd;
+                0
+            }
+
+            McPhase::GotCmd => {
+                if rw == 1 {
+                    // Accumulate address bytes from the MSB of the DATA register.
+                    for i in 0..(bytes.min(3usize.saturating_sub(self.addr_bytes as usize))) {
+                        let byte = (data_in >> (24u32 - i as u32 * 8)) as u8;
+                        self.addr = (self.addr << 8) | byte as u32;
+                        self.addr_bytes += 1;
+                    }
+                    if self.addr_bytes >= 3 {
+                        self.xfer_pos = 0;
+                        self.phase = McPhase::DataXfer;
+                    }
+                }
+                0
+            }
+
+            McPhase::DataXfer => {
+                let card_addr = (self.addr as usize).min(MC_SIZE.saturating_sub(1));
+
+                match self.cmd {
+                    MC_CMD_READ => {
+                        // Return `bytes` bytes of card data, left-aligned.
+                        let mut result = 0u32;
+                        for i in 0..bytes {
+                            let pos = (card_addr + self.xfer_pos as usize + i) % MC_SIZE;
+                            result = (result << 8) | self.data[pos] as u32;
+                        }
+                        self.xfer_pos += bytes as u32;
+                        // Left-align the result in the 32-bit DATA register.
+                        result << (32u32.saturating_sub(bytes as u32 * 8))
+                    }
+
+                    MC_CMD_WRITE => {
+                        // Store `bytes` bytes into card data.
+                        for i in 0..bytes {
+                            let pos = (card_addr + self.xfer_pos as usize + i) % MC_SIZE;
+                            let byte = (data_in >> (24u32.saturating_sub(i as u32 * 8))) as u8;
+                            self.data[pos] = byte;
+                        }
+                        self.xfer_pos += bytes as u32;
+                        0
+                    }
+
+                    MC_CMD_ERASE => {
+                        // Erase the 16 KiB block containing `card_addr` to 0xFF.
+                        const ERASE_SIZE: usize = 16 * 1024;
+                        let block_off = card_addr & !(ERASE_SIZE - 1);
+                        let end = (block_off + ERASE_SIZE).min(MC_SIZE);
+                        self.data[block_off..end].fill(0xFF);
+                        self.phase = McPhase::Idle;
+                        0
+                    }
+
+                    _ => 0,
+                }
+            }
+        }
+    }
+
+    /// Reset the state machine.
+    ///
+    /// Called when the chip-select for this card is deasserted (i.e., when
+    /// the EXI `device_sel` field transitions away from the card's device slot).
+    pub(crate) fn reset_phase(&mut self) {
+        self.phase = McPhase::Idle;
+        self.addr_bytes = 0;
+        self.xfer_pos = 0;
+    }
+}
+
 /// Per-channel EXI register state.
 #[derive(Default, Clone, Copy)]
 struct ExiChannel {
@@ -81,6 +248,12 @@ pub(crate) struct ExiSramDma {
 /// External Interface hardware register file (3 channels).
 pub(crate) struct ExiState {
     channels: [ExiChannel; 3],
+    /// Previous device_sel value for each channel (used to detect CS transitions).
+    prev_device_sel: [u8; 3],
+    /// Memory card in EXI channel 0 slot A (device_sel = 0b001).
+    pub(crate) mc_a: MemCard,
+    /// Memory card in EXI channel 1 slot A (device_sel = 0b001).
+    pub(crate) mc_b: MemCard,
     /// 64-byte stub SRAM.
     ///
     /// Initialised with sensible GameCube defaults:
@@ -116,6 +289,9 @@ impl Default for ExiState {
     fn default() -> Self {
         let mut state = Self {
             channels: [ExiChannel::default(); 3],
+            prev_device_sel: [0u8; 3],
+            mc_a: MemCard::default(),
+            mc_b: MemCard::default(),
             sram: [0u8; 64],
             rtc: 0,
             uart_pending: false,
@@ -161,6 +337,19 @@ impl ExiState {
         let Some(ch) = ch else { return None };
         match reg {
             0x00 => {
+                // CPR: detect chip-select transitions before applying the write.
+                let old_sel = self.prev_device_sel[ch];
+                let new_sel = ((val >> 7) & 0x7) as u8;
+                if old_sel != new_sel {
+                    // CS deasserted for old device — reset its state machine.
+                    match (ch, old_sel) {
+                        (0, 0b001) => self.mc_a.reset_phase(),
+                        (1, 0b001) => self.mc_b.reset_phase(),
+                        _ => {}
+                    }
+                }
+                self.prev_device_sel[ch] = new_sel;
+
                 // CPR: write-1-to-clear interrupt bits (1 = device_int, 3 = xfer_int, 11 = attach_int).
                 let w1c_mask = (1 << 1) | (1 << 3) | (1 << 11);
                 let cleared = self.channels[ch].param & !(val & w1c_mask);
@@ -266,6 +455,24 @@ impl ExiState {
 
         let device_sel = (self.channels[ch].param >> 7) & 0x7;
         let data = self.channels[ch].data;
+
+        // ── Memory card (device_sel = 0b001, channels 0 and 1) ──────────────
+        if device_sel == 0b001 {
+            let mc = match ch {
+                0 => &mut self.mc_a,
+                1 => &mut self.mc_b,
+                _ => {
+                    self.channels[ch].control &= !1;
+                    self.channels[ch].param |= 1 << 3;
+                    return None;
+                }
+            };
+            let result = mc.handle(rw, bytes, data);
+            self.channels[ch].data = result;
+            self.channels[ch].control &= !1; // clear TSTART
+            self.channels[ch].param |= 1 << 3; // set XFER_INT
+            return None;
+        }
 
         let result = if ch == 0 && device_sel == 0b010 {
             // ── Channel 0, IPL/SRAM/RTC device ───────────────────────────
