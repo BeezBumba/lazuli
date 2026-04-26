@@ -40,7 +40,7 @@
  */
 
 // ── Imports ───────────────────────────────────────────────────────────────────
-import init, { WasmEmulator, wasm_memory } from "./pkg/lazuli_web.js";
+import init, { WasmEmulator, wasm_memory, check_webgpu_support, init_webgpu_renderer } from "./pkg/lazuli_web.js";
 
 // ── CPU Worker management ─────────────────────────────────────────────────────
 //
@@ -94,6 +94,24 @@ let pcmSab    = null; // SharedArrayBuffer: Float32 [L[0..8191], R[0..8191]]
 let pcmIdxSab = null; // SharedArrayBuffer: Int32[2] [writeHead, readHead]
 
 /**
+ * Phase 4 – WebGPU renderer.
+ * Initialised asynchronously after WASM loads if navigator.gpu is available.
+ * Falls back to the canvas-based YUV422 XFB blitter when null.
+ *
+ * @type {import("./pkg/lazuli_web.js").WgpuRenderer | null}
+ */
+let webgpuRenderer = null;
+
+/** Number of audio samples per animation frame at 48 kHz / 60 fps. */
+const AUDIO_SAMPLES_PER_FRAME_48K = Math.ceil(48000 / 60); // 800
+/** Number of audio samples per animation frame at 32 kHz / 60 fps. */
+const AUDIO_SAMPLES_PER_FRAME_32K = Math.ceil(32000 / 60); // 534
+
+/** PCM ring buffer size (must match cpu-worker.js). */
+const PCM_RING_SIZE = 8192;
+const PCM_RING_MASK = PCM_RING_SIZE - 1;
+
+/**
  * A proxy object that forwards reads to workerState and writes (pad input,
  * PC reset) as Worker messages.  Passed to the existing UI helpers
  * (updateStats, renderRegisters, etc.) so they work unchanged while the
@@ -119,6 +137,9 @@ const fakeEmu = {
   set_pad_buttons: (v) => {
     workerState.padButtons = v >>> 0;
     cpuWorker?.postMessage({ type: "input", padButtons: v >>> 0 });
+  },
+  set_analog_axes: (jx, jy, cx, cy, lt, rt) => {
+    cpuWorker?.postMessage({ type: "analog_axes", jx, jy, cx, cy, lt, rt });
   },
   // All other methods are no-ops or stubs; they are never called on the main
   // thread when the Worker is active.
@@ -286,6 +307,14 @@ function handleWorkerMessage(msg, canvas, ctx) {
       try {
         const sramB64 = btoa(String.fromCharCode(...msg.data));
         localStorage.setItem("lazuli_sram", sramB64);
+      } catch (_) {}
+      break;
+
+    case "memcard":
+      // Worker sends memory card data for localStorage persistence.
+      try {
+        const mcB64 = btoa(String.fromCharCode(...msg.data));
+        localStorage.setItem(`lazuli_memcard_${msg.slot}`, mcB64);
       } catch (_) {}
       break;
 
@@ -925,15 +954,56 @@ let keyboardBits = 0;
 let gamepadBits = 0;
 
 /**
+ * Analog trigger value (0–255) reported when a keyboard L/R key is held.
+ * ~78% of full travel — identical to the legacy BTN_L/BTN_R to analog
+ * mapping before full analog support was added.
+ */
+const KEYBOARD_TRIGGER_VALUE = 200;
+
+/**
+ * Derive analog stick / trigger values from the current keyboard STICK_* bits
+ * and forward them to the emulator's SI layer via `set_analog_axes`.
+ *
+ * Called immediately from keydown / keyup handlers so that the emulator sees
+ * updated axis values within the same event cycle rather than waiting for the
+ * next `pollGamepad` tick.  `pollGamepad` may override these values later in
+ * the same frame if a gamepad is also connected — that is intentional and
+ * correct (gamepad always wins).
+ *
+ * Stick deflection: 75% of full range (128 ± 96) matching the legacy
+ * STICK_* constant used before full analog support was added.
+ * Trigger: `KEYBOARD_TRIGGER_VALUE` (~78%) when the corresponding L/R key is held.
+ *
+ * @param {import("./pkg/lazuli_web.js").WasmEmulator} emu
+ * @param {number} bits  Current `keyboardBits` value.
+ */
+function updateKeyboardAnalog(emu, bits) {
+  const jx = Math.max(0, Math.min(255, 128
+    + ((bits & GC_BTN.STICK_RIGHT) ? 96 : 0)
+    - ((bits & GC_BTN.STICK_LEFT)  ? 96 : 0)));
+  const jy = Math.max(0, Math.min(255, 128
+    + ((bits & GC_BTN.STICK_UP)   ? 96 : 0)
+    - ((bits & GC_BTN.STICK_DOWN) ? 96 : 0)));
+  const lt = (bits & GC_BTN.L) ? KEYBOARD_TRIGGER_VALUE : 0;
+  const rt = (bits & GC_BTN.R) ? KEYBOARD_TRIGGER_VALUE : 0;
+  emu.set_analog_axes(jx, jy, 128, 128, lt, rt);
+}
+
+/**
  * Poll the Gamepad API and update `gamepadBits`.
  *
  * Uses the first connected gamepad.  Digital buttons are mapped via
- * `GAMEPAD_BTN_MAP`; the left analog stick is converted to the four
- * `STICK_*` pseudo-buttons using `GAMEPAD_AXIS_THRESHOLD`.
+ * `GAMEPAD_BTN_MAP`; the left analog stick is mapped both to the four
+ * discrete `STICK_*` pseudo-buttons (for compatibility) **and** to full
+ * 8-bit `joy_x`/`joy_y` values forwarded via `set_analog_axes`.
  *
- * Must be called once per animation frame (inside `gameLoop`) so that the
- * emulator sees fresh controller state before executing the next batch of
- * blocks.
+ * When no gamepad is connected the analog stick values are derived from the
+ * keyboard `STICK_*` bits (±96 deflection around centre 128) so that
+ * keyboard users still get meaningful axis data rather than a stuck centre.
+ *
+ * Must be called once per animation frame (inside `gameLoop` / `renderLoop`)
+ * so that the emulator sees fresh controller state before executing the next
+ * batch of blocks.
  *
  * @param {import("./pkg/lazuli_web.js").WasmEmulator} emu
  */
@@ -942,9 +1012,11 @@ function pollGamepad(emu) {
 
   const gamepads = navigator.getGamepads();
   gamepadBits = 0;
+  let gamepadConnected = false;
 
   for (const gp of gamepads) {
     if (!gp || !gp.connected) continue;
+    gamepadConnected = true;
 
     // Map digital buttons using the standard gamepad layout table.
     for (let i = 0; i < Math.min(gp.buttons.length, GAMEPAD_BTN_MAP.length); i++) {
@@ -953,15 +1025,41 @@ function pollGamepad(emu) {
       }
     }
 
-    // Map left analog stick (axes 0 = X, 1 = Y) to STICK_* pseudo-buttons.
+    // Left analog stick (axes 0 = X, 1 = Y).
+    // Standard Gamepad API: axis range is −1.0 (left/up) to +1.0 (right/down).
+    // GC Joy-Y is inverted: larger value = up, so we negate axis 1.
     const ax = gp.axes[0] ?? 0;
     const ay = gp.axes[1] ?? 0;
+
+    // Discrete STICK_* bits for existing threshold-based code paths.
     if (ax < -GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_LEFT;
     if (ax >  GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_RIGHT;
     if (ay < -GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_UP;
     if (ay >  GAMEPAD_AXIS_THRESHOLD) gamepadBits |= GC_BTN.STICK_DOWN;
 
+    // Full 8-bit analog values for the SI poll response.
+    const jx = Math.max(0, Math.min(255, Math.round((ax + 1) * 127.5)));
+    const jy = Math.max(0, Math.min(255, Math.round((-ay + 1) * 127.5)));
+
+    // C-Stick (axes 2 / 3 on most controllers; fall back to centre if absent).
+    const cax = gp.axes[2] ?? 0;
+    const cay = gp.axes[3] ?? 0;
+    const cx  = Math.max(0, Math.min(255, Math.round((cax + 1) * 127.5)));
+    const cy  = Math.max(0, Math.min(255, Math.round((-cay + 1) * 127.5)));
+
+    // Analog triggers: button 6 (LT) and 7 (RT) carry a `value` in 0.0–1.0.
+    const lt = Math.max(0, Math.min(255, Math.round((gp.buttons[6]?.value ?? 0) * 255)));
+    const rt = Math.max(0, Math.min(255, Math.round((gp.buttons[7]?.value ?? 0) * 255)));
+
+    emu.set_analog_axes(jx, jy, cx, cy, lt, rt);
     break; // Use the first connected gamepad only.
+  }
+
+  if (!gamepadConnected) {
+    // No gamepad: derive stick axes from keyboard STICK_* bits via the same
+    // helper used by keydown / keyup handlers, ensuring a single source of
+    // truth for keyboard → analog conversion.
+    updateKeyboardAnalog(emu, keyboardBits);
   }
 
   emu.set_pad_buttons(keyboardBits | gamepadBits);
@@ -2722,6 +2820,39 @@ function pushDspSamples(interleavedSamples) {
 }
 
 /**
+ * Push an interleaved stereo Float32Array into the SharedArrayBuffer PCM ring
+ * buffer consumed by the AudioWorkletNode.
+ *
+ * Used by the single-threaded gameLoop path.  The SAB layout is identical to
+ * cpu-worker.js: [L[0..RING-1], R[0..RING-1]] as Float32.
+ *
+ * @param {Float32Array} interleaved  Interleaved L/R pairs [L0, R0, L1, R1, …]
+ */
+function pushPcmInterleavedToSab(interleaved) {
+  if (!pcmSab || !pcmIdxSab) {
+    // SAB not ready: fall back to worklet postMessage transfer.
+    pushDspSamples(interleaved);
+    return;
+  }
+
+  const n      = interleaved.length >> 1; // stereo frame count
+  const data   = new Float32Array(pcmSab);
+  const idx    = new Int32Array(pcmIdxSab);
+  const wHead  = Atomics.load(idx, 0);
+  const rHead  = Atomics.load(idx, 1);
+  const avail  = (wHead - rHead + PCM_RING_SIZE) & PCM_RING_MASK;
+  const free   = PCM_RING_SIZE - avail - 1;
+  const count  = Math.min(n, free);
+
+  for (let i = 0; i < count; i++) {
+    const pos              = (wHead + i) & PCM_RING_MASK;
+    data[pos]              = interleaved[i * 2];
+    data[pos + PCM_RING_SIZE] = interleaved[i * 2 + 1];
+  }
+  Atomics.store(idx, 0, (wHead + count) & PCM_RING_MASK);
+}
+
+/**
  * Initialise (or resume) the Web Audio context and DSP audio worklet.
  *
  * Must be triggered by a user gesture (click) due to browser autoplay
@@ -3206,6 +3337,21 @@ function gameLoop(emu, canvas, ctx, timestamp) {
   // Render XFB to canvas
   renderXfb(ram, ctx, emu, gameTitle);
 
+  // ── DSP HLE audio: push PCM samples into the SAB ring buffer ─────────────
+  // Generate one frame's worth of samples (800 at 48 kHz or 534 at 32 kHz)
+  // from the AI DMA ring buffer and push them to the AudioWorkletNode SAB.
+  // Only fires when AudioDmaControl bit 15 (PSTAT) is set and the SAB has
+  // been initialised (requires crossOriginIsolated headers for SharedArrayBuffer).
+  if (pcmSab && pcmIdxSab) {
+    // Choose sample count based on AICR.AISFR (bit 1): 0=48kHz, 1=32kHz.
+    const aisfr     = (emu.get_ai_control?.() ?? 0) >> 1 & 1;
+    const nSamples  = aisfr ? AUDIO_SAMPLES_PER_FRAME_32K : AUDIO_SAMPLES_PER_FRAME_48K;
+    const interleaved = emu.take_audio_samples(nSamples);
+    if (interleaved && interleaved.length > 0) {
+      pushPcmInterleavedToSab(interleaved);
+    }
+  }
+
   // Milestone: first frame with non-zero XFB pixel data.
   // renderXfb() sets xfbHasContent=true the first time it finds a non-zero
   // pixel in any candidate XFB region.  We latch that into milestones here
@@ -3285,6 +3431,21 @@ function gameLoop(emu, canvas, ctx, timestamp) {
       localStorage.setItem("lazuli_sram", sramB64);
     } catch (_) {
       // localStorage may be unavailable (private browsing, quota exceeded).
+    }
+    // Persist memory card data (~every 60 frames = ~1 s).
+    for (const slot of [0, 1]) {
+      try {
+        const mcBytes = emu.get_memcard_data(slot);
+        // Only persist if the card has been written (any byte differs from 0xFF).
+        let hasContent = false;
+        for (let b = 0; b < mcBytes.length; b += 1024) {
+          if (mcBytes[b] !== 0xFF) { hasContent = true; break; }
+        }
+        if (hasContent) {
+          const mcB64 = btoa(String.fromCharCode(...mcBytes));
+          localStorage.setItem(`lazuli_memcard_${slot}`, mcB64);
+        }
+      } catch (_) {}
     }
   }
 
@@ -3408,6 +3569,19 @@ async function main() {
     } catch (sramErr) {
       console.warn("[lazuli] Could not restore SRAM:", sramErr);
     }
+    // Restore persistent memory card data and send it to the Worker.
+    for (const slot of [0, 1]) {
+      try {
+        const mcB64 = localStorage.getItem(`lazuli_memcard_${slot}`);
+        if (mcB64) {
+          const raw = Uint8Array.from(atob(mcB64), c => c.charCodeAt(0));
+          cpuWorker.postMessage({ type: "load_memcard", slot, data: raw });
+          console.log(`[lazuli] Memory card slot ${slot} sent to CPU Worker (${raw.byteLength} bytes)`);
+        }
+      } catch (mcErr) {
+        console.warn(`[lazuli] Could not restore memory card slot ${slot}:`, mcErr);
+      }
+    }
     $("btn-compile").disabled  = false;
     $("btn-load-iso").disabled = false;
     $("btn-start").disabled    = false;
@@ -3432,6 +3606,30 @@ async function main() {
         }
       } catch (sramErr) {
         console.warn("[lazuli] Could not restore SRAM from localStorage:", sramErr);
+      }
+      // Restore persistent memory card data from localStorage.
+      for (const slot of [0, 1]) {
+        try {
+          const mcB64 = localStorage.getItem(`lazuli_memcard_${slot}`);
+          if (mcB64) {
+            const raw = Uint8Array.from(atob(mcB64), c => c.charCodeAt(0));
+            emu.set_memcard_data(slot, raw);
+            console.log(`[lazuli] Memory card slot ${slot} restored (${raw.byteLength} bytes)`);
+          }
+        } catch (mcErr) {
+          console.warn(`[lazuli] Could not restore memory card slot ${slot}:`, mcErr);
+        }
+      }
+      // Phase 4: initialise the WebGPU renderer if the browser supports it.
+      if (check_webgpu_support()) {
+        try {
+          webgpuRenderer = await init_webgpu_renderer("screen");
+          if (webgpuRenderer) {
+            console.log("[lazuli] Phase 4: WebGPU renderer active");
+          }
+        } catch (gpuErr) {
+          console.warn("[lazuli] WebGPU renderer init failed (falling back to canvas 2D):", gpuErr);
+        }
       }
       setStatus("✓ WASM module loaded — load an ISO or a demo program to begin", "status-ok");
       $("btn-compile").disabled  = false;
@@ -3477,6 +3675,7 @@ async function main() {
       e.preventDefault();
       keyboardBits |= bit;
       emu.set_pad_buttons(keyboardBits | gamepadBits);
+      updateKeyboardAnalog(emu, keyboardBits);
       setText("stat-pad",
         "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
     }
@@ -3486,6 +3685,7 @@ async function main() {
     if (bit) {
       keyboardBits &= ~bit;
       emu.set_pad_buttons(keyboardBits | gamepadBits);
+      updateKeyboardAnalog(emu, keyboardBits);
       setText("stat-pad",
         "0x" + emu.get_pad_buttons().toString(16).toUpperCase().padStart(4, "0"));
     }

@@ -14,6 +14,7 @@ gekko = { workspace = true }
 disks = { workspace = true }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -26,16 +27,18 @@ features = [
     "HtmlCanvasElement",
 ]
 
-# ── WebGPU rendering backend (future) ─────────────────────────────────────────
-# Phase 4: add wgpu + renderer wasm32 deps here once renderer is ported to
-# wasm32 (wgpu::SurfaceTarget::Canvas).  Until then these deps are omitted
-# because renderer has native windowing imports incompatible with wasm32.
+# ── WebGPU rendering backend (Phase 4) ────────────────────────────────────────
+# The renderer crate already guards its background-thread path with
+# #[cfg(not(target_arch = "wasm32"))] so it is safe to link on wasm32.
+# wgpu's webgpu feature enables wgpu::SurfaceTarget::Canvas support.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+renderer = { workspace = true, features = ["webgpu"] }
 
-# Disable wasm-opt during wasm-pack builds so that the package can be built
-# without a network connection.  Re-enable for distribution builds by removing
-# this section or setting `wasm-opt = ["-O3"]`.
+# Enable wasm-opt -O3 for release builds to shrink the WASM binary and improve
+# execution speed.  Disabled for dev builds to keep incremental compile times
+# fast.  Remove this section entirely to use wasm-pack's built-in defaults.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = ["-O3"]
 
 [package.metadata.wasm-pack.profile.dev]
 wasm-opt = false

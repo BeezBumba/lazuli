@@ -20,8 +20,8 @@
 use ppcir::{IrBlock, IrInst, IrTy};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, Ieee64, ImportSection, Instruction, MemArg, MemoryType, Module,
-    TypeSection, ValType,
+    FunctionSection, GlobalType, Ieee64, ImportSection, Instruction, MemArg, MemoryType,
+    Module, TypeSection, ValType,
 };
 
 use crate::block::{WasmBlock, imports};
@@ -39,23 +39,28 @@ const TY_VOID:      u32 = 7; // () -> ()  — isync
 const TY_EXECUTE:   u32 = TY_I32_I32;
 
 // ─── MemArg helpers ───────────────────────────────────────────────────────────
-#[inline] fn m32 (o: u64) -> MemArg { MemArg { offset: o, align: 2, memory_index: 0 } }
-#[allow(dead_code)]
+#[inline] fn m32 (o: u64) -> MemArg { MemArg { offset: o, align: 0, memory_index: 0 } }
 #[inline] fn m8  (o: u64) -> MemArg { MemArg { offset: o, align: 0, memory_index: 0 } }
-#[inline] fn mf64(o: u64) -> MemArg { MemArg { offset: o, align: 3, memory_index: 0 } }
+#[inline] fn m16 (o: u64) -> MemArg { MemArg { offset: o, align: 0, memory_index: 0 } }
+#[inline] fn mf64(o: u64) -> MemArg { MemArg { offset: o, align: 0, memory_index: 0 } }
+
+/// Physical address mask: strip the segment/BAT bits, leaving the low 25 bits.
+/// Covers the full 32 MiB GameCube RAM (0x8000_0000–0x8200_0000 → 0x00FF_FFFF).
+const PHYS_MASK: i32 = 0x01FF_FFFFu32 as i32;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Compile an [`IrBlock`] into a standalone WASM binary module.
 pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
-    let n_ir = block.local_types.len() as u32;
-    let si32 = n_ir + 1; // i32 scratch local
-    let sf64 = n_ir + 2; // f64 scratch local
+    let n_ir  = block.local_types.len() as u32;
+    let si32  = n_ir + 1; // i32 scratch local A (read results, read addr)
+    let si32b = n_ir + 2; // i32 scratch local B (write addr)
+    let sf64  = n_ir + 3; // f64 scratch local
 
     // ── Emit WASM body ────────────────────────────────────────────────────────
     let mut body: Vec<Instruction<'static>> = Vec::new();
     for inst in &block.insts {
-        emit_inst(inst, offsets, si32, sf64, &mut body);
+        emit_inst(inst, offsets, si32, si32b, sf64, &mut body);
     }
     // Final `end` of the function body.
     body.push(Instruction::End);
@@ -70,7 +75,8 @@ pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
             _ => locals.push((1, vt)),
         }
     }
-    locals.push((1, ValType::I32)); // i32 scratch
+    locals.push((1, ValType::I32)); // i32 scratch A
+    locals.push((1, ValType::I32)); // i32 scratch B
     locals.push((1, ValType::F64)); // f64 scratch
 
     // ── Assemble WASM module ──────────────────────────────────────────────────
@@ -87,6 +93,15 @@ pub fn lower(block: &IrBlock, offsets: &RegOffsets) -> WasmBlock {
     let mut isec = ImportSection::new();
     isec.import("env", "memory", EntityType::Memory(MemoryType {
         minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None,
+    }));
+    // `ram_base` is the byte offset of the emulator's RAM inside the WASM
+    // linear memory.  JIT blocks use it with direct i32.load / i32.store
+    // instructions for non-MMIO / non-L2C RAM accesses, avoiding the overhead
+    // of a JavaScript boundary crossing on every memory operation.
+    isec.import("env", "ram_base", EntityType::Global(GlobalType {
+        val_type: ValType::I32,
+        mutable: false,
+        shared: false,
     }));
     let h = "hooks";
     isec.import(h, "read_u8",         EntityType::Function(TY_I32_I32));
@@ -171,6 +186,7 @@ fn emit_inst(
     inst: &IrInst,
     off: &RegOffsets,
     si32: u32,
+    si32b: u32,
     sf64: u32,
     b: &mut Vec<Instruction<'static>>,
 ) {
@@ -419,16 +435,24 @@ fn emit_inst(
         IrInst::I64ReinterpretF64 => b.push(Instruction::I64ReinterpretF64),
         IrInst::I32WrapI64        => b.push(Instruction::I32WrapI64),
 
-        // ── Memory access via host hooks ───────────────────────────────────────
-        // addr is on top of stack; call pops it, pushes result.
-        IrInst::ReadU8  => b.push(Instruction::Call(imports::READ_U8)),
-        IrInst::ReadU16 => b.push(Instruction::Call(imports::READ_U16)),
-        IrInst::ReadU32 => b.push(Instruction::Call(imports::READ_U32)),
+        // ── Memory access — inline WASM for RAM, hooks for MMIO / L2C ─────────
+        //
+        // For each read/write the inline path:
+        //   1. Checks MMIO  (addr & 0xFE00_0000) == 0xCC00_0000  → hook
+        //   2. Checks L2C   (addr >> 24) == 0xE0                 → hook
+        //   3. Otherwise    (addr & PHYS_MASK) + ram_base         → direct load/store
+        //
+        // `read_f64` / `write_f64` remain as hook calls because big-endian
+        // f64 byte-swapping via i64 instructions adds significant code size
+        // with marginal gain (these are less common than integer accesses).
+
+        IrInst::ReadU8 => emit_read_u8(si32, b),
+        IrInst::ReadU16 => emit_read_u16(si32, b),
+        IrInst::ReadU32 => emit_read_u32(si32, b),
         IrInst::ReadF64 => b.push(Instruction::Call(imports::READ_F64)),
-        // (addr, val) on stack in that order; WASM call pops val then addr.
-        IrInst::WriteU8  => b.push(Instruction::Call(imports::WRITE_U8)),
-        IrInst::WriteU16 => b.push(Instruction::Call(imports::WRITE_U16)),
-        IrInst::WriteU32 => b.push(Instruction::Call(imports::WRITE_U32)),
+        IrInst::WriteU8  => emit_write_u8(si32, si32b, b),
+        IrInst::WriteU16 => emit_write_u16(si32, si32b, b),
+        IrInst::WriteU32 => emit_write_u32(si32, si32b, b),
         IrInst::WriteF64 => b.push(Instruction::Call(imports::WRITE_F64)),
 
         // ── Quantized paired-single memory ────────────────────────────────────
@@ -487,4 +511,241 @@ fn emit_inst(
             b.push(Instruction::Return);
         }
     }
+}
+
+// ─── Inline memory-access helpers ─────────────────────────────────────────────
+//
+// These emit WASM instruction sequences that dispatch to:
+//   • MMIO hook  when (addr & 0xFE00_0000) == 0xCC00_0000
+//   • L2C hook   when (addr >> 24) == 0xE0
+//   • Direct RAM load/store otherwise  (addr & PHYS_MASK) + global(0 = ram_base)
+//
+// For read operations the if-else chain produces one i32 (or f64) result.
+// For write operations the if-else chain has no result (BlockType::Empty).
+//
+// The caller saves `addr` into `si32` via LocalTee so both branches can reload it.
+// Write helpers additionally use `si32b` to hold `addr` after also saving `val` in `si32`.
+
+/// Emit MMIO / L2C / RAM check boilerplate for read operations.
+///
+/// After the call:
+/// - MMIO branch: calls `hook_fn` with addr from `si32`; hook returns the result.
+/// - L2C branch:  calls `hook_fn` with addr from `si32`; hook returns the result.
+/// - RAM "else" entry: stack is empty; caller must emit the direct-access code.
+///
+/// The caller must close the two `End` instructions at the end.
+fn begin_read_dispatch(si32: u32, hook_fn: u32, b: &mut Vec<Instruction<'static>>) {
+    // Save addr in si32 while keeping a copy on the stack.
+    b.push(Instruction::LocalTee(si32));
+    // MMIO check: (addr & 0xFE00_0000) == 0xCC00_0000
+    b.push(Instruction::I32Const(0xFE00_0000u32 as i32));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(0xCC00_0000u32 as i32));
+    b.push(Instruction::I32Eq);
+    b.push(Instruction::If(BlockType::Result(ValType::I32)));
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::Call(hook_fn));
+    b.push(Instruction::Else);
+    // L2C check: (addr >> 24) == 0xE0
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(24));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Const(0xE0));
+    b.push(Instruction::I32Eq);
+    b.push(Instruction::If(BlockType::Result(ValType::I32)));
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::Call(hook_fn));
+    b.push(Instruction::Else);
+    // Caller emits the RAM direct-load here.
+}
+
+/// Emit the tail-end of a read dispatch (two `End` instructions).
+fn end_read_dispatch(b: &mut Vec<Instruction<'static>>) {
+    b.push(Instruction::End); // end inner (L2C) if
+    b.push(Instruction::End); // end outer (MMIO) if
+}
+
+/// Compute the physical RAM address in WASM linear memory and leave it on the stack.
+/// Stack before: [] (in the RAM else branch)
+/// Stack after:  [wasm_ram_addr: i32]
+fn push_wasm_ram_addr(si32: u32, b: &mut Vec<Instruction<'static>>) {
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(PHYS_MASK));
+    b.push(Instruction::I32And);
+    b.push(Instruction::GlobalGet(0)); // ram_base
+    b.push(Instruction::I32Add);
+}
+
+/// `ReadU8` — Stack: (addr) → (u8 zero-extended as i32)
+fn emit_read_u8(si32: u32, b: &mut Vec<Instruction<'static>>) {
+    begin_read_dispatch(si32, imports::READ_U8, b);
+    push_wasm_ram_addr(si32, b);
+    b.push(Instruction::I32Load8U(m8(0)));
+    end_read_dispatch(b);
+}
+
+/// `ReadU16` — Stack: (addr) → (big-endian u16 zero-extended as i32)
+fn emit_read_u16(si32: u32, b: &mut Vec<Instruction<'static>>) {
+    begin_read_dispatch(si32, imports::READ_U16, b);
+    push_wasm_ram_addr(si32, b);
+    b.push(Instruction::I32Load16U(m16(0)));
+    // bswap16: ((x & 0xFF) << 8) | ((x >> 8) & 0xFF)
+    // si32 is no longer needed for addr; reuse as temp.
+    b.push(Instruction::LocalSet(si32));
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(0xFF));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32Shl);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Const(0xFF));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Or);
+    end_read_dispatch(b);
+}
+
+/// `ReadU32` — Stack: (addr) → (big-endian u32 as i32)
+fn emit_read_u32(si32: u32, b: &mut Vec<Instruction<'static>>) {
+    begin_read_dispatch(si32, imports::READ_U32, b);
+    push_wasm_ram_addr(si32, b);
+    b.push(Instruction::I32Load(m32(0)));
+    // bswap32 — si32 reused as temp after addr is no longer needed.
+    b.push(Instruction::LocalSet(si32));
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(0xFF));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(24));
+    b.push(Instruction::I32Shl);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(0xFF00));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32Shl);
+    b.push(Instruction::I32Or);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Const(0xFF00));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Or);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(24));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Or);
+    end_read_dispatch(b);
+}
+
+/// Emit MMIO / L2C / RAM check boilerplate for write operations.
+///
+/// On entry: stack has `..., addr, val`.
+/// After this call:
+/// - `si32`  holds `val`  (popped from stack).
+/// - `si32b` holds `addr` (saved via LocalTee; addr remains on stack for the test).
+/// - MMIO branch: calls `hook_fn(addr, val)` and falls into the outer `End`.
+/// - L2C branch:  calls `hook_fn(addr, val)` and falls into the inner `End`.
+/// - RAM "else" entry: stack is empty; caller must emit the direct-store code.
+///
+/// Caller must emit the `wasm_ram_addr + store + End + End` to close.
+fn begin_write_dispatch(si32: u32, si32b: u32, hook_fn: u32, b: &mut Vec<Instruction<'static>>) {
+    b.push(Instruction::LocalSet(si32));   // pop val → si32
+    b.push(Instruction::LocalTee(si32b));  // si32b = addr; keep addr on stack
+    // MMIO check
+    b.push(Instruction::I32Const(0xFE00_0000u32 as i32));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(0xCC00_0000u32 as i32));
+    b.push(Instruction::I32Eq);
+    b.push(Instruction::If(BlockType::Empty));
+    b.push(Instruction::LocalGet(si32b));
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::Call(hook_fn));
+    b.push(Instruction::Else);
+    // L2C check
+    b.push(Instruction::LocalGet(si32b));
+    b.push(Instruction::I32Const(24));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Const(0xE0));
+    b.push(Instruction::I32Eq);
+    b.push(Instruction::If(BlockType::Empty));
+    b.push(Instruction::LocalGet(si32b));
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::Call(hook_fn));
+    b.push(Instruction::Else);
+    // Caller emits wasm_ram_addr + store here.
+}
+
+/// Emit the tail-end of a write dispatch (two `End` instructions).
+fn end_write_dispatch(b: &mut Vec<Instruction<'static>>) {
+    b.push(Instruction::End); // end inner (L2C) if
+    b.push(Instruction::End); // end outer (MMIO) if
+}
+
+/// Compute the physical RAM address in WASM linear memory from `si32b` (addr).
+fn push_wasm_ram_addr_b(si32b: u32, b: &mut Vec<Instruction<'static>>) {
+    b.push(Instruction::LocalGet(si32b));
+    b.push(Instruction::I32Const(PHYS_MASK));
+    b.push(Instruction::I32And);
+    b.push(Instruction::GlobalGet(0)); // ram_base
+    b.push(Instruction::I32Add);
+}
+
+/// `WriteU8` — Stack: (addr, val) → ()
+fn emit_write_u8(si32: u32, si32b: u32, b: &mut Vec<Instruction<'static>>) {
+    begin_write_dispatch(si32, si32b, imports::WRITE_U8, b);
+    push_wasm_ram_addr_b(si32b, b);
+    b.push(Instruction::LocalGet(si32)); // val (no bswap for byte)
+    b.push(Instruction::I32Store8(m8(0)));
+    end_write_dispatch(b);
+}
+
+/// `WriteU16` — Stack: (addr, val) → ()  (val is a big-endian u16)
+fn emit_write_u16(si32: u32, si32b: u32, b: &mut Vec<Instruction<'static>>) {
+    begin_write_dispatch(si32, si32b, imports::WRITE_U16, b);
+    push_wasm_ram_addr_b(si32b, b);
+    // bswap16(val): ((val & 0xFF) << 8) | ((val >> 8) & 0xFF)
+    // si32 holds val; build bswap result on the stack.
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(0xFF));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32Shl);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Const(0xFF));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Or);
+    b.push(Instruction::I32Store16(m16(0)));
+    end_write_dispatch(b);
+}
+
+/// `WriteU32` — Stack: (addr, val) → ()  (val is a big-endian u32)
+fn emit_write_u32(si32: u32, si32b: u32, b: &mut Vec<Instruction<'static>>) {
+    begin_write_dispatch(si32, si32b, imports::WRITE_U32, b);
+    push_wasm_ram_addr_b(si32b, b);
+    // bswap32(val) on the stack; si32 holds val.
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(0xFF));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(24));
+    b.push(Instruction::I32Shl);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(0xFF00));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32Shl);
+    b.push(Instruction::I32Or);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(8));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Const(0xFF00));
+    b.push(Instruction::I32And);
+    b.push(Instruction::I32Or);
+    b.push(Instruction::LocalGet(si32));
+    b.push(Instruction::I32Const(24));
+    b.push(Instruction::I32ShrU);
+    b.push(Instruction::I32Or);
+    b.push(Instruction::I32Store(m32(0)));
+    end_write_dispatch(b);
 }

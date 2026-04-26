@@ -122,6 +122,28 @@ impl WasmEmulator {
         self.pad_buttons
     }
 
+    /// Store precise analog axis values for the port-0 controller.
+    ///
+    /// Called by the JavaScript input layer once per animation frame after
+    /// either reading the Gamepad API (full 8-bit resolution) or computing
+    /// axis values from keyboard `STICK_*` pseudo-buttons (±96 deflection).
+    ///
+    /// These values are forwarded verbatim into the SI poll response (bytes 2–7
+    /// of the 8-byte controller report), replacing the old fixed-deflection
+    /// calculation that was derived from the digital button bitmask.
+    ///
+    /// - `joy_x` / `joy_y`: main stick (0–255, centre = 128; Y: up = larger).
+    /// - `c_stick_x` / `c_stick_y`: C-Stick (0–255, centre = 128).
+    /// - `l_trig` / `r_trig`: analog trigger depth (0 = released, 255 = full).
+    pub fn set_analog_axes(
+        &mut self,
+        joy_x: u8, joy_y: u8,
+        c_stick_x: u8, c_stick_y: u8,
+        l_trig: u8, r_trig: u8,
+    ) {
+        self.si.set_analog_axes(joy_x, joy_y, c_stick_x, c_stick_y, l_trig, r_trig);
+    }
+
     // ── Timebase ──────────────────────────────────────────────────────────────
 
     /// Advance the CPU time-base register by `delta` ticks.
@@ -241,6 +263,15 @@ impl WasmEmulator {
         (self.cpu_cycles >> 32) as u32
     }
 
+    /// Read the Audio Interface Control Register (AICR).
+    ///
+    /// JavaScript uses bit 1 (AISFR) to select the audio sample rate
+    /// (0 = 48 kHz, 1 = 32 kHz) for cycle-accurate AI scheduling and
+    /// per-frame sample generation.
+    pub fn get_ai_control(&self) -> u32 {
+        self.ai.control
+    }
+
     /// Number of compiled blocks that contained at least one unimplemented opcode.
     pub fn unimplemented_block_count(&self) -> u32 {
         self.unimplemented_block_count as u32
@@ -356,7 +387,136 @@ impl WasmEmulator {
         data.slice(0, len as u32).copy_to(&mut self.exi.sram[..len]);
     }
 
-    // ── CPU struct serialisation ──────────────────────────────────────────────
+    // ── Memory card ───────────────────────────────────────────────────────────
+
+    /// Return the raw 512 KiB memory card data for the given slot.
+    ///
+    /// - `slot = 0`: EXI channel 0, slot A (standard card port).
+    /// - `slot = 1`: EXI channel 1, slot B.
+    ///
+    /// JavaScript should persist this data in `localStorage` (or OPFS for
+    /// larger cards) and call [`set_memcard_data`] on startup to restore it.
+    pub fn get_memcard_data(&self, slot: u32) -> js_sys::Uint8Array {
+        let mc = match slot {
+            0 => &self.exi.mc_a,
+            1 => &self.exi.mc_b,
+            _ => return js_sys::Uint8Array::new_with_length(0),
+        };
+        js_sys::Uint8Array::from(mc.data.as_slice())
+    }
+
+    /// Overwrite the memory card data for the given slot with `data`.
+    ///
+    /// Any number of bytes up to 512 KiB may be written; bytes beyond the
+    /// internal buffer length are silently ignored.  If `data` is shorter than
+    /// 512 KiB the remainder of the card stays at its current value (default
+    /// `0xFF` = erased).
+    pub fn set_memcard_data(&mut self, slot: u32, data: js_sys::Uint8Array) {
+        let mc = match slot {
+            0 => &mut self.exi.mc_a,
+            1 => &mut self.exi.mc_b,
+            _ => return,
+        };
+        let len = data.length().min(mc.data.len() as u32) as usize;
+        data.slice(0, len as u32).copy_to(&mut mc.data[..len]);
+    }
+
+    // ── DSP audio PCM generation ──────────────────────────────────────────────
+
+    /// Generate up to `n_samples` stereo 16-bit PCM samples from the AI DMA
+    /// ring buffer and return them as a `Float32Array` of length `n_samples * 2`
+    /// (interleaved left/right, each sample normalised to `−1.0 … +1.0`).
+    ///
+    /// Called once per animation frame by the JavaScript audio pipeline to
+    /// fill the `SharedArrayBuffer` PCM ring buffer consumed by the
+    /// `AudioWorkletNode` DSP output worklet.
+    ///
+    /// Returns an empty array when the AI DMA is not running (`AudioDmaControl`
+    /// bit 15 = 0), the DMA buffer length is zero, or `n_samples == 0`.
+    pub fn take_audio_samples(&mut self, n_samples: u32) -> js_sys::Float32Array {
+        // Only generate samples while the AI DMA is playing (bit 15 of AudioDmaControl).
+        let playing = self.dsp.audio_dma_control & 0x8000 != 0;
+        let buf_len = self.dsp.audio_dma_len as usize;
+        if !playing || n_samples == 0 || buf_len == 0 {
+            return js_sys::Float32Array::new_with_length(0);
+        }
+
+        let base = crate::phys_addr(self.dsp.audio_dma_base);
+        let out = js_sys::Float32Array::new_with_length(n_samples * 2);
+
+        for i in 0..n_samples {
+            let pos = self.dsp.audio_dma_pos as usize % buf_len;
+            let off = base + pos;
+
+            // Each stereo sample = 2 big-endian i16 values (L then R).
+            let l = if off + 1 < self.ram.len() {
+                i16::from_be_bytes([self.ram[off], self.ram[off + 1]])
+            } else {
+                0
+            };
+            let r = if off + 3 < self.ram.len() {
+                i16::from_be_bytes([self.ram[off + 2], self.ram[off + 3]])
+            } else {
+                0
+            };
+
+            out.set_index(i * 2,     l as f32 / 32768.0);
+            out.set_index(i * 2 + 1, r as f32 / 32768.0);
+
+            // Advance the ring-buffer position by 4 bytes (one stereo pair).
+            self.dsp.audio_dma_pos = ((self.dsp.audio_dma_pos + 4) as usize % buf_len) as u32;
+        }
+
+        out
+    }
+
+    // ── BAT address translation ───────────────────────────────────────────────
+
+    /// Return the upper 32-bit word of a Data BAT register.
+    ///
+    /// `n` is 0–3 for DBAT0U–DBAT3U.  These are stored in
+    /// `cpu.supervisor.memory.dbat[n]` (bits 32–63 of the packed 64-bit
+    /// `Bat` value, as recorded by `mtspr DBAT0U` etc.).
+    ///
+    /// JavaScript reads this alongside [`get_dbat_l`] to implement BAT address
+    /// translation in the MMIO hook fallback path.
+    pub fn get_dbat_u(&self, n: u32) -> u32 {
+        let n = n as usize;
+        if n >= 4 { return 0; }
+        // The Bat struct is 64 bits packed as (lower: bits 0–31, upper: bits 32–63).
+        let raw: u64 = self.cpu.supervisor.memory.dbat[n].to_bits();
+        (raw >> 32) as u32
+    }
+
+    /// Return the lower 32-bit word of a Data BAT register.
+    ///
+    /// `n` is 0–3 for DBAT0L–DBAT3L.
+    pub fn get_dbat_l(&self, n: u32) -> u32 {
+        let n = n as usize;
+        if n >= 4 { return 0; }
+        let raw: u64 = self.cpu.supervisor.memory.dbat[n].to_bits();
+        raw as u32
+    }
+
+    /// Return the upper 32-bit word of an Instruction BAT register.
+    ///
+    /// `n` is 0–3 for IBAT0U–IBAT3U.
+    pub fn get_ibat_u(&self, n: u32) -> u32 {
+        let n = n as usize;
+        if n >= 4 { return 0; }
+        let raw: u64 = self.cpu.supervisor.memory.ibat[n].to_bits();
+        (raw >> 32) as u32
+    }
+
+    /// Return the lower 32-bit word of an Instruction BAT register.
+    ///
+    /// `n` is 0–3 for IBAT0L–IBAT3L.
+    pub fn get_ibat_l(&self, n: u32) -> u32 {
+        let n = n as usize;
+        if n >= 4 { return 0; }
+        let raw: u64 = self.cpu.supervisor.memory.ibat[n].to_bits();
+        raw as u32
+    }
 
     /// Size in bytes of the [`gekko::Cpu`] struct.
     pub fn cpu_struct_size(&self) -> u32 {

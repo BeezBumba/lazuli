@@ -101,6 +101,22 @@ pub(crate) struct DspState {
     /// AudioDmaControl at offset 0x36 (`0xCC005036`).
     /// Bit 15 = playing; bits 0–14 = length in 32-byte blocks.
     pub(crate) audio_dma_control: u16,
+    /// `AudioDmaBase` at offset 0x30 (`0xCC005030`).
+    /// Main-RAM byte address of the audio PCM source buffer set by the OS.
+    pub(crate) audio_dma_base: u32,
+    /// Total byte length of the AI DMA ring buffer (derived from
+    /// `AudioDmaControl` bits 0–14 × 32 bytes per block, updated when
+    /// `AudioDmaControl` is written with the playing bit set).
+    pub(crate) audio_dma_len: u32,
+    /// Current read position within the AI DMA ring buffer (byte offset from
+    /// `audio_dma_base`).  Advances by 4 bytes (one stereo 16-bit sample pair)
+    /// for every sample generated.  Wraps at `audio_dma_len`.
+    pub(crate) audio_dma_pos: u32,
+    /// Sub-sample fractional accumulator used to convert CPU cycles to
+    /// audio-sample counts at 32 kHz / 48 kHz.  Accumulates
+    /// `cpu_cycles × sample_rate` and is reduced by `cpu_hz` once per
+    /// generated sample so no fractional samples are lost across frames.
+    pub(crate) audio_sample_frac: u64,
 
     // ── ARAM DMA register state ────────────────────────────────────────────
     /// `DspAramDmaRamBase` (offset 0x20, 4 bytes) — main-RAM byte address for
@@ -126,6 +142,10 @@ impl Default for DspState {
             dsp2cpu_lo: 0,
             control: DSPCTRL_DEFAULT,
             audio_dma_control: 0,
+            audio_dma_base: 0,
+            audio_dma_len: 0,
+            audio_dma_pos: 0,
+            audio_sample_frac: 0,
             aram_dma_ram_base: 0,
             aram_dma_aram_base: 0,
             aram_dma_control: 0,
@@ -162,6 +182,10 @@ impl DspState {
             0x06 => self.dsp2cpu_lo,
             // DSPCONTROL at the CORRECT hardware offset 0x0A (0xCC00500A).
             0x0A => self.control,
+            // AudioDmaBase (0x30/0x32): return the stored 32-bit value split
+            // into two 16-bit halves (big-endian: high at 0x30, low at 0x32).
+            0x30 => (self.audio_dma_base >> 16) as u16,
+            0x32 => self.audio_dma_base as u16,
             // AudioDmaControl: return the last written value.
             0x36 => self.audio_dma_control,
             // AudioDmaRemaining: HLE always returns 0 (DMA instantly complete).
@@ -229,6 +253,12 @@ impl DspState {
                 self.audio_dma_control = val;
                 if val & 0x8000 != 0 {
                     self.control |= 1 << 3; // ai_dma_interrupt = 1
+                    // Compute the DMA ring-buffer length (bits 0–14 × 32 bytes/block).
+                    // Reset the read position so the next sample generation starts
+                    // at the beginning of the new buffer.
+                    let blocks = (val & 0x7FFF) as u32;
+                    self.audio_dma_len = blocks.max(1) * 32;
+                    self.audio_dma_pos = 0;
                 }
             }
             _ => {}
@@ -264,9 +294,11 @@ impl DspState {
                 self.control |= 1 << 5;  // aram_dma_interrupt = 1
                 self.control &= !(1 << 9); // aram_dma_ongoing = 0
             }
-            // AudioDmaBase (0x30, 4 bytes): address of the audio DMA source in
-            // main RAM.  HLE does not stream audio, so the write is accepted but
-            // ignored.  DspAramDmaRamBase / DspAramDmaAramBase are handled above.
+            // AudioDmaBase (0x30, 4 bytes): main-RAM byte address of the PCM
+            // source buffer.  HLE does not stream audio, but the value is stored
+            // so that future audio DMA support can reference it without a protocol
+            // change.
+            0x30 => self.audio_dma_base = val,
             _ => {}
         }
     }

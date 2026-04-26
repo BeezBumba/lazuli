@@ -229,7 +229,7 @@ impl WasmEmulator {
         let exts = Extensions::gekko_broadway();
         let mut out = Vec::new();
 
-        for i in 0..32usize {
+        for i in 0..64usize {
             let pc = guest_pc.wrapping_add((i * 4) as u32);
             let addr = crate::phys_addr(pc);
             if addr + 4 > self.ram.len() {

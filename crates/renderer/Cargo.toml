@@ -40,3 +40,9 @@ wgpu = { workspace = true, features = ["vulkan", "metal", "wgsl"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12", "vulkan", "wgsl"] }
+
+# WebGPU rendering backend for wasm32 (Phase 4).
+# Uses wgpu::SurfaceTarget::Canvas; the background renderer thread is disabled
+# at compile time via #[cfg(not(target_arch = "wasm32"))] in lib.rs.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgpu", "wgsl"] }
