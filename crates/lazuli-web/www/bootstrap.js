@@ -2539,7 +2539,18 @@ function renderXfb(ram, ctx, emu, title) {
     return;
   }
 
-  // YUV422 → RGBA conversion into an ImageData
+  // Phase 4 fast path: pass raw YUV422 bytes to the WebGPU renderer.
+  // The Rust side handles YUV422→RGBA conversion and GPU texture upload,
+  // which is significantly faster than the JS loop below.
+  if (webgpuRenderer) {
+    const xfbRaw = new Uint8Array(ram.buffer, ram.byteOffset + xfb, XFB_BYTE_SIZE);
+    webgpuRenderer.present_xfb(xfbRaw);
+    return;
+  }
+
+  // Canvas 2D fallback: YUV422 → RGBA conversion in JavaScript.
+  // Used when WebGPU is unavailable or when running in the Worker path
+  // (webgpuRenderer is always null on the worker thread).
   const imageData = ctx.createImageData(SCREEN_W, SCREEN_H);
   const px        = imageData.data;
   const pairs     = (SCREEN_W * SCREEN_H) >>> 1;

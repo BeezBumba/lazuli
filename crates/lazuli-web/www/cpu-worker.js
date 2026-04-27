@@ -1104,7 +1104,7 @@ function runFrame() {
   // ring buffer and pushes them to the AudioWorkletNode via the SAB.
   if (pcmSab && pcmIdxSab) {
     // AICR.AISFR (bit 1): 0 = 48 kHz, 1 = 32 kHz.
-    const n = (((emu.read_hw_u32?.(0xCC006C00) ?? 0) >> 1) & 1)
+    const n = (((emu.hw_read_u32?.(0xCC006C00) ?? 0) >> 1) & 1)
       ? 534  // 32 kHz / 60 fps
       : 800; // 48 kHz / 60 fps
     const samples = emu.take_audio_samples(n);
