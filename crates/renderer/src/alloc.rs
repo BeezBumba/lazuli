@@ -9,7 +9,7 @@ struct BufferPair {
 }
 
 impl BufferPair {
-    fn map(self, f: impl FnOnce(BufferPair) + 'static) {
+    fn map(self, f: impl FnOnce(BufferPair) + wgpu::WasmNotSend + 'static) {
         let buffer = match &self.secondary {
             Some(secondary) => secondary.clone(),
             None => self.primary.clone(),
