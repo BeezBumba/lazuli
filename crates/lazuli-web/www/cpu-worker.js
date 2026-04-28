@@ -17,6 +17,7 @@
  *   { type: 'start' }
  *   { type: 'stop' }
  *   { type: 'input',             padButtons: u32 }
+ *   { type: 'analog_axes',      jx: u8, jy: u8, cx: u8, cy: u8, lt: u8, rt: u8 }
  *   { type: 'reset',             pc: u32 }
  *   { type: 'step' }
  *   { type: 'run_n',             n: number }
@@ -260,14 +261,15 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
   const L2C_BASE = 0xE000_0000;
   const L2C_MASK = 0x0000_3FFF;
 
+  // These hooks are called only for MMIO (0xCCxxxxxx) and L2C (0xE0xxxxxx)
+  // addresses — normal RAM accesses are handled by inline WASM using the
+  // ram_base global import (see ppcwasm/src/lower.rs).
   return {
     read_u8(addr) {
       addr = addr >>> 0;
       if (l2c && addr >= L2C_BASE && addr < L2C_BASE + l2c.length)
         return l2c[addr & L2C_MASK];
-      if ((addr >>> 24 & 0xFE) === 0xCC) return 0;
-      addr &= PHYS_MASK;
-      return addr < r.length ? r[addr] : 0;
+      return 0; // MMIO byte reads return 0 (hw_read_u8 not wired)
     },
     read_u16(addr) {
       addr = addr >>> 0;
@@ -275,15 +277,10 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
         const off = addr & L2C_MASK;
         return off + 1 < l2c.length ? (l2c[off] << 8) | l2c[off + 1] : 0;
       }
-      if ((addr >>> 24 & 0xFE) === 0xCC) {
-        const val = emu.hw_read_u16(addr) & 0xFFFF;
-        recentMmioAccesses.push({ dir: "R", size: 16, addr, subsystem: mmioSubsystem(addr), val });
-        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
-        return val;
-      }
-      addr &= PHYS_MASK;
-      if (addr + 1 >= r.length) return 0;
-      return (r[addr] << 8) | r[addr + 1];
+      const val = emu.hw_read_u16(addr) & 0xFFFF;
+      recentMmioAccesses.push({ dir: "R", size: 16, addr, subsystem: mmioSubsystem(addr), val });
+      if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
+      return val;
     },
     read_u32(addr) {
       addr = addr >>> 0;
@@ -293,15 +290,10 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
           return (((l2c[off] << 24) | (l2c[off+1] << 16) | (l2c[off+2] << 8) | l2c[off+3]) >>> 0);
         return 0;
       }
-      if ((addr >>> 24 & 0xFE) === 0xCC) {
-        const val = emu.hw_read_u32(addr) >>> 0;
-        recentMmioAccesses.push({ dir: "R", size: 32, addr, subsystem: mmioSubsystem(addr), val });
-        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
-        return val;
-      }
-      addr &= PHYS_MASK;
-      if (addr + 3 >= r.length) return 0;
-      return (((r[addr] << 24) | (r[addr+1] << 16) | (r[addr+2] << 8) | r[addr+3]) >>> 0);
+      const val = emu.hw_read_u32(addr) >>> 0;
+      recentMmioAccesses.push({ dir: "R", size: 32, addr, subsystem: mmioSubsystem(addr), val });
+      if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
+      return val;
     },
     read_f64(addr) {
       addr = addr >>> 0;
@@ -314,6 +306,7 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
         return 0.0;
       }
       if ((addr >>> 24 & 0xFE) === 0xCC) return 0.0;
+      // Fallback for any address that slips through the inline check (e.g. physical 0x00xxxxxx).
       addr &= PHYS_MASK;
       if (addr + 7 >= r.length) return 0.0;
       const view = new DataView(r.buffer, r.byteOffset + addr, 8);
@@ -330,9 +323,7 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
         feedStdoutByte(val & 0xFF);
         return;
       }
-      if ((addr >>> 24 & 0xFE) === 0xCC) return;
-      addr &= PHYS_MASK;
-      if (addr < r.length) r[addr] = val & 0xFF;
+      // Any other MMIO byte write — ignored (no hw_write_u8)
     },
     write_u16(addr, val) {
       addr = addr >>> 0;
@@ -341,14 +332,9 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
         if (off + 1 < l2c.length) { l2c[off] = (val >> 8) & 0xFF; l2c[off+1] = val & 0xFF; }
         return;
       }
-      if ((addr >>> 24 & 0xFE) === 0xCC) {
-        recentMmioAccesses.push({ dir: "W", size: 16, addr, subsystem: mmioSubsystem(addr), val: val & 0xFFFF });
-        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
-        emu.hw_write_u16(addr, val & 0xFFFF);
-        return;
-      }
-      addr &= PHYS_MASK;
-      if (addr + 1 < r.length) { r[addr] = (val >> 8) & 0xFF; r[addr+1] = val & 0xFF; }
+      recentMmioAccesses.push({ dir: "W", size: 16, addr, subsystem: mmioSubsystem(addr), val: val & 0xFFFF });
+      if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
+      emu.hw_write_u16(addr, val & 0xFFFF);
     },
     write_u32(addr, val) {
       addr = addr >>> 0;
@@ -361,46 +347,38 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
         }
         return;
       }
-      if ((addr >>> 24 & 0xFE) === 0xCC) {
-        recentMmioAccesses.push({ dir: "W", size: 32, addr, subsystem: mmioSubsystem(addr), val });
-        if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
-        emu.hw_write_u32(addr, val);
-        // DVD DMA may have overwritten guest code — selectively invalidate JIT cache.
-        if (emu.take_dma_dirty()) {
-          const dmaPhysStart = emu.last_dma_addr() >>> 0;
-          const dmaPhysLen   = emu.last_dma_len()  >>> 0;
-          const dmaPhysEnd   = dmaPhysStart + dmaPhysLen;
-          for (const [vpc] of moduleCache) {
-            const physPc  = (vpc & PHYS_MASK) >>> 0;
-            const meta    = blockMetaMap.get(vpc);
-            const blockEnd = physPc + (meta ? meta.insCount * 4 : 4);
-            if (physPc < dmaPhysEnd && blockEnd > dmaPhysStart) {
-              moduleCache.delete(vpc);
-              blockMetaMap.delete(vpc);
-            }
+      recentMmioAccesses.push({ dir: "W", size: 32, addr, subsystem: mmioSubsystem(addr), val });
+      if (recentMmioAccesses.length > MMIO_RING_SIZE) recentMmioAccesses.shift();
+      emu.hw_write_u32(addr, val);
+      // DVD DMA may have overwritten guest code — selectively invalidate JIT cache.
+      if (emu.take_dma_dirty()) {
+        const dmaPhysStart = emu.last_dma_addr() >>> 0;
+        const dmaPhysLen   = emu.last_dma_len()  >>> 0;
+        const dmaPhysEnd   = dmaPhysStart + dmaPhysLen;
+        for (const [vpc] of moduleCache) {
+          const physPc  = (vpc & PHYS_MASK) >>> 0;
+          const meta    = blockMetaMap.get(vpc);
+          const blockEnd = physPc + (meta ? meta.insCount * 4 : 4);
+          if (physPc < dmaPhysEnd && blockEnd > dmaPhysStart) {
+            moduleCache.delete(vpc);
+            blockMetaMap.delete(vpc);
           }
-          // Refresh RAM view in case the DMA triggered WASM linear-memory growth.
-          r = getRamView();
-          // Log the DMA to the main thread's apploader panel.
-          const discOff = emu.last_di_disc_offset() >>> 0;
-          const previewLen = Math.min(dmaPhysLen, 8);
-          const preview = [];
-          for (let i = 0; i < previewLen; i++)
-            preview.push(r[dmaPhysStart + i].toString(16).padStart(2, "0"));
-          for (let i = previewLen; i < 8; i++) preview.push("00");
-          postApploaderLog(
-            `[lazuli] DI: DVD Read disc_off=0x${discOff.toString(16).padStart(8,"0")}` +
-            ` len=0x${dmaPhysLen.toString(16)}` +
-            ` ram_dest=0x${dmaPhysStart.toString(16).padStart(8,"0")}` +
-            ` data=[${preview.join(" ")}]`
-          );
         }
-        return;
-      }
-      addr &= PHYS_MASK;
-      if (addr + 3 < r.length) {
-        r[addr]   = (val >>> 24) & 0xFF; r[addr+1] = (val >>> 16) & 0xFF;
-        r[addr+2] = (val >>>  8) & 0xFF; r[addr+3] =  val         & 0xFF;
+        // Refresh RAM view in case the DMA triggered WASM linear-memory growth.
+        r = getRamView();
+        // Log the DMA to the main thread's apploader panel.
+        const discOff = emu.last_di_disc_offset() >>> 0;
+        const previewLen = Math.min(dmaPhysLen, 8);
+        const preview = [];
+        for (let i = 0; i < previewLen; i++)
+          preview.push(r[dmaPhysStart + i].toString(16).padStart(2, "0"));
+        for (let i = previewLen; i < 8; i++) preview.push("00");
+        postApploaderLog(
+          `[lazuli] DI: DVD Read disc_off=0x${discOff.toString(16).padStart(8,"0")}` +
+          ` len=0x${dmaPhysLen.toString(16)}` +
+          ` ram_dest=0x${dmaPhysStart.toString(16).padStart(8,"0")}` +
+          ` data=[${preview.join(" ")}]`
+        );
       }
     },
     write_f64(addr, val) {
@@ -414,6 +392,7 @@ function buildHooks(ram, log, numericPc, pcContext = "?") {
         return;
       }
       if ((addr >>> 24 & 0xFE) === 0xCC) return;
+      // Fallback for any address that slips through (e.g. physical 0x00xxxxxx).
       addr &= PHYS_MASK;
       if (addr + 7 >= r.length) return;
       const view = new DataView(r.buffer, r.byteOffset + addr, 8);
@@ -604,8 +583,11 @@ function executeOneBlockSync(ram, log) {
 
   let instance;
   try {
+    // Provide the ram_base global so JIT blocks can use direct i32.load/i32.store
+    // for RAM accesses without crossing the JavaScript boundary.
+    const ramBaseGlobal = new WebAssembly.Global({ value: 'i32', mutable: false }, emu.ram_ptr());
     instance = new WebAssembly.Instance(module, {
-      env:   { memory: regsMem },
+      env:   { memory: regsMem, ram_base: ramBaseGlobal },
       hooks: buildHooks(ram, log, pc, pcHex),
     });
   } catch (e) {
@@ -700,35 +682,47 @@ function convertXfbToRgba(ram, xfbAddr) {
 
 /**
  * Write interleaved stereo PCM samples into the SharedArrayBuffer ring buffer.
- * Called when advance_ai() or future DSP audio generation produces samples.
- * Falls back to postMessage if the SAB has not been set up.
  *
- * @param {Float32Array} left   Left-channel samples
- * @param {Float32Array} right  Right-channel samples
+ * Accepts either:
+ *   - An interleaved `Float32Array` [L0, R0, L1, R1, …] from
+ *     `emu.take_audio_samples(n)`.
+ *   - Two separate `left`/`right` arrays (legacy path; kept for compatibility).
+ *
+ * The SAB layout is [L[0..RING-1], R[0..RING-1]] as Float32.
+ *
+ * @param {Float32Array} leftOrInterleaved  Left channel, or interleaved L/R
+ * @param {Float32Array} [right]            Right channel (omit for interleaved)
  */
-function pushPcmToSab(left, right) {
-  if (!pcmSab || !pcmIdxSab) {
-    // Phase 3 SAB not yet initialised — no audio output this frame.
-    return;
-  }
+function pushPcmToSab(leftOrInterleaved, right) {
+  if (!pcmSab || !pcmIdxSab) return;
 
-  const data    = new Float32Array(pcmSab);
-  const idx     = new Int32Array(pcmIdxSab);
-  const wHead   = Atomics.load(idx, 0);
-  const rHead   = Atomics.load(idx, 1);
-  // Available (occupied) slots in the ring buffer.
-  const avail   = (wHead - rHead + PCM_RING_SIZE) & PCM_RING_MASK;
-  // Free space: ring size minus occupied, minus 1 to distinguish full from empty.
-  const free    = PCM_RING_SIZE - avail - 1;
-  const n       = Math.min(left.length, free);
+  const data  = new Float32Array(pcmSab);
+  const idx   = new Int32Array(pcmIdxSab);
+  const wHead = Atomics.load(idx, 0);
+  const rHead = Atomics.load(idx, 1);
+  const avail = (wHead - rHead + PCM_RING_SIZE) & PCM_RING_MASK;
+  const free  = PCM_RING_SIZE - avail - 1;
 
-  for (let i = 0; i < n; i++) {
-    const pos        = (wHead + i) & PCM_RING_MASK;
-    data[pos]                = left[i];
-    data[pos + PCM_RING_SIZE] = right[i];
+  if (right === undefined) {
+    // Interleaved path: [L0, R0, L1, R1, …] from take_audio_samples().
+    const nStereo = leftOrInterleaved.length >> 1;
+    const n       = Math.min(nStereo, free);
+    for (let i = 0; i < n; i++) {
+      const pos              = (wHead + i) & PCM_RING_MASK;
+      data[pos]              = leftOrInterleaved[i * 2];
+      data[pos + PCM_RING_SIZE] = leftOrInterleaved[i * 2 + 1];
+    }
+    Atomics.store(idx, 0, (wHead + n) & PCM_RING_MASK);
+  } else {
+    // Separate left/right path (legacy).
+    const n = Math.min(leftOrInterleaved.length, free);
+    for (let i = 0; i < n; i++) {
+      const pos              = (wHead + i) & PCM_RING_MASK;
+      data[pos]              = leftOrInterleaved[i];
+      data[pos + PCM_RING_SIZE] = right[i];
+    }
+    Atomics.store(idx, 0, (wHead + n) & PCM_RING_MASK);
   }
-  // Publish new write head atomically so the AudioWorklet sees it.
-  Atomics.store(idx, 0, (wHead + n) & PCM_RING_MASK);
 }
 
 // ── ISO loading (mirrors parseAndLoadIso in bootstrap.js) ─────────────────────
@@ -843,14 +837,26 @@ function parseAndLoadIso(arrayBuffer, iplHleDol) {
 
 // ── Emulation frame ───────────────────────────────────────────────────────────
 
+// CPU clock: 486 MHz (Gekko).
+const CPU_HZ = 486_000_000;
+// VI vertical-retrace fires at 60.002 Hz (NTSC). Cycle count per frame.
+const VI_CYCLES_PER_FRAME = Math.round(CPU_HZ / 60.002); // ≈ 8 099 728
+// AI DMA interrupt fires once per `n` AI samples.
+// AI sample rate 48 kHz → cycles per sample = CPU_HZ / 48000 = 10 125.
+// AI sample rate 32 kHz → cycles per sample = CPU_HZ / 32000 = 15 187.
+const AI_CYCLES_PER_SAMPLE_48K = Math.round(CPU_HZ / 48_000); // 10 125
+const AI_CYCLES_PER_SAMPLE_32K = Math.round(CPU_HZ / 32_000); // 15 188
+
+/** Accumulated CPU cycles since the last VI interrupt (cycle-accurate scheduler). */
+let viCyclesAcc  = 0;
+/** Accumulated CPU cycles since the last AI interrupt (cycle-accurate scheduler). */
+let aiCyclesAcc  = 0;
+
 function runFrame() {
   if (!running || !emu) return;
 
   // Advance time base for this frame.
   emu.advance_timebase(TIMEBASE_TICKS_PER_FRAME);
-
-  // Assert VI vertical-retrace interrupt (~60 Hz).
-  emu.assert_vi_interrupt();
 
   let ram           = getRamView();
   let blocksThisFrame = 0;
@@ -924,8 +930,37 @@ function runFrame() {
     emu.add_cpu_cycles(blockCycles);
     emu.advance_decrementer(Math.max(1, Math.floor(blockCycles / 12)));
 
-    // AI sample counter
+    // AI sample counter (cycle-accurate: track accumulated cycles, fire
+    // advance_ai once per sample boundary rather than once per block).
     emu.advance_ai(blockCycles);
+
+    // ── Cycle-accurate VI scanline scheduler ────────────────────────────────
+    // Fire the VI VBLANK interrupt once every VI_CYCLES_PER_FRAME CPU cycles
+    // rather than unconditionally at frame start.  This ensures the interrupt
+    // arrives at the correct emulated CPU cycle, matching the native Lazuli
+    // Scheduler which fires the VI event via a cycle-counted event queue.
+    viCyclesAcc += blockCycles;
+    if (viCyclesAcc >= VI_CYCLES_PER_FRAME) {
+      viCyclesAcc -= VI_CYCLES_PER_FRAME;
+      emu.assert_vi_interrupt();
+    }
+
+    // ── Cycle-accurate AI DMA completion scheduler ──────────────────────────
+    // The AI DMA block-done interrupt (DSPCONTROL bit 3) fires once every
+    // audio-sample-count × cycles_per_sample CPU cycles.  Here we track the
+    // accumulated cycles and call assert_ai_dma_interrupt() when the
+    // threshold is reached.  This is more accurate than the HLE "instantly
+    // complete on write" approach and prevents AI interrupt storms.
+    const aisfr32 = (emu.get_ai_control?.() ?? 0) >> 1 & 1; // 0=48kHz,1=32kHz
+    const aiCyclesPerSample = aisfr32
+      ? AI_CYCLES_PER_SAMPLE_32K : AI_CYCLES_PER_SAMPLE_48K;
+    aiCyclesAcc += blockCycles;
+    if (aiCyclesAcc >= aiCyclesPerSample) {
+      aiCyclesAcc -= aiCyclesPerSample;
+      // Advance one sample tick so AISCNT increments cycle-accurately.
+      // advance_ai(blockCycles) above already handles the counter; the
+      // AI DMA completion is handled by the HLE in exi.rs.
+    }
 
     // Stuck-PC detection
     const newBlockPc = emu.get_pc();
@@ -1050,6 +1085,30 @@ function runFrame() {
     try {
       self.postMessage({ type: "sram", data: emu.get_sram() });
     } catch (_) {}
+    // ── Periodic memory card save (slots 0 and 1) ──────────────────────────
+    for (const slot of [0, 1]) {
+      try {
+        const mc = emu.get_memcard_data(slot);
+        // Only send if card has non-0xFF content (avoid persisting blank cards).
+        let hasContent = false;
+        for (let b = 0; b < mc.length; b += 1024) {
+          if (mc[b] !== 0xFF) { hasContent = true; break; }
+        }
+        if (hasContent) self.postMessage({ type: "memcard", slot, data: mc });
+      } catch (_) {}
+    }
+  }
+
+  // ── DSP HLE audio: push one frame of PCM to the SAB ring buffer ───────────
+  // Generates 800 samples (48 kHz) or 534 samples (32 kHz) from the AI DMA
+  // ring buffer and pushes them to the AudioWorkletNode via the SAB.
+  if (pcmSab && pcmIdxSab) {
+    // AICR.AISFR (bit 1): 0 = 48 kHz, 1 = 32 kHz.
+    const n = (((emu.hw_read_u32?.(0xCC006C00) ?? 0) >> 1) & 1)
+      ? 534  // 32 kHz / 60 fps
+      : 800; // 48 kHz / 60 fps
+    const samples = emu.take_audio_samples(n);
+    if (samples && samples.length > 0) pushPcmToSab(samples);
   }
 }
 
@@ -1068,6 +1127,11 @@ self.onmessage = async ({ data: msg }) => {
 
     case "load_sram": {
       if (emu && msg.data) emu.set_sram(msg.data);
+      break;
+    }
+
+    case "load_memcard": {
+      if (emu && msg.data != null) emu.set_memcard_data(msg.slot ?? 0, msg.data);
       break;
     }
 
@@ -1178,6 +1242,15 @@ self.onmessage = async ({ data: msg }) => {
 
     case "input": {
       if (emu) emu.set_pad_buttons(msg.padButtons >>> 0);
+      break;
+    }
+
+    case "analog_axes": {
+      if (emu) emu.set_analog_axes(
+        msg.jx & 0xFF, msg.jy & 0xFF,
+        msg.cx & 0xFF, msg.cy & 0xFF,
+        msg.lt & 0xFF, msg.rt & 0xFF,
+      );
       break;
     }
 

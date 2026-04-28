@@ -32,6 +32,7 @@ mod cpu;
 mod hw;
 mod jit;
 mod loader;
+mod renderer;
 
 use ppcwasm::WasmJit;
 use wasm_bindgen::prelude::*;

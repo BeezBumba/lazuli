@@ -2,8 +2,11 @@
 
 /// Import function indices within the generated WASM module's import section.
 ///
-/// The import section lists hook functions in this exact order:
+/// The import section lists one memory import, one global import, then the hook
+/// functions in this exact order:
 /// ```text
+/// (import "env" "memory" (memory 1))            — memory index 0
+/// (import "env" "ram_base" (global i32))         — global index 0
 /// 0  read_u8            (i32) -> i32
 /// 1  read_u16           (i32) -> i32
 /// 2  read_u32           (i32) -> i32
@@ -16,7 +19,16 @@
 /// 9  psq_load           (i32, i32) -> f64
 /// 10 psq_store          (i32, i32, f64) -> i32
 /// 11 psq_load_size      (i32) -> i32
+/// 12 icbi               (i32) -> ()
+/// 13 isync              () -> ()
 /// ```
+///
+/// The `ram_base` global (index 0) is the byte offset of guest RAM inside the
+/// WASM linear memory.  JIT blocks use it with direct `i32.load` / `i32.store`
+/// instructions instead of hook calls for normal RAM addresses, avoiding the
+/// JavaScript boundary crossing overhead on every memory operation.
+/// Hook calls for `read_u32` / `write_u32` etc. are emitted only for MMIO
+/// (`0xCCxxxxxx`) and L2C (`0xE0xxxxxx`) addresses.
 pub mod imports {
     pub const READ_U8:          u32 = 0;
     pub const READ_U16:         u32 = 1;
@@ -53,7 +65,16 @@ pub mod imports {
 /// | `$regs_ptr`        | Byte offset into WASM linear memory where [`gekko::Cpu`] begins. |
 /// | return value       | Next PC to execute. `0` means the block already wrote `Cpu::pc`. |
 ///
+/// ### Imported globals
+///
+/// | name       | type | meaning                                              |
+/// |------------|------|------------------------------------------------------|
+/// | `ram_base` | i32  | Byte offset of guest RAM in WASM linear memory.      |
+///
 /// ### Imported hooks
+///
+/// These are called only for MMIO (`0xCCxxxxxx`) and L2C (`0xE0xxxxxx`)
+/// addresses; all other addresses use direct `i32.load` / `i32.store`.
 ///
 /// | name              | signature              |
 /// |-------------------|------------------------|
