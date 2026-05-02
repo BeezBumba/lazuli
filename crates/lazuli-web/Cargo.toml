@@ -33,6 +33,7 @@ features = [
 # wgpu's webgpu feature enables wgpu::SurfaceTarget::Canvas support.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 renderer = { workspace = true, features = ["webgpu"] }
+wgpu = { workspace = true, features = ["webgpu", "wgsl"] }
 
 # Enable wasm-opt -O3 for release builds to shrink the WASM binary and improve
 # execution speed.  Disabled for dev builds to keep incremental compile times
