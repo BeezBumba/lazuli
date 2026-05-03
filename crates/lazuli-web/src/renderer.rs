@@ -295,7 +295,8 @@ pub async fn init_webgpu_renderer(canvas_id: &str) -> Option<WgpuRenderer> {
             compatible_surface:     Some(&surface),
             force_fallback_adapter: false,
         })
-        .await?;
+        .await
+        .ok()?;
 
     // Request a logical device.
     let (device, queue) = adapter
