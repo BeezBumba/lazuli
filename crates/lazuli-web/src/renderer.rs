@@ -220,6 +220,7 @@ impl WgpuRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view:           &surface_view,
                     resolve_target: None,
+                    depth_slice:    None,
                     ops: wgpu::Operations {
                         load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -301,11 +302,12 @@ pub async fn init_webgpu_renderer(canvas_id: &str) -> Option<WgpuRenderer> {
     // Request a logical device.
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            label:             Some("lazuli-web wgpu device"),
-            required_features: wgpu::Features::empty(),
-            required_limits:   wgpu::Limits::downlevel_webgl2_defaults(),
-            memory_hints:      wgpu::MemoryHints::MemoryUsage,
-            trace:             wgpu::Trace::Off,
+            label:                  Some("lazuli-web wgpu device"),
+            required_features:      wgpu::Features::empty(),
+            required_limits:        wgpu::Limits::downlevel_webgl2_defaults(),
+            memory_hints:           wgpu::MemoryHints::MemoryUsage,
+            trace:                  wgpu::Trace::Off,
+            experimental_features:  wgpu::ExperimentalFeatures::disabled(),
         })
         .await
         .ok()?;
