@@ -362,6 +362,14 @@ pub struct VertexAttributeStream {
 }
 
 impl VertexAttributeStream {
+    /// Construct a [`VertexAttributeStream`] from raw vertex data.
+    ///
+    /// `table` is the 0–7 VAT slot index, `count` is the number of vertices,
+    /// and `data` is the raw byte payload from the FIFO.
+    pub fn new(table: u8, count: u16, data: Vec<u8>) -> Self {
+        Self { table, count, data }
+    }
+
     pub fn table_index(&self) -> usize {
         self.table as usize
     }

@@ -2677,6 +2677,8 @@ dependencies = [
  "disks",
  "gekko",
  "js-sys",
+ "lazuli",
+ "modules",
  "ppcwasm",
  "renderer",
  "wasm-bindgen",

@@ -509,6 +509,15 @@ pub struct VertexStream {
 }
 
 impl VertexStream {
+    /// Construct a [`VertexStream`] from pre-allocated arena handles.
+    ///
+    /// Both handles must have been obtained from [`alloc_vertices_handle`] /
+    /// [`alloc_matrices_handle`] and their slots fully initialised before
+    /// calling [`VertexStream::vertices`] / [`VertexStream::matrices`].
+    pub fn new(vertices: Handle<Vertex>, matrices: Handle<(MatrixId, Mat4)>) -> Self {
+        Self { vertices, matrices }
+    }
+
     pub fn vertices(&self) -> &[Vertex] {
         // SAFETY: this struct is only created inside `extract_vertices`, which mantains
         // a static arena
@@ -1011,7 +1020,7 @@ pub fn set_register(sys: &mut System, reg: Reg, value: u32) {
 }
 
 #[inline]
-fn alloc_vertices_handle(length: usize) -> Handle<Vertex> {
+pub fn alloc_vertices_handle(length: usize) -> Handle<Vertex> {
     const CHUNK_SIZE: usize = bytesize::MIB as usize;
     const CHUNK_CAPACITY: NonZero<usize> = NonZero::new(CHUNK_SIZE / size_of::<Vertex>()).unwrap();
 
@@ -1022,7 +1031,7 @@ fn alloc_vertices_handle(length: usize) -> Handle<Vertex> {
 }
 
 #[inline]
-fn alloc_matrices_handle(length: usize) -> Handle<(MatrixId, Mat4)> {
+pub fn alloc_matrices_handle(length: usize) -> Handle<(MatrixId, Mat4)> {
     const CHUNK_SIZE: usize = 2 * bytesize::MIB as usize;
     const CHUNK_CAPACITY: NonZero<usize> = NonZero::new(CHUNK_SIZE / size_of::<Mat4>()).unwrap();
 

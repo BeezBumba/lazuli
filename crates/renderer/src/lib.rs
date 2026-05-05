@@ -117,6 +117,15 @@ impl Renderer {
         let alloc = self.inner.device.generate_allocator_report();
         Box::new(Stats { counters, alloc })
     }
+
+    /// Dispatch a GX [`Action`] to the renderer.
+    ///
+    /// On wasm32 the action is queued and processed synchronously during
+    /// [`Renderer::render`].  On native builds it is forwarded to the
+    /// dedicated renderer thread.
+    pub fn exec(&mut self, action: Action) {
+        self.sender.send(action).expect("rendering thread is alive");
+    }
 }
 
 // SAFETY: When the `webgpu` feature is enabled the target is wasm32, which is

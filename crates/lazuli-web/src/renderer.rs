@@ -31,6 +31,12 @@
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
+/// Re-export the external `renderer` crate's `Renderer` so that `lib.rs` can
+/// refer to it as `crate::renderer::Renderer` without ambiguity (the local
+/// module is named `renderer`, so bare `renderer::Renderer` in `lib.rs` would
+/// look inside the local submodule rather than the external crate).
+pub(crate) use renderer::Renderer;
+
 // ─── XFB blit constants ───────────────────────────────────────────────────────
 
 /// GameCube XFB dimensions (pixels).
@@ -124,6 +130,20 @@ fn yuv422_to_rgba(xfb: &[u8]) -> Vec<u8> {
 
 // ─── WgpuRenderer ─────────────────────────────────────────────────────────────
 
+/// An opaque, clone-able handle to the `renderer::Renderer` instance owned by
+/// a [`WgpuRenderer`].
+///
+/// Exported to JavaScript so that the game loop can hand it to
+/// [`WasmEmulator::attach_gx_renderer`], which allows the GX FIFO parser to
+/// dispatch draw actions directly to the GPU renderer as the emulator runs.
+///
+/// ```js
+/// const wgpuRenderer = await init_webgpu_renderer("gc-canvas");
+/// emu.attach_gx_renderer(wgpuRenderer.gx_renderer_handle());
+/// ```
+#[wasm_bindgen]
+pub struct GxRendererHandle(pub(crate) renderer::Renderer);
+
 /// Opaque handle to the initialised WebGPU rendering context.
 ///
 /// Exported to JavaScript as `WgpuRenderer`.  When the renderer is
@@ -140,13 +160,21 @@ pub struct WgpuRenderer {
     xfb_pipeline:         wgpu::RenderPipeline,
     xfb_bind_group_layout: wgpu::BindGroupLayout,
     xfb_sampler:          wgpu::Sampler,
-    // GX pipeline renderer (for future hardware-accelerated GX rendering).
-    #[allow(dead_code)]
+    // GX pipeline renderer — processes GX actions accumulated via
+    // [`GxRendererHandle`] and composites the rendered EFB onto the canvas.
     renderer:             renderer::Renderer,
 }
 
 #[wasm_bindgen]
 impl WgpuRenderer {
+    /// Clone and return a [`GxRendererHandle`] backed by this renderer.
+    ///
+    /// The handle shares the same internal Arc as this `WgpuRenderer`, so GX
+    /// actions enqueued through the handle are visible to `present_xfb`.
+    pub fn gx_renderer_handle(&self) -> GxRendererHandle {
+        GxRendererHandle(self.renderer.clone())
+    }
+
     /// Present a 640×480 YUV422 external frame-buffer via the wgpu blitter.
     ///
     /// `xfb_data` must be a `Uint8Array` (or `ArrayBuffer`-backed view) of
@@ -230,9 +258,15 @@ impl WgpuRenderer {
                 timestamp_writes:         None,
                 occlusion_query_set:      None,
             });
+            // Blit the raw XFB (game's own EFB→XFB copy) as the background layer.
             pass.set_pipeline(&self.xfb_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..4, 0..1); // fullscreen quad (triangle-strip)
+
+            // Composite the GPU-rendered EFB on top (if any GX draw commands
+            // were issued since the last frame).  On wasm32 `render` drains
+            // and executes all pending actions synchronously before blitting.
+            self.renderer.render(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
