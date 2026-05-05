@@ -367,6 +367,8 @@ impl GxFifo {
                 let vtx_start = base + 2;
                 let stride    = self.vertex_size(vat_index);
                 let vtx_end   = vtx_start + count * stride;
+                // `payload_needed` already verified sufficient bytes are in the buffer
+                // before this function is called; this guard is a defensive check.
                 if count == 0 || vtx_end > self.buf.len() { return; }
                 let topology = draw_topology(opcode);
                 if let Some(r) = renderer {
@@ -476,6 +478,13 @@ impl GxFifo {
         use lazuli::system::gx::tev::alpha;
         use lazuli::system::gx::color::Rgba8;
 
+        /// Extract an `Rgba8` from the two BP clear-color registers:
+        /// `ar` carries alpha (bits 31–24) and red (bits 23–16),
+        /// `gb` carries green (bits 31–24) and blue (bits 23–16).
+        fn rgba8_from_ar_gb(ar: u32, gb: u32) -> Rgba8 {
+            Rgba8 { r: (ar >> 8) as u8, g: (gb >> 8) as u8, b: gb as u8, a: ar as u8 }
+        }
+
         if std::mem::take(&mut self.bp_pixel_dirty) {
             renderer.exec(Action::SetDepthMode(
                 DepthMode::from_bits(self.bp_regs[BP_Z_MODE as usize]),
@@ -509,6 +518,7 @@ impl GxFifo {
                 c:     FogParamC::from_bits(self.bp_regs[BP_FOG_C as usize]),
                 color: {
                     let raw = self.bp_regs[BP_FOG_COLOR as usize];
+                    // BP fog color: bits 23–16 = R, 15–8 = G, 7–0 = B, no alpha.
                     Rgba8 { r: (raw >> 16) as u8, g: (raw >> 8) as u8, b: raw as u8, a: 255 }
                 },
             };
@@ -518,15 +528,7 @@ impl GxFifo {
         if std::mem::take(&mut self.bp_clear_dirty) {
             let ar = self.bp_regs[BP_CLEAR_AR as usize];
             let gb = self.bp_regs[BP_CLEAR_GB as usize];
-            renderer.exec(Action::SetClearColor(
-                Rgba8 {
-                    r: (ar >> 8) as u8,
-                    g: (gb >> 8) as u8,
-                    b: gb as u8,
-                    a: ar as u8,
-                }
-                .into(),
-            ));
+            renderer.exec(Action::SetClearColor(rgba8_from_ar_gb(ar, gb).into()));
         }
     }
 
@@ -542,6 +544,9 @@ impl GxFifo {
             let offset_x  = f32::from_bits(self.xf_regs[base + 3]);
             let offset_y  = f32::from_bits(self.xf_regs[base + 4]);
             let _offset_z = f32::from_bits(self.xf_regs[base + 5]);
+            // Z offset is not used in the near/far calculation below; the
+            // GameCube uses a reversed-Z convention (far=0, near=1) that makes
+            // offset_z redundant once scale_z is known.
 
             // GC XF viewport: half-extents + center, with 342-pixel hardware bias.
             let width      = scale_x.abs() * 2.0;
@@ -611,6 +616,8 @@ impl GxFifo {
             VertexDescriptor::from_bits((hi << 32) | lo)
         };
         if !vcd.position().is_present() {
+            // Without position data the renderer cannot place vertices in 3D
+            // space; skip this draw call entirely.
             return;
         }
 
