@@ -468,9 +468,12 @@ impl WasmEmulator {
             out.set_index(i * 2 + 1, r as f32 / 32768.0);
 
             // Advance the ring-buffer position by 4 bytes (one stereo pair).
-            let next_pos = (self.dsp.audio_dma_pos + 4) as usize % buf_len;
-            let wrapped = next_pos < self.dsp.audio_dma_pos as usize;
-            self.dsp.audio_dma_pos = next_pos as u32;
+            // Detect wrap before applying modulo so the interrupt fires exactly once
+            // per full buffer cycle (i.e. when raw position reaches buf_len).
+            let old_pos = self.dsp.audio_dma_pos as usize;
+            let new_pos_raw = old_pos + 4;
+            let wrapped = new_pos_raw >= buf_len;
+            self.dsp.audio_dma_pos = (new_pos_raw % buf_len) as u32;
 
             // When the DMA position wraps back to the start of the ring buffer,
             // one complete pass through all `length_by_32` blocks has finished.

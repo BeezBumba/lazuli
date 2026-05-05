@@ -54,7 +54,6 @@
 //! | 0x14   | 16    | DspDmaDspBase     | DSP DMA DMEM/IMEM address (W)        |
 //! | 0x18   | 16    | DspDmaLength      | DSP DMA length in 32-bit words (W)   |
 //! | 0x1A   | 16    | DspDmaControl     | DSP DMA control: start/dir/target(W) |
-//! | 0x12   | 16    | DspAramSize       | ARAM size (R/W; always 0 = no ARAM)  |
 //! | 0x20   | 32    | DspAramDmaRamBase | ARAM DMA RAM base address (W)        |
 //! | 0x24   | 32    | DspAramDmaAramBase| ARAM DMA ARAM base address (W)       |
 //! | 0x28   | 32    | DspAramDmaControl | ARAM DMA control — write triggers HLE|
