@@ -635,7 +635,7 @@ impl WasmEmulator {
     /// Must be called after every write to a DSPCONTROL-related register so that
     /// the OS can observe the correct PI_INTSR state via `__OSInitAudioSystem`
     /// and related polling loops.
-    fn sync_pi_dsp(&mut self) {
+    pub(crate) fn sync_pi_dsp(&mut self) {
         if self.dsp.any_interrupt() {
             self.pi_intsr |= PI_INT_DSP;
         } else {
