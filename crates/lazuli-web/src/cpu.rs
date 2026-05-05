@@ -448,13 +448,17 @@ impl WasmEmulator {
             let pos = self.dsp.audio_dma_pos as usize % buf_len;
             let off = base + pos;
 
-            // Each stereo sample = 2 big-endian i16 values (L then R).
-            let l = if off + 1 < self.ram.len() {
+            // The GameCube AI DMA ring buffer stores each stereo pair as:
+            //   bytes +0/+1 = right channel (big-endian i16)
+            //   bytes +2/+3 = left channel  (big-endian i16)
+            // This matches the native `push_data_dma_block` read order:
+            //   right = read_phys_slow::<i16>(addr + 0), left = read_phys_slow::<i16>(addr + 2)
+            let r = if off + 1 < self.ram.len() {
                 i16::from_be_bytes([self.ram[off], self.ram[off + 1]])
             } else {
                 0
             };
-            let r = if off + 3 < self.ram.len() {
+            let l = if off + 3 < self.ram.len() {
                 i16::from_be_bytes([self.ram[off + 2], self.ram[off + 3]])
             } else {
                 0
@@ -464,7 +468,22 @@ impl WasmEmulator {
             out.set_index(i * 2 + 1, r as f32 / 32768.0);
 
             // Advance the ring-buffer position by 4 bytes (one stereo pair).
-            self.dsp.audio_dma_pos = ((self.dsp.audio_dma_pos + 4) as usize % buf_len) as u32;
+            // Detect wrap before applying modulo so the interrupt fires exactly once
+            // per full buffer cycle (i.e. when raw position reaches buf_len).
+            let old_pos = self.dsp.audio_dma_pos as usize;
+            let new_pos_raw = old_pos + 4;
+            let wrapped = new_pos_raw >= buf_len;
+            self.dsp.audio_dma_pos = (new_pos_raw % buf_len) as u32;
+
+            // When the DMA position wraps back to the start of the ring buffer,
+            // one complete pass through all `length_by_32` blocks has finished.
+            // Fire ai_dma_interrupt (DSPCONTROL bit 3) to mirror the native
+            // `push_data_dma_block` → `set_ai_dma_interrupt(true)` path.
+            if wrapped {
+                self.dsp.control |= 1 << 3; // ai_dma_interrupt = 1
+                self.sync_pi_dsp();
+                self.maybe_deliver_external_interrupt();
+            }
         }
 
         out

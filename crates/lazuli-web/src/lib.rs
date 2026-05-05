@@ -34,6 +34,9 @@ mod jit;
 mod loader;
 mod renderer;
 
+#[cfg(target_arch = "wasm32")]
+use renderer::GxRendererHandle;
+
 use ppcwasm::WasmJit;
 use wasm_bindgen::prelude::*;
 
@@ -189,6 +192,13 @@ pub struct WasmEmulator {
     /// guest reads/writes to `0xE000_xxxx` to/from this buffer via the
     /// `l2c_ptr()` / `l2c_size()` exports.
     pub(crate) l2c: Vec<u8>,
+    /// WebGPU renderer handle for GX pipeline output.
+    ///
+    /// Populated via [`WasmEmulator::attach_gx_renderer`] after the WebGPU
+    /// renderer is initialised.  The GX FIFO parser dispatches [`Action::*`]
+    /// actions through this handle whenever draw commands are executed.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) renderer: Option<crate::renderer::Renderer>,
 }
 
 #[wasm_bindgen]
@@ -237,7 +247,26 @@ impl WasmEmulator {
             last_dma_len: 0,
             last_di_disc_offset: 0,
             l2c: vec![0u8; 16 * 1024],
+            #[cfg(target_arch = "wasm32")]
+            renderer: None,
         }
+    }
+
+    /// Attach a WebGPU renderer so the GX FIFO parser can dispatch draw
+    /// actions directly to the GPU.
+    ///
+    /// Call this once after [`init_webgpu_renderer`] succeeds:
+    ///
+    /// ```js
+    /// const wgpuRenderer = await init_webgpu_renderer("gc-canvas");
+    /// emu.attach_gx_renderer(wgpuRenderer.gx_renderer_handle());
+    /// ```
+    ///
+    /// The handle shares the same internal `Arc` as the `WgpuRenderer`, so
+    /// actions enqueued by the emulator are visible to `present_xfb`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn attach_gx_renderer(&mut self, handle: GxRendererHandle) {
+        self.renderer = Some(handle.0);
     }
 }
 

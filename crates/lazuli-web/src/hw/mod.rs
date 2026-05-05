@@ -166,6 +166,15 @@ impl WasmEmulator {
         //     replacing the coarse VI-rate PE_FINISH stub.
         // Mirrors native `pi::fifo_push` → CP FIFO buffer → `cmd::consume/process`.
         if addr >= 0xCC00_8000 && addr < 0xCC00_8020 {
+            // On wasm32 we have a WebGPU renderer and can dispatch GX draw actions;
+            // on other targets fall back to the simple parser (CP/BP state + interrupts).
+            #[cfg(target_arch = "wasm32")]
+            {
+                let ram = self.ram.as_slice();
+                let renderer = self.renderer.as_mut();
+                self.gx.fifo.push_u32_gfx(val, ram, renderer);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             self.gx.fifo.push_u32(val);
             // Check if the FIFO parser fired any PE interrupt.
             if core::mem::replace(&mut self.gx.fifo.pe_finish_pending, false) {
@@ -635,7 +644,7 @@ impl WasmEmulator {
     /// Must be called after every write to a DSPCONTROL-related register so that
     /// the OS can observe the correct PI_INTSR state via `__OSInitAudioSystem`
     /// and related polling loops.
-    fn sync_pi_dsp(&mut self) {
+    pub(crate) fn sync_pi_dsp(&mut self) {
         if self.dsp.any_interrupt() {
             self.pi_intsr |= PI_INT_DSP;
         } else {

@@ -50,7 +50,10 @@
 //! | 0x04   | 16    | DSMAILBOX_H       | DSP→CPU mailbox hi (R; HLE echo)     |
 //! | 0x06   | 16    | DSMAILBOX_L       | DSP→CPU mailbox lo (R; HLE echo)     |
 //! | 0x0A   | 16    | DSPCONTROL        | Control/status register (R/W)        |
-//! | 0x12   | 16    | DspAramSize       | ARAM size (R/W; always 0 = no ARAM)  |
+//! | 0x10   | 32    | DspDmaRamBase     | DSP DMA main-RAM address (W)         |
+//! | 0x14   | 16    | DspDmaDspBase     | DSP DMA DMEM/IMEM address (W)        |
+//! | 0x18   | 16    | DspDmaLength      | DSP DMA length in 32-bit words (W)   |
+//! | 0x1A   | 16    | DspDmaControl     | DSP DMA control: start/dir/target(W) |
 //! | 0x20   | 32    | DspAramDmaRamBase | ARAM DMA RAM base address (W)        |
 //! | 0x24   | 32    | DspAramDmaAramBase| ARAM DMA ARAM base address (W)       |
 //! | 0x28   | 32    | DspAramDmaControl | ARAM DMA control — write triggers HLE|
@@ -91,6 +94,23 @@ const DSPCTRL_DEFAULT: u16 = 1 << 11;
 
 /// DSP Interface hardware register file (HLE stub).
 pub(crate) struct DspState {
+    // ── DSP DMA (IMEM/DMEM) register state ────────────────────────────────
+    /// `DspDmaRamBase` (offsets 0x10–0x13, 32-bit): main-RAM byte address for
+    /// the DSP DMA transfer.  Mirrors `dspi::DspDma::ram_base`.
+    pub(crate) dsp_dma_ram_base: u32,
+    /// `DspDmaDspBase` (offset 0x14, 16-bit): DMEM or IMEM address in the DSP
+    /// for the DMA transfer.  Mirrors `dspi::DspDma::dsp_base`.
+    pub(crate) dsp_dma_dsp_base: u16,
+    /// `DspDmaLength` (offset 0x18, 16-bit): transfer length in 32-bit words.
+    /// Mirrors `dspi::DspDma::length`.
+    pub(crate) dsp_dma_length: u16,
+    /// `DspDmaControl` (offset 0x1A, 16-bit): direction (bit 0), target
+    /// (bit 1: 0=DMEM, 1=IMEM), transfer-ongoing (bit 2, R/O).
+    /// Writing with bit 2 set requests a transfer; the HLE stub clears bit 2
+    /// immediately (instant completion — no real DSP microcode is running).
+    /// Mirrors `dspi::DspDma::control`.
+    pub(crate) dsp_dma_control: u16,
+
     /// DSP→CPU mailbox high/low — read from `0xCC005004`/`0xCC005006` (DSMAILBOX).
     /// Populated by echoing CPU→DSP writes so that any "poll for DSP ACK" loops
     /// at `0xCC005004` terminate without real DSP microcode.
@@ -138,6 +158,10 @@ pub(crate) struct DspState {
 impl Default for DspState {
     fn default() -> Self {
         Self {
+            dsp_dma_ram_base: 0,
+            dsp_dma_dsp_base: 0,
+            dsp_dma_length: 0,
+            dsp_dma_control: 0,
             dsp2cpu_hi: 0,
             dsp2cpu_lo: 0,
             control: DSPCTRL_DEFAULT,
@@ -182,6 +206,15 @@ impl DspState {
             0x06 => self.dsp2cpu_lo,
             // DSPCONTROL at the CORRECT hardware offset 0x0A (0xCC00500A).
             0x0A => self.control,
+            // DSP DMA RAM base address (0x10/0x12: high/low 16 bits).
+            0x10 => (self.dsp_dma_ram_base >> 16) as u16,
+            0x12 => self.dsp_dma_ram_base as u16,
+            // DSP DMA DSP address (0x14).
+            0x14 => self.dsp_dma_dsp_base,
+            // DSP DMA length (0x18).
+            0x18 => self.dsp_dma_length,
+            // DSP DMA control (0x1A): bit 2 = transfer_ongoing (always 0 = complete).
+            0x1A => self.dsp_dma_control & !0x0004,
             // AudioDmaBase (0x30/0x32): return the stored 32-bit value split
             // into two 16-bit halves (big-endian: high at 0x30, low at 0x32).
             0x30 => (self.audio_dma_base >> 16) as u16,
@@ -240,6 +273,25 @@ impl DspState {
                     self.dsp2cpu_hi |= 0x8000; // DSP→CPU mailbox status = message ready
                 }
             }
+            // DSP DMA RAM base address — high halfword (0x10) and low halfword (0x12).
+            // Software writes these with `sth` before writing DspDmaControl to kick off
+            // a DMEM/IMEM transfer.  Store them so reads return consistent values.
+            0x10 => self.dsp_dma_ram_base = (self.dsp_dma_ram_base & 0x0000_FFFF) | ((val as u32) << 16),
+            0x12 => self.dsp_dma_ram_base = (self.dsp_dma_ram_base & 0xFFFF_0000) | (val as u32),
+            // DSP DMA DSP-side base address (0x14, 16-bit).
+            0x14 => self.dsp_dma_dsp_base = val,
+            // DSP DMA length in 32-bit words (0x18, 16-bit).
+            0x18 => self.dsp_dma_length = val,
+            // DSP DMA control (0x1A, 16-bit).
+            // bit 0 = direction (0=RAM→DSP, 1=DSP→RAM)
+            // bit 1 = target (0=DMEM, 1=IMEM)
+            // bit 2 = transfer_ongoing (W1=start; HLE clears it instantly since there
+            //         is no real DSP microcode to DMA into — the write is a no-op).
+            0x1A => {
+                // Store direction and target bits but clear transfer_ongoing immediately
+                // (HLE instant completion — no real IMEM/DMEM exists).
+                self.dsp_dma_control = val & !0x0004;
+            }
             // ARAM DMA control high halfword (0x28 = offset of DspAramDmaControl).
             // Writing this triggers a DMA in hardware; HLE completes it instantly.
             0x28 => {
@@ -278,6 +330,9 @@ impl DspState {
     /// `WasmEmulator::aram`).
     pub(crate) fn write_u32(&mut self, offset: u32, val: u32) {
         match offset {
+            // DspDmaRamBase (0x10, 4 bytes): main-RAM byte address for the DSP
+            // DMA transfer (to/from IMEM or DMEM).  Mirrors `dspi::DspDma::ram_base`.
+            0x10 => self.dsp_dma_ram_base = val,
             // DspAramDmaRamBase (0x20, 4 bytes): store the main-RAM address for the
             // pending ARAM DMA transfer.  Mirroring native dspi.rs field `aram_dma.ram_base`.
             0x20 => self.aram_dma_ram_base = val,
