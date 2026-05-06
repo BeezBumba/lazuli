@@ -302,7 +302,7 @@ impl WgpuRenderer {
 /// Typical call from JS:
 /// ```js
 /// const renderer = await init_webgpu_renderer("screen");
-/// if (renderer) { /* use renderer.present_xfb(rawYuv) each frame */ }
+/// if (renderer) { renderer.present_xfb(rawYuv); }
 /// ```
 #[wasm_bindgen]
 pub async fn init_webgpu_renderer(canvas_id: &str) -> Option<WgpuRenderer> {
