@@ -30,6 +30,11 @@ const APPLOADER_LOAD_ADDR: u32 = 0x8120_0000;
 /// ISO byte offset of the apploader header (immediately after the boot header).
 const APPLOADER_ISO_OFFSET: u64 = 0x2440;
 
+#[inline]
+fn is_ciso_format(data: &[u8]) -> bool {
+    data.starts_with(b"CISO")
+}
+
 /// Detect the disc image format and return a flat byte vector.
 ///
 /// If `data` starts with the `"CISO"` magic (a Compact ISO / CISO disc
@@ -39,7 +44,7 @@ const APPLOADER_ISO_OFFSET: u64 = 0x2440;
 /// If `data` does not look like a CISO, it is assumed to be a raw ISO and is
 /// returned unchanged.
 fn flatten_disc_image(data: Vec<u8>) -> Result<Vec<u8>, String> {
-    if data.starts_with(b"CISO") {
+    if is_ciso_format(&data) {
         flatten_ciso(&data)
     } else {
         Ok(data)
@@ -205,7 +210,7 @@ impl WasmEmulator {
     /// Call this in addition to (not instead of) the DOL-loading path in
     /// `parseAndLoadIso` / `load_bytes`.
     pub fn load_disc_image(&mut self, data: Vec<u8>) {
-        let is_ciso = data.starts_with(b"CISO");
+        let is_ciso = is_ciso_format(&data);
         let flat = if is_ciso {
             match flatten_ciso(&data) {
                 Ok(f) => f,
