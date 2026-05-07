@@ -37,12 +37,12 @@ const APPLOADER_ISO_OFFSET: u64 = 0x2440;
 /// Unused blocks (those marked 0 in the CISO block map) are zero-filled.
 ///
 /// If `data` does not look like a CISO, it is assumed to be a raw ISO and is
-/// returned as-is (zero-copy via a single allocation).
-fn flatten_disc_image(data: &[u8]) -> Result<Vec<u8>, String> {
-    if data.len() >= 4 && &data[0..4] == b"CISO" {
-        flatten_ciso(data)
+/// returned unchanged.
+fn flatten_disc_image(data: Vec<u8>) -> Result<Vec<u8>, String> {
+    if data.starts_with(b"CISO") {
+        flatten_ciso(&data)
     } else {
-        Ok(data.to_vec())
+        Ok(data)
     }
 }
 
@@ -204,16 +204,20 @@ impl WasmEmulator {
     ///
     /// Call this in addition to (not instead of) the DOL-loading path in
     /// `parseAndLoadIso` / `load_bytes`.
-    pub fn load_disc_image(&mut self, data: &[u8]) {
-        let flat = match flatten_disc_image(data) {
-            Ok(f) => f,
-            Err(e) => {
-                console_log!("[lazuli] DiscImageDevice: format error — {e}; storing raw bytes");
-                data.to_vec()
+    pub fn load_disc_image(&mut self, data: Vec<u8>) {
+        let is_ciso = data.starts_with(b"CISO");
+        let flat = if is_ciso {
+            match flatten_ciso(&data) {
+                Ok(f) => f,
+                Err(e) => {
+                    console_log!("[lazuli] DiscImageDevice: format error — {e}; storing raw bytes");
+                    data
+                }
             }
+        } else {
+            data
         };
         let disc_size_mib = flat.len() / (1024 * 1024);
-        let is_ciso = data.len() >= 4 && &data[0..4] == b"CISO";
         self.disc = Some(flat);
         // Mark the cover as closed (bit 2 = DICVR_STATE = 1 → cover closed,
         // disc present) so games that poll DICOVER before issuing commands see
@@ -267,7 +271,7 @@ impl WasmEmulator {
     /// | `apploaderEntry`   | number | Apploader entry function address          |
     ///
     /// Returns a JavaScript `Error` on failure (bad magic, corrupt DOL, …).
-    pub fn parse_and_load_disc(&mut self, data: &[u8]) -> Result<JsValue, JsValue> {
+    pub fn parse_and_load_disc(&mut self, data: Vec<u8>) -> Result<JsValue, JsValue> {
         use std::io::{Cursor, Seek, SeekFrom};
 
         // ── 1. Format detection ───────────────────────────────────────────────
