@@ -59,7 +59,6 @@ import init, { WasmEmulator, wasm_memory } from "./pkg/lazuli_web.js";
 const BLOCKS_PER_FRAME         = 500;
 const TIMEBASE_TICKS_PER_FRAME = 675_000;
 const TICKS_PER_BLOCK_FALLBACK = Math.ceil(TIMEBASE_TICKS_PER_FRAME / BLOCKS_PER_FRAME);
-const WASM_PAGE                = 65_536;
 const PHYS_MASK                = 0x01FF_FFFF;
 const SCREEN_W                 = 640;
 const SCREEN_H                 = 480;
@@ -91,9 +90,6 @@ let pcmIdxSab = null;  // Int32[2]: [writeHead, readHead]
 const moduleCache  = new Map(); // u32 pc → WebAssembly.Module
 const blockMetaMap = new Map(); // u32 pc → { cycles, insCount }
 const pcHitMap     = new Map(); // u32 pc → number
-
-// CPU register-file memory (reused across block executions)
-let regsMemCache = null;
 
 // RAM view (zero-copy slice into WASM linear memory)
 let ramView          = null;
@@ -207,16 +203,6 @@ function getL2cView() {
     l2cView = new Uint8Array(mem.buffer, emu.l2c_ptr(), emu.l2c_size());
   }
   return l2cView;
-}
-
-function getRegsMem() {
-  if (!regsMemCache) {
-    const cpuSize     = emu.cpu_struct_size();
-    const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE);
-    const mem         = new WebAssembly.Memory({ initial: pagesNeeded });
-    regsMemCache      = { mem, view: new Uint8Array(mem.buffer) };
-  }
-  return regsMemCache;
 }
 
 // ── UART output ───────────────────────────────────────────────────────────────
@@ -575,9 +561,8 @@ function executeOneBlockSync(ram, log) {
     });
   }
 
-  const cpuSize = emu.cpu_struct_size();
-  const { mem: regsMem, view: regsView } = getRegsMem();
-  regsView.set(emu.get_cpu_bytes(), 0);
+  const mem    = wasm_memory();
+  const cpuPtr = emu.cpu_ptr() >>> 0;
 
   lastRaisedExceptionKind = -1;
 
@@ -587,7 +572,7 @@ function executeOneBlockSync(ram, log) {
     // for RAM accesses without crossing the JavaScript boundary.
     const ramBaseGlobal = new WebAssembly.Global({ value: 'i32', mutable: false }, emu.ram_ptr());
     instance = new WebAssembly.Instance(module, {
-      env:   { memory: regsMem, ram_base: ramBaseGlobal },
+      env:   { memory: mem, ram_base: ramBaseGlobal },
       hooks: buildHooks(ram, log, pc, pcHex),
     });
   } catch (e) {
@@ -600,7 +585,7 @@ function executeOneBlockSync(ram, log) {
 
   let nextPc;
   try {
-    nextPc = instance.exports.execute(0);
+    nextPc = instance.exports.execute(cpuPtr);
   } catch (e) {
     const msg = `execution error @ ${pcHex}: ${e}`;
     console.error(`[lazuli-worker] ${msg}`);
@@ -609,7 +594,6 @@ function executeOneBlockSync(ram, log) {
     return false;
   }
 
-  emu.set_cpu_bytes(new Uint8Array(regsMem.buffer, 0, cpuSize));
   emu.record_block_executed();
   pcHitMap.set(pc, (pcHitMap.get(pc) ?? 0) + 1);
 

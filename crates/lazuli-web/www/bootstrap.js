@@ -2206,7 +2206,6 @@ function clearModuleCache() {
   blockMetaMap.clear();
   pcHitMap.clear();
   raiseExceptionTotal = 0;
-  regsMemCache = null;
   // Reset debug state so stale info from a previous ISO does not carry over.
   lastRaisedExceptionPc   = 0;
   lastRaisedExceptionKind = -1;
@@ -2237,34 +2236,6 @@ function clearModuleCache() {
 }
 
 // ── Synchronous block execution ───────────────────────────────────────────────
-
-const WASM_PAGE = 65536;
-
-/**
- * Single `WebAssembly.Memory` used as the register-file backing store for
- * every JIT block execution.  Allocated lazily on first use and reused
- * across all subsequent calls to `executeOneBlockSync` to avoid creating a
- * new 64 KB allocation (+ `get_cpu_bytes` externref copy) on every block.
- *
- * @type {{ mem: WebAssembly.Memory, view: Uint8Array } | null}
- */
-let regsMemCache = null;
-
-/**
- * Return (or lazily create) the shared register-file memory.
- *
- * @param {WasmEmulator} emu
- * @returns {{ mem: WebAssembly.Memory, view: Uint8Array }}
- */
-function getRegsMem(emu) {
-  if (!regsMemCache) {
-    const cpuSize    = emu.cpu_struct_size();
-    const pagesNeeded = Math.ceil(cpuSize / WASM_PAGE);
-    const mem  = new WebAssembly.Memory({ initial: pagesNeeded });
-    regsMemCache = { mem, view: new Uint8Array(mem.buffer) };
-  }
-  return regsMemCache;
-}
 
 /**
  * Compile (or fetch from cache), instantiate, and execute one PPC basic block.
@@ -2325,10 +2296,9 @@ function executeOneBlockSync(emu, ram, log) {
     });
   }
 
-  // ── Step 2: write CPU register file into the shared (cached) WASM memory ──
-  const cpuSize        = emu.cpu_struct_size();
-  const { mem: regsMem, view: regsView } = getRegsMem(emu);
-  regsView.set(emu.get_cpu_bytes(), 0);
+  // ── Step 2: use emulator linear memory + real CPU struct pointer ───────────
+  const mem    = wasm_memory();
+  const cpuPtr = emu.cpu_ptr() >>> 0;
 
 
 
@@ -2339,8 +2309,9 @@ function executeOneBlockSync(emu, ram, log) {
   // ── Step 3: instantiate with hook closures that use the zero-copy RAM ────
   let instance;
   try {
+    const ramBaseGlobal = new WebAssembly.Global({ value: "i32", mutable: false }, emu.ram_ptr());
     instance = new WebAssembly.Instance(module, {
-      env:   { memory: regsMem },
+      env:   { memory: mem, ram_base: ramBaseGlobal },
       hooks: buildHooks(ram, log, emu, pc, pcHex),
     });
   } catch (e) {
@@ -2354,7 +2325,7 @@ function executeOneBlockSync(emu, ram, log) {
   // ── Step 4: execute ───────────────────────────────────────────────────────
   let nextPc;
   try {
-    nextPc = instance.exports.execute(0 /* regs_ptr = 0 */);
+    nextPc = instance.exports.execute(cpuPtr);
   } catch (e) {
     const msg = `execution error @ ${pcHex}: ${e}`;
     console.error(`[lazuli] ${msg}`);
@@ -2363,8 +2334,7 @@ function executeOneBlockSync(emu, ram, log) {
     return false;
   }
 
-  // ── Step 5: sync CPU state back; RAM is already in sync (zero-copy) ──────
-  emu.set_cpu_bytes(new Uint8Array(regsMem.buffer, 0, cpuSize));
+  // ── Step 5: RAM/CPU state already live in shared WASM memory ──────────────
   emu.record_block_executed();
   pcHitMap.set(pc, (pcHitMap.get(pc) ?? 0) + 1);
 

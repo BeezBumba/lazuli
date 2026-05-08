@@ -333,6 +333,15 @@ impl WasmEmulator {
     // ── Memory views ──────────────────────────────────────────────────────────
 
     /// Returns a raw pointer (WASM linear memory offset) to the start of the
+    /// [`gekko::Cpu`] register file struct.
+    ///
+    /// JIT blocks call `execute(regs_ptr)` and expect this pointer to refer to
+    /// the in-memory `#[repr(C)] gekko::Cpu` inside the module's linear memory.
+    pub fn cpu_ptr(&self) -> u32 {
+        (&self.cpu as *const gekko::Cpu) as u32
+    }
+
+    /// Returns a raw pointer (WASM linear memory offset) to the start of the
     /// guest RAM buffer.
     ///
     /// Combine with [`wasm_memory`] and [`ram_size`] to create a live,
